@@ -1,0 +1,4 @@
+# Python UI framework used to build the frontend page
+nicegui==2.7.0
+# HTTP client used by the frontend to call the backend API
+httpx==0.27.2

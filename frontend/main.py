@@ -1,7 +1,7 @@
 import httpx 
 from nicegui import ui
 
-BACKEND_URL = "http://127.0.0.1:8000"
+BACKEND_URL = "http://127.0.0.1:8080"
 
 @ui.page("/")
 async def homepage():

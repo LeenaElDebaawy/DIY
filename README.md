@@ -1,89 +1,65 @@
-
 # Fixly
 
-Fixly is a repair guidance web app built in Python.
+Fixly is a Python based repair guidance web app.
 
-## Current Status
+## Project Status
 
-The project currently includes:
+The project has currently completed the following phases:
 
-- a FastAPI backend
-- a NiceGUI frontend
-- a health check endpoint
-- a simple frontend page that checks whether the backend is running
+### Phase 1 — Foundation
+- FastAPI backend created
+- NiceGUI frontend created
+- backend and frontend can run locally
 
-## Project Structure
+### Phase 2 — Router Structure
+- backend routes moved into a cleaner `app/api` structure
+- central router added through `app/router.py`
 
-```text
-Fixly/
-├── .gitignore
-├── README.md
-├── backend/
-│   ├── main.py
-│   └── requirements.txt
-└── frontend/
-    ├── main.py
-    └── requirements.txt
-```
+### Phase 3 — Initial Database Scaffold
+- SQLAlchemy added
+- initial database model scaffold created
+- `/health` and `/health/db` endpoints added
+- backend and frontend connection confirmed
 
-## Run Locally
+### Phase 4 — PostgreSQL and Alembic Setup
+- PostgreSQL moved into Docker
+- backend database connection upgraded from SQLite to async PostgreSQL
+- Alembic initialized for migrations
+- full schema models created
+- first migration generated and applied successfully
+
+## Current Stack
 
 ### Backend
-
-```bash
-cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
-```
+- FastAPI
+- SQLAlchemy 2.0
+- Async PostgreSQL with `asyncpg`
+- Alembic
 
 ### Frontend
+- NiceGUI
 
-```bash
-cd frontend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python main.py
-```
-
-## URLs
-
-- Backend health check: http://127.0.0.1:8000/health
-- Frontend: http://localhost:3000
-
-## Notes
-
-- The backend and frontend run as separate Python processes.
-- The frontend sends a request to the backend health endpoint to confirm that the backend is running.
-- This is the current foundation of the project. More features will be added in later phases.
-=======
-# Fixly
-
-Fixly is a repair guidance web app built in Python.
-
-## Current Status
-
-The project currently includes:
-
-- a FastAPI backend
-- a NiceGUI frontend
-- a health check endpoint
-- a database health check endpoint
-- a SQLite database foundation
-- a simple frontend page that checks whether the backend is running
+### Database
+- PostgreSQL running in Docker
 
 ## Project Structure
 
 ```text
-Fixly/
+FixIT/
 ├── .gitignore
 ├── README.md
+├── docker-compose.yml
 ├── backend/
+│   ├── .env
+│   ├── alembic.ini
 │   ├── main.py
 │   ├── requirements.txt
-│   ├── fixly.db
+│   ├── alembic/
+│   │   ├── env.py
+│   │   ├── README
+│   │   ├── script.py.mako
+│   │   └── versions/
+│   │       └── dd9275c4f79f_full_schema.py
 │   └── app/
 │       ├── __init__.py
 │       ├── database.py
@@ -97,50 +73,79 @@ Fixly/
     └── requirements.txt
 ```
 
-## Current Features
+## Current Database Tables
 
-The project currently supports:
+The current PostgreSQL schema includes:
 
-- backend and frontend running as separate Python processes
-- a backend health check route
-- a database connection health check route
-- automatic SQLite database file creation on backend startup
-- a simple `Case` model using SQLAlchemy
-- a frontend page that checks backend availability
+- `users`
+- `user_tokens`
+- `sessions`
+- `uploads`
+- `analyses`
+- `messages`
 
 ## Run Locally
 
-### Backend
+### 1. Start PostgreSQL in Docker
+
+From the project root:
+
+```bash
+docker compose up -d db
+```
+
+### 2. Start the backend
 
 ```bash
 cd backend
-python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-uvicorn main:app --host 127.0.0.1 --port 8080
+uvicorn main:app --reload --host 127.0.0.1 --port 8080
 ```
 
-### Frontend
+### 3. Start the frontend
+
+Open a second terminal:
 
 ```bash
 cd frontend
-python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
 python main.py
 ```
 
 ## URLs
 
-- Backend health check: http://127.0.0.1:8080/health
-- Database health check: http://127.0.0.1:8080/health/db
-- Frontend: http://localhost:3000
+### Backend
+- Health check: `http://127.0.0.1:8080/health`
+- Database health check: `http://127.0.0.1:8080/health/db`
 
-## Notes
+### Frontend
+- `http://localhost:3000`
 
-- The backend and frontend run as separate Python processes.
-- The frontend sends a request to the backend health endpoint to confirm that the backend is running.
-- The backend currently uses SQLite for the database layer.
-- The `fixly.db` file is created automatically inside the `backend` folder when the app starts.
-- This is the current foundation of the project. More features will be added in the next phases.
+## Environment Notes
 
+- PostgreSQL runs in Docker on port `5433`
+- backend runs locally on port `8080`
+- frontend runs locally on port `3000`
+
+## What Has Been Achieved So Far
+
+So far, the project has moved from a simple local scaffold to a more realistic application foundation with:
+
+- Dockerized PostgreSQL
+- async database access
+- Alembic migration support
+- full schema models for the main application entities
+- working backend health and database health checks
+
+## Next Phase
+
+### Phase 5 — Authentication
+The next planned phase is authentication, including:
+
+- register
+- login
+- logout
+- `/auth/me`
+- password hashing
+- bearer token based authentication
+- a small matching frontend authentication UI

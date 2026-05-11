@@ -1,10 +1,17 @@
 # Web framework for building the backend API
 fastapi==0.115.5
+
 # ASGI server used to run the FastAPI app locally
 uvicorn[standard]==0.32.1
-# Python UI framework for building the web interface
-nicegui==2.7.0
-# HTTP client so the frontend can call the backend API
-httpx==0.27.2
-# ORM used to define database models and connect Python to the database
-sqlalchemy==2.0.36
+
+# SQLAlchemy with asyncio support for the async database layer
+sqlalchemy[asyncio]==2.0.36
+
+# Async PostgreSQL driver used by SQLAlchemy
+asyncpg==0.30.0
+
+# Database migration tool
+alembic==1.14.0
+
+# Loads environment variables from the backend .env file
+python-dotenv==1.0.1

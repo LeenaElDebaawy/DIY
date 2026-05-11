@@ -1,0 +1,16 @@
+services:
+  db:
+    image: postgres:16
+    container_name: fixly_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fixly_user
+      POSTGRES_PASSWORD: devpassword
+      POSTGRES_DB: fixly
+    ports:
+      - "5433:5432"
+    volumes:
+      - fixly_pgdata:/var/lib/postgresql/data
+
+volumes:
+  fixly_pgdata:

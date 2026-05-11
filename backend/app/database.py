@@ -1,25 +1,40 @@
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, DeclarativeBase
+import os
+from collections.abc import AsyncGenerator
 
-# SQLite database file stored inside the backend folder
-DATABASE_URL = "sqlite:///./fixly.db"
-
-# Create the database engine
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False}, # needed for SQLite with FastAPI
+from dotenv import load_dotenv
+from sqlalchemy.ext.asyncio import (
+    create_async_engine,
+    async_sessionmaker,
+    AsyncSession,
 )
-# Create a session factory for database operations
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+from sqlalchemy.orm import DeclarativeBase
 
-# Base class that all database models will inherit from
+# Load environment variables from backend/.env
+load_dotenv()
+
+# Read the database URL from the .env file
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+asyncpg://fixly_user:devpassword@localhost:5433/fixly",
+)
+
+# Create the async database engine
+engine = create_async_engine(DATABASE_URL, echo=True)
+
+# Create async database sessions
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+# Base class for all database models
 class Base(DeclarativeBase):
     pass
 
-# Dependency function that gives a database session to route functions
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+
+# This dependency gives route functions a database session
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+
+    # Open a database session
+    async with AsyncSessionLocal() as session:
+
+        # Hand the session to the route while it is running
+        yield session

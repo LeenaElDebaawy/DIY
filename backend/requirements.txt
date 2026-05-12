@@ -15,3 +15,10 @@ alembic==1.14.0
 
 # Loads environment variables from the backend .env file
 python-dotenv==1.0.1
+
+# Password hashing library for secure authentication
+passlib[bcrypt]==1.7.4
+# bcrypt 3.2.2 is the last release fully compatible with passlib 1.7.4 on all platforms.
+# Versions 4.x removed __about__ and changed internal API, breaking passlib's verify path.
+bcrypt==3.2.2
+

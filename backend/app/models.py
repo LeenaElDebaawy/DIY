@@ -26,8 +26,12 @@ class User(Base):
     # Password is stored only as a hash, never as plain text
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
 
-    # Account plan, default is free
-    plan: Mapped[str] = mapped_column(String(50), default="free", nullable=False)
+    # Account plan, default is free.
+    # server_default sets the default at the PostgreSQL level so the column
+    # can never be NULL even if the ORM omits the value on insert.
+    plan: Mapped[str] = mapped_column(
+        String(50), default="free", server_default="free", nullable=False
+    )
 
     # Timestamp created automatically by the database
     created_at: Mapped[datetime.datetime] = mapped_column(

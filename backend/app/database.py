@@ -18,8 +18,14 @@ DATABASE_URL = os.getenv(
     "postgresql+asyncpg://fixly_user:devpassword@localhost:5433/fixly",
 )
 
-# Create the async database engine
-engine = create_async_engine(DATABASE_URL, echo=True)
+# Create the async database engine.
+# echo=True prints every SQL statement — useful during initial development
+# but very noisy once the AI pipeline starts making dozens of queries per run.
+# Set DATABASE_ECHO=true in .env to re-enable for debugging.
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=os.getenv("DATABASE_ECHO", "false").lower() == "true",
+)
 
 # Create async database sessions
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)

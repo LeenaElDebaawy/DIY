@@ -6,6 +6,7 @@ from fastapi import HTTPException, status
 from passlib.context import CryptContext
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models import User, UserToken
 
@@ -66,7 +67,15 @@ async def register_user(
 async def login_user(
     db: AsyncSession, email: str, password: str
 ) -> tuple[User, str]:
-    result = await db.execute(select(User).where(User.email == email))
+    # selectinload(User.tokens) pre-loads the tokens collection in the same
+    # round-trip.  Without it, db.add(UserToken(...)) later causes SQLAlchemy
+    # to backpopulate user.tokens, which triggers an implicit lazy SQL query.
+    # Implicit SQL in async context raises MissingGreenlet → 500.
+    result = await db.execute(
+        select(User)
+        .where(User.email == email)
+        .options(selectinload(User.tokens))
+    )
     user = result.scalar_one_or_none()
 
     # Same message for wrong email AND wrong password on purpose —

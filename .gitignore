@@ -6,3 +6,17 @@ venv/
 .env
 *.egg-info/
 *.db
+
+# Logs
+*.log
+backend/backend.log
+backend/backend_err.log
+backend/uvicorn_test.log
+frontend/frontend.log
+frontend/frontend_err.log
+
+# Uploaded files (local storage)
+backend/uploads/
+
+# NiceGUI user session storage
+frontend/.nicegui/storage-user-*.json

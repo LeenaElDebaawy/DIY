@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
 from app.database import get_db
@@ -18,9 +18,11 @@ def health_check():
 
 
 @router.get("/health/db")
-def db_check(db: Session = Depends(get_db)):
-    # Run a very small SQL query to confirm the database connection works
-    db.execute(text("SELECT 1"))
+async def db_check(db: AsyncSession = Depends(get_db)):
+    # Actually await the query so we know the DB connection is real.
+    # The previous version was sync and dropped the coroutine silently —
+    # it always returned "ok" even when the database was unreachable.
+    await db.execute(text("SELECT 1"))
     return {
         "status": "ok",
         "message": "Database connection working",

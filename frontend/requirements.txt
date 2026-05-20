@@ -2,3 +2,5 @@
 nicegui==2.7.0
 # HTTP client used by the frontend to call the backend API
 httpx==0.27.2
+# Required by FastAPI to parse multipart/form-data (file uploads)
+python-multipart==0.0.9

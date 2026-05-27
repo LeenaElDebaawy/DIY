@@ -21,6 +21,7 @@ class MessageRequest(BaseModel):
     """Body for POST /cases/{case_id}/chat."""
 
     content: str
+    image_ids: list[int] = []   # optional follow-up photo IDs uploaded via chat toolbar
 
 
 class MessageResponse(BaseModel):

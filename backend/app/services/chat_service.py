@@ -31,6 +31,7 @@ Graceful degradation:
 
 import logging
 import os
+from pathlib import Path
 from typing import Optional
 
 import ollama
@@ -38,15 +39,23 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Analysis, Message, Session as RepairSession
+from app.models import Analysis, Message, Session as RepairSession, Upload
 
 log = logging.getLogger(__name__)
 
-OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL",  "http://localhost:11434")
-CHAT_MODEL       = os.getenv("CHAT_MODEL",       "llama3.1:8b")
-CHAT_NUM_CTX     = int(os.getenv("CHAT_NUM_CTX",     "2048"))
-CHAT_NUM_PREDICT = int(os.getenv("CHAT_NUM_PREDICT", "768"))
-OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "5m")
+OLLAMA_BASE_URL   = os.getenv("OLLAMA_BASE_URL",   "http://localhost:11434")
+CHAT_MODEL        = os.getenv("CHAT_MODEL",        "llama3.1:8b")
+CHAT_NUM_CTX      = int(os.getenv("CHAT_NUM_CTX",      "2048"))
+CHAT_NUM_PREDICT  = int(os.getenv("CHAT_NUM_PREDICT",  "768"))
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE",  "5m")
+
+# Vision model used for lightweight follow-up image analysis in chat.
+# Defaults to the same model as Stage 1 in the analysis pipeline.
+STAGE_1_MODEL    = os.getenv("STAGE_1_MODEL",     "qwen2.5vl:7b")
+STAGE_1_NUM_CTX  = int(os.getenv("STAGE_1_NUM_CTX",  "4096"))
+
+# Upload directory — must match analysis_service.py so storage paths resolve.
+UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
 
 # The scope instruction appended to every system prompt — keeps the assistant
 # from drifting into general-purpose chat unrelated to the repair case.
@@ -86,6 +95,7 @@ async def send_message(
     case_id: int,
     user_id: int,
     content: str,
+    image_ids: list[int] | None = None,
 ) -> Message:
     """
     Persist the user's message, call the AI, persist the reply, return the reply.
@@ -118,6 +128,20 @@ async def send_message(
 
     # 1. Build system prompt from the latest complete analysis
     system_prompt = await _build_system_prompt(db, case_id)
+
+    # 1b. If the user attached follow-up images, run a quick vision pass and
+    #     append the description to the system prompt so Knitra can refer to them.
+    image_context = ""
+    if image_ids:
+        image_context = await _describe_chat_images(db, case_id, image_ids)
+        if image_context:
+            system_prompt = (
+                system_prompt
+                + f"\n\nThe user has attached {len(image_ids)} follow-up photo(s) to this message. "
+                "Vision analysis of those photos:\n"
+                + image_context
+                + "\nReference these observations when answering the user's question."
+            )
 
     # 2. Load message history
     history_result = await db.execute(
@@ -201,6 +225,96 @@ async def _require_owned_case(
     return case
 
 
+async def _describe_chat_images(
+    db: AsyncSession,
+    case_id: int,
+    image_ids: list[int],
+) -> str:
+    """
+    Load uploads by ID (verifying they belong to this case), run a lightweight
+    single-shot Qwen2.5-VL pass on each image, and return a brief description.
+
+    This is intentionally simpler than the full Stage 1 pipeline:
+      - No Pydantic schema validation (we just want natural-language description)
+      - No retries (if the model fails, Knitra still has the rest of the context)
+      - Low num_predict (200 tokens — just enough for 2-3 descriptive sentences)
+
+    Returns an empty string if no images could be loaded or the model fails.
+    """
+    import base64, io
+    if not image_ids:
+        return ""
+
+    # Load only uploads that belong to this case (prevents cross-case path traversal)
+    rows = await db.execute(
+        select(Upload).where(
+            Upload.id.in_(image_ids),
+            Upload.session_id == case_id,
+        )
+    )
+    uploads = list(rows.scalars().all())
+    if not uploads:
+        log.warning("No matching uploads found for image_ids %s in case %d", image_ids, case_id)
+        return ""
+
+    # Encode images as base64 (reuse Pillow resize logic inline to avoid import cycle)
+    try:
+        from PIL import Image as _PILImage
+        _pil_available = True
+    except ImportError:
+        _pil_available = False
+
+    encoded_images: list[str] = []
+    for upload in uploads:
+        full = UPLOAD_DIR / upload.storage_path
+        if not full.exists():
+            log.warning("Follow-up image not found: %s", full)
+            continue
+        try:
+            raw = full.read_bytes()
+            if _pil_available:
+                img = _PILImage.open(io.BytesIO(raw))
+                if img.mode not in ("RGB", "L"):
+                    img = img.convert("RGB")
+                img.thumbnail((512, 512))
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=82)
+                encoded_images.append(base64.b64encode(buf.getvalue()).decode())
+            else:
+                encoded_images.append(base64.b64encode(raw).decode())
+        except Exception as exc:
+            log.warning("Failed to encode follow-up image %s: %s", upload.storage_path, exc)
+
+    if not encoded_images:
+        return ""
+
+    try:
+        resp = await _ollama.chat(
+            model=STAGE_1_MODEL,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "You are a home repair assistant. "
+                    "Look at the attached photo(s) and describe in 2-4 sentences: "
+                    "what you see, any visible damage or wear, the approximate severity, "
+                    "and any detail that would help a repair diagnosis. "
+                    "Be specific and practical."
+                ),
+                "images": encoded_images,
+            }],
+            options={
+                "temperature": 0.2,
+                "num_predict": 200,
+                "num_ctx": STAGE_1_NUM_CTX,
+            },
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        return resp.message.content.strip()
+    except Exception as exc:
+        log.warning("Chat follow-up image vision failed: %s", exc)
+        return ""
+
+
 async def _build_system_prompt(db: AsyncSession, case_id: int) -> str:
     """
     Build a case-aware system prompt from the latest complete analysis.
@@ -225,10 +339,59 @@ async def _build_system_prompt(db: AsyncSession, case_id: int) -> str:
     analysis = result.scalar_one_or_none()
 
     if analysis is None or not analysis.structured_result:
-        # Fallback — analysis exists (checked above) but structured_result is empty.
-        # This can happen when the Stage 1 vision fallback ran.
+        # ── Check if the latest analysis is in needs_clarification state ──
+        # If so, build a prompt that explains WHY confidence was low and what
+        # the user needs to provide so Knitra can answer "why was the confidence low?"
+        nc_result = await db.execute(
+            select(Analysis)
+            .where(
+                Analysis.session_id == case_id,
+                Analysis.status == "needs_clarification",
+            )
+            .order_by(Analysis.created_at.desc())
+            .limit(1)
+        )
+        nc_analysis = nc_result.scalar_one_or_none()
+
+        if nc_analysis is not None and nc_analysis.stage_outputs:
+            s1 = (nc_analysis.stage_outputs or {}).get("stage_1") or {}
+            conf           = s1.get("confidence", "unknown")
+            conf_reason    = (s1.get("confidence_reason") or "").strip()
+            vis_evidence   = s1.get("visual_evidence") or []
+            unc_notes      = (s1.get("uncertainty_notes") or "").strip()
+            clarif_req     = (s1.get("clarification_request") or "").strip()
+            observations   = s1.get("observations") or []
+
+            seen_str   = "; ".join(vis_evidence[:6]) if vis_evidence else (
+                         "; ".join(observations[:4]) if observations else "nothing identifiable")
+            unsure_str = unc_notes or "the image was not clear enough to identify a specific problem"
+            clarif_str = clarif_req or nc_analysis.validation_issues or (
+                         "Please upload a closer, well-lit photo of the damaged area, "
+                         "or describe the problem in the text field.")
+
+            return (
+                "You are Knitra, a repair assistant for this case.\n"
+                + _REPAIR_SCOPE + "\n\n"
+                "The automated image analysis stopped because the AI's confidence was too low "
+                f"to safely diagnose the problem (confidence: {conf}%).\n\n"
+                "Stage 1 analysis summary:\n"
+                f"  Confidence    : {conf}%\n"
+                f"  Reason        : {conf_reason or 'Image was unclear or too ambiguous to classify.'}\n"
+                f"  What was seen : {seen_str}\n"
+                f"  Could not confirm: {unsure_str}\n"
+                f"  Clarification needed: {clarif_str}\n\n"
+                "Your job in this chat:\n"
+                "1. Explain clearly WHY the AI confidence was low — reference the specific reason above.\n"
+                "2. Tell the user EXACTLY what photo or information would help (use the clarification text above).\n"
+                "3. If the user describes what they see in text, try to give a provisional diagnosis and basic repair guidance.\n"
+                "4. Suggest whether a closer photo, wider photo, brighter photo, or written description would help most.\n"
+                "5. If the issue is described clearly enough in text, say so and offer to help plan the repair anyway.\n"
+                "Keep answers helpful and practical. UK context — UK brands, UK regulations, UK retailers."
+            )
+
+        # Generic fallback — no analysis at all
         return (
-            "You are Fixly, a repair assistant. "
+            "You are Knitra, a repair assistant. "
             + _REPAIR_SCOPE + " "
             "The automated image analysis for this case was inconclusive. "
             "Ask the user to describe the problem in detail and guide them "
@@ -267,11 +430,28 @@ async def _build_system_prompt(db: AsyncSession, case_id: int) -> str:
         if original_question else ""
     )
 
+    # Confidence / uncertainty block — from Stage 1 vision analysis
+    confidence_pct    = s1.get("confidence", "?")
+    confidence_reason = (s1.get("confidence_reason") or "").strip()
+    visual_evidence   = s1.get("visual_evidence") or []
+    uncertainty_notes = (s1.get("uncertainty_notes") or "").strip()
+
+    confidence_block = f"AI confidence: {confidence_pct}%"
+    if confidence_reason:
+        confidence_block += f" — {confidence_reason}"
+    if visual_evidence:
+        confidence_block += (
+            "\nVisually confirmed: " + "; ".join(visual_evidence[:6])
+        )
+    if uncertainty_notes:
+        confidence_block += f"\nUncertain/unconfirmed: {uncertainty_notes}"
+
     context = (
         f"{user_question_line}"
         f"Problem     : {s1.get('problem_type', 'Unknown')}\n"
         f"Trade       : {s1.get('trade_category', 'Unknown')}\n"
         f"Severity    : {s1.get('severity', 'Unknown')}\n"
+        f"{confidence_block}\n"
         f"Tools       : {tools_line}\n"
         f"Materials   : {materials_line}\n"
         f"Difficulty  : {s3.get('difficulty_level', 'Unknown')}\n"
@@ -300,18 +480,23 @@ async def _build_system_prompt(db: AsyncSession, case_id: int) -> str:
         )
 
     return (
-        "You are Fixly, the repair assistant for this specific case.\n"
+        "You are Knitra, the repair assistant for this specific case.\n"
         + _REPAIR_SCOPE + "\n"
         + fallback_note
         + high_risk_note
         + "\nRepair case context:\n"
         + context
-        + "\n\nAnswer follow-up questions accurately using the case context above. "
-        "If the user had an original question (shown above), make sure your answers "
-        "address it directly — do not ignore it or treat the chat as starting from scratch. "
-        "Reference specific steps, tools, or materials by name when relevant. "
-        "If the user describes new or worsening symptoms, acknowledge this and "
-        "adjust your guidance — do not ignore signs that the situation has changed. "
-        "If a repair involves electrical mains, gas, structural load, or significant "
-        "water damage, explicitly recommend consulting a qualified tradesperson."
+        + "\n\nAnswer follow-up questions accurately using the case context above.\n"
+        "If the user had an original question (shown above), address it directly.\n"
+        "Reference specific steps, tools, and materials from the repair plan by name.\n"
+        "If the case context includes uncertainty notes or unconfirmed details, "
+        "acknowledge these honestly when relevant — do not overstate what the image analysis "
+        "could confirm. For example, if crack depth was uncertain, say so rather than guessing.\n"
+        "If the user describes new or worsening symptoms, acknowledge this and adjust your "
+        "guidance — do not ignore signs that the situation has changed.\n"
+        "Keep answers practical and concise. UK context throughout — reference UK brands, "
+        "UK trade regulations (Part P, Gas Safe, Building Regs), and UK retailers (Screwfix, "
+        "Toolstation, B&Q, Wickes) where relevant.\n"
+        "If a repair involves electrical mains, gas, structural load, or significant water "
+        "damage, explicitly recommend consulting a qualified UK tradesperson."
     )

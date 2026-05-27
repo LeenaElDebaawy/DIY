@@ -13,7 +13,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Fixly", lifespan=lifespan)
+app = FastAPI(title="Knitra", lifespan=lifespan)
 
 # Allow the NiceGUI frontend (port 3000) to call the API directly from the browser.
 # This is needed for the Whisper transcription endpoint where JS sends audio as FormData.

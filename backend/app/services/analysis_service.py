@@ -537,14 +537,21 @@ async def _run_pipeline(
     start = time.monotonic()
 
     async with AsyncSessionLocal() as db:
+        case_row = None   # initialised here so the except block can always reference it
         try:
-            # Load the analysis row in this new session
+            # Load the analysis row and its parent case in this new session
             analysis = await db.get(Analysis, analysis_id)
             if analysis is None:
                 return  # row was deleted between creation and pipeline start
 
-            # Mark running
+            # Load case_row early so we can mirror analysis status throughout.
+            # This keeps Session.status in sync so the My Cases status filter works.
+            case_row = await db.get(RepairSession, case_id)
+
+            # Mark running — mirror to case so the Cases list shows "Analysing"
             analysis.status = "running"
+            if case_row is not None:
+                case_row.status = "running"
             await db.commit()
 
             # ── STAGE 1 — Image / Problem Analysis ───────────────────────────
@@ -555,29 +562,41 @@ async def _run_pipeline(
             _s1_fallback = False
             try:
                 s1: Stage1Output = await _stage_1_analyse(upload_paths, text_context)
-            except (ValueError, RuntimeError) as _s1_exc:
-                # Stage 1 failed all retries. Rather than aborting the whole
-                # pipeline, create a minimal Stage1Output from the user's text
-                # context (if any) so Stages 2 and 3 can still run and produce
-                # a useful repair guide. The frontend will show a warning.
-                log.warning(
-                    "Stage 1 failed — using graceful fallback. Error: %s", _s1_exc
+            except RuntimeError as _s1_exc:
+                # RuntimeError = Ollama connection/OOM/server error.
+                # These are NOT parse failures — retrying immediately will not help
+                # and continuing with fake Stage1Output produces garbage downstream.
+                # Fail fast with a clear message so the user knows to retry.
+                log.error(
+                    "Stage 1 runtime failure (OOM or Ollama error) — failing pipeline. Error: %s",
+                    _s1_exc,
                 )
-                _problem = (
-                    text_context.strip()
-                    if text_context and text_context.strip()
-                    else "Repair issue (could not analyse image automatically)"
-                )
-                s1 = Stage1Output(
-                    problem_type=_problem,
-                    trade_category="other",
-                    severity="medium",
-                    observations=[
-                        "Image could not be automatically analysed.",
-                        "Please describe the problem in more detail using the chat.",
-                    ],
-                )
-                _s1_fallback = True
+                raise  # re-raise → pipeline catches it in the outer except and marks failed
+            except ValueError as _s1_exc:
+                # ValueError = all retries exhausted on parse/validation errors.
+                # Only fall back to text context if the user provided one — that gives
+                # Stages 2+3 something real to work from rather than a generic placeholder.
+                if text_context and text_context.strip():
+                    log.warning(
+                        "Stage 1 parse failure — falling back to user text context. Error: %s",
+                        _s1_exc,
+                    )
+                    s1 = Stage1Output(
+                        problem_type=text_context.strip(),
+                        trade_category="other",
+                        severity="medium",
+                        observations=[
+                            "Image could not be automatically analysed — using your description instead.",
+                            "For a better diagnosis, try uploading a clearer or wider photo.",
+                        ],
+                    )
+                    _s1_fallback = True
+                else:
+                    log.error(
+                        "Stage 1 failed and no text context provided — failing pipeline. Error: %s",
+                        _s1_exc,
+                    )
+                    raise  # no text context to fall back to — fail the pipeline
             _ms_s1 = int((time.monotonic() - _t_s1) * 1000)
             log.info("Stage 1 in %.1fs%s", _ms_s1 / 1000,
                      " [fallback]" if _s1_fallback else "")
@@ -590,8 +609,38 @@ async def _run_pipeline(
             analysis.pipeline_stage = _S1_DONE
             await db.commit()
 
+            # ── Confidence gate ───────────────────────────────────────────────
+            # If Stage 1 is not confident enough to diagnose the problem, stop
+            # the pipeline and ask the user for a clearer photo or more context
+            # instead of generating unreliable repair steps.
+            # Threshold is 75 (not 50) because Qwen2.5-VL:3b tends to hallucinate
+            # confidence values of 60-70 even for featureless/dark images.
+            # 75 catches those while still allowing genuine 80+ readings through.
+            _LOW_CONFIDENCE = 75
+            if not _s1_fallback and (s1.needs_clarification or s1.confidence < _LOW_CONFIDENCE):
+                log.info(
+                    "Stage 1 confidence=%d needs_clarification=%s — stopping pipeline, "
+                    "asking user for clarification.",
+                    s1.confidence, s1.needs_clarification,
+                )
+                clarification_msg = (
+                    s1.clarification_request.strip()
+                    if s1.clarification_request.strip()
+                    else (
+                        "The photo is not clear enough to identify a specific home repair problem. "
+                        "Please upload a closer, well-lit photo of the damaged area, "
+                        "or describe the issue in the text field above."
+                    )
+                )
+                analysis.status = "needs_clarification"
+                analysis.pipeline_stage = "needs_clarification"
+                analysis.validation_issues = clarification_msg
+                if case_row is not None:
+                    case_row.status = "needs_clarification"
+                await db.commit()
+                return  # stop — do not run Stage 2 or 3
+
             # Auto-title: overwrite the placeholder "Diagnosing…" with the AI result
-            case_row = await db.get(RepairSession, case_id)
             if case_row is not None:
                 case_row.title    = s1.problem_type
                 case_row.category = s1.trade_category
@@ -630,6 +679,8 @@ async def _run_pipeline(
             analysis.structured_result  = combined.model_dump()
             analysis.status             = "complete"
             analysis.pipeline_stage     = "complete"
+            if case_row is not None:
+                case_row.status = "complete"
             analysis.processing_time_ms = _ms_total
             analysis.provider           = "ollama"
             analysis.model              = f"{STAGE_1_MODEL} | {STAGE_2_MODEL} | {STAGE_3_MODEL}"
@@ -650,8 +701,10 @@ async def _run_pipeline(
             # surface it and the user can decide whether to re-trigger.
             log.error("Pipeline failed for analysis_id=%d: %s", analysis_id, exc, exc_info=True)
             try:
-                analysis.status           = "failed"
+                analysis.status            = "failed"
                 analysis.validation_issues = f"{type(exc).__name__}: {exc}"
+                if case_row is not None:
+                    case_row.status = "failed"
                 await db.commit()
             except Exception:
                 pass  # if even the error write fails, there is nothing more we can do
@@ -708,21 +761,66 @@ async def _stage_1_analyse(
         "broken, worn, or malfunctioning.\n\n"
         "IMPORTANT rules:\n"
         "- Only describe what is LITERALLY VISIBLE in the image. Do not invent problems.\n"
-        "- If an image shows a door, lock, handle, hinge, or door hardware — classify it as carpentry.\n"
-        "- If an image shows a pipe, tap, drain, or water fitting — classify it as plumbing.\n"
-        "- If an image shows wiring, sockets, switches, or circuit breakers — classify it as electrical.\n"
-        "- If an image shows a wall, ceiling, or floor — classify it as structural or painting.\n"
-        "- For the observations, list only what you can concretely see in the photo.\n\n"
+        "- For the observations and visual_evidence, list only what you can concretely see.\n\n"
         "You must return a single JSON object with exactly these fields:\n"
         "  problem_type        : string — a short description of the specific item that needs repair\n"
         "                        (e.g. 'Loose door handle', 'Leaking pipe joint', 'Cracked wall plaster',\n"
-        "                        'Broken door lock', 'Worn door hinge')\n"
-        "  trade_category      : string — exactly one of:\n"
-        "                        plumbing, electrical, carpentry, appliance, structural,\n"
-        "                        painting, roofing, other\n"
+        "                        'Failed window seal', 'Draughty window frame')\n"
+        "  trade_category      : string — EXACTLY one of these 10 values (use the exact string):\n"
+        "                        plumbing, electrical, appliance, carpentry/joinery,\n"
+        "                        glazing, sealing/weatherproofing, plastering/decorating,\n"
+        "                        structural, hvac, general/other\n"
+        "\n"
+        "                        Use these rules to pick the correct value:\n"
+        "                        WINDOW-SPECIFIC:\n"
+        "                          cracked glass, broken pane, condensation between panes (failed\n"
+        "                            double-glazing unit) → glazing\n"
+        "                          wooden frame rot/damage, sash alignment, window latch/handle/hinge,\n"
+        "                            stiff or misaligned opening sash → carpentry/joinery\n"
+        "                          draught, failed silicone bead, water ingress around the frame,\n"
+        "                            gaps between frame and wall → sealing/weatherproofing\n"
+        "                          crack in the wall or lintel above/beside window opening → structural\n"
+        "                        OTHER:\n"
+        "                          pipes, taps, drains, radiator leaks → plumbing\n"
+        "                          wiring, sockets, switches, consumer units → electrical\n"
+        "                          washing machine, dishwasher, boiler body, oven → appliance\n"
+        "                          cracked/missing plaster, peeling paint, damp patches on walls → plastering/decorating\n"
+        "                          load-bearing walls, foundations, lintels, masonry cracks → structural\n"
+        "                          boiler controls, central heating, air conditioning, ventilation → hvac\n"
+        "                          anything else → general/other\n"
         "  severity            : string — exactly one of: low, medium, high\n"
         "  observations        : array of strings — 3 to 5 specific visual observations\n"
-        "                        describing exactly what you see in the image\n\n"
+        "                        describing exactly what you see in the image\n"
+        "  confidence          : integer 0-100 — your confidence that you can clearly identify\n"
+        "                        a specific home repair problem from this image and any user text.\n"
+        "                        STRICT RULES for confidence:\n"
+        "                        90-100 = damage is crystal clear in a sharp, well-lit, close-up photo.\n"
+        "                        76-89  = image is usable but not ideal (slightly blurry, far away, etc).\n"
+        "                        0-75   = ANYTHING that is: mostly dark or black, mostly one solid colour,\n"
+        "                                 random noise or static, a non-home-repair subject (food, person,\n"
+        "                                 sky, text document, screenshot), too blurry to identify any object,\n"
+        "                                 or where you are guessing rather than seeing clear damage.\n"
+        "                        If you are not certain what is shown, you MUST use 0-75.\n"
+        "  needs_clarification : boolean — true if confidence is 75 or below OR the image does not\n"
+        "                        show a recognisable home repair problem; false otherwise.\n"
+        "  clarification_request: string — if needs_clarification is true, write ONE specific sentence\n"
+        "                        telling the user exactly what better photo or information would help\n"
+        "                        (e.g. 'Please upload a closer, well-lit photo of the damaged pipe joint').\n"
+        "                        If needs_clarification is false, use an empty string.\n"
+        "  confidence_reason   : string — one to two sentences explaining exactly why you gave this\n"
+        "                        confidence score. Be specific about what made the image clear or unclear.\n"
+        "                        Example: 'Sharp close-up clearly shows a diagonal crack through painted\n"
+        "                        plaster with visible dust below; damage extent and location are unambiguous.'\n"
+        "  visual_evidence     : array of strings — list every distinct object or feature you can clearly\n"
+        "                        see in the image, not just the damaged part. Be specific and factual.\n"
+        "                        Example: ['White painted wall', 'Diagonal hairline crack approx 20cm',\n"
+        "                        'Plaster dust on skirting board below crack', 'Painted skirting board']\n"
+        "                        Do NOT include items you cannot actually see.\n"
+        "  uncertainty_notes   : string — describe ONLY what you cannot confirm from the image alone\n"
+        "                        (e.g. depth of crack, hidden damage behind surface, age of problem).\n"
+        "                        If you are confident about everything relevant, use an empty string \"\".\n"
+        "                        Example: 'Cannot determine whether crack penetrates full plaster depth\n"
+        "                        or is surface-only; no sign of damp but cannot rule it out.'\n\n"
         "Return ONLY the JSON object.  No explanation, no markdown, no extra text."
     )
 
@@ -743,19 +841,18 @@ async def _stage_1_analyse(
         },
     ]
 
-    # CRITICAL: num_ctx must cover system prompt (~200 tok) + image tokens
-    # (~500-700 per image for Qwen2.5-VL) + JSON response (~300 tok).
-    # The old value of 512 caused the model to truncate mid-JSON on every call.
-    # num_predict=400 is sufficient for a 4-field JSON response; keeping it
-    # small reduces inference time without risking output truncation.
+    # CRITICAL: num_ctx must cover system prompt (~350 tok now, with new fields)
+    # + image tokens (~500-700 per image for Qwen2.5-VL) + JSON response (~600 tok).
+    # num_predict is set to STAGE_1_NUM_PREDICT (default 800) to accommodate
+    # confidence/clarification fields + visual_evidence list + confidence_reason + uncertainty_notes.
     return await _call_stage(
         model=STAGE_1_MODEL,
         messages=messages,
         schema_class=Stage1Output,
         stage_name="stage_1 (Qwen2.5-VL)",
         extra_options={
-            "num_ctx":     STAGE_1_NUM_CTX,     # 4096 — the real fix
-            "num_predict": STAGE_1_NUM_PREDICT,  # 400  — short JSON output
+            "num_ctx":     STAGE_1_NUM_CTX,     # 4096
+            "num_predict": STAGE_1_NUM_PREDICT,  # bumped to 600 in .env
         },
     )
 
@@ -795,23 +892,42 @@ async def _stage_2_resources(stage_1: Stage1Output) -> Stage2Output:
     )
 
     system_prompt = (
-        "You are a home repair planning expert. "
-        "Given a diagnosis of a home repair problem, your job is to list exactly "
-        "what the user needs before they can start the repair.\n\n"
-        "Separate tools and materials into ESSENTIAL (must-have to complete the job) "
-        "and OPTIONAL (helpful but the job can be done without them).\n\n"
+        "You are an experienced UK DIY advisor helping a homeowner prepare for a repair.\n"
+        "Your job is to list exactly what they need before starting — tools, materials, and safety gear.\n\n"
+        "RULES:\n"
+        "1. Recommend SPECIFIC UK products and brands where relevant. Examples by trade:\n"
+        "   Plasterwork/filling: Polyfilla Ready Mixed (small cracks up to 5mm), Toupret TX110 Fibre (cracks\n"
+        "     5-20mm or on damp/movement-prone surfaces), Toupret Interior Filler (general patching),\n"
+        "     Blue Grit bonding agent (before skim coat on smooth surfaces), Gyproc EasiFill (for large areas).\n"
+        "   Adhesives/sealants: UniBond No More Nails (general bonding), Gorilla Grab Adhesive,\n"
+        "     CT1 Sealant (superior waterproof multipurpose sealant for wet areas),\n"
+        "     Dow Corning 785 or UniBond Silicone (bathroom/kitchen silicone), Everbuild Flash Band.\n"
+        "   Paints/primers: Dulux or Johnstone's Trade matt emulsion (interior walls), Zinsser Bulls Eye 1-2-3\n"
+        "     (stain-blocking primer), Johnstone's Exterior Gloss (exterior woodwork), Dulux Weathershield.\n"
+        "   Plumbing: PTFE tape (standard 12mm thread seal), Fernox F1 or Sentinel X100 (heating system\n"
+        "     inhibitor if relevant), push-fit fittings (e.g. John Guest or Speedfit), solvent weld fittings.\n"
+        "   Wood/timber: Ronseal Exterior Wood Filler (two-part, for outdoor wood), Ronseal Interior Wood\n"
+        "     Filler (ready mixed, for indoor), Ronseal Hardener + Filler (for soft/rotten timber),\n"
+        "     Osmo Polyx Oil or Ronseal Hardwood Decking Oil (for hardwood), Sadolin Classic (softwood).\n"
+        "   Fixings: Rawlplug or Fischer wall plugs (specify size: red=6mm, brown=7mm, yellow=5mm),\n"
+        "     Resin anchor (Hilti HIT-RE 500 or Fischer FIS EV) for structural fixings.\n"
+        "2. Size and spec every tool entry. Example: 'No.2 cross-head (Pozidriv) screwdriver — for the\n"
+        "   M5 pan-head screws securing the bracket'. Never list a bare tool name.\n"
+        "3. For materials, include the pack/tube size and mixing ratio where relevant.\n"
+        "   Example: 'Polyfilla Ready Mixed (500g tub — apply with filling knife, no mixing required,\n"
+        "   dries white in 2-4 hours depending on depth)'.\n"
+        "4. Separate ESSENTIAL items (job cannot be done without them) from OPTIONAL (improve the result\n"
+        "   or speed up the work but not strictly required).\n"
+        "5. Include realistic estimated_time_minutes — this must account for drying/curing wait times\n"
+        "   where relevant (e.g. a two-coat filler repair is not 30 min, it is 3-4 hours including drying).\n\n"
         "You must return a single JSON object with exactly these fields:\n"
-        "  tools                   : array of strings — ESSENTIAL tools you cannot do without\n"
-        "                            (e.g. ['Adjustable spanner', 'Pipe cutter'])\n"
-        "  optional_tools          : array of strings — OPTIONAL tools that make the job easier\n"
-        "                            (e.g. ['Pipe vice', 'Deburring tool'])\n"
-        "  materials               : array of strings — ESSENTIAL consumable materials\n"
-        "                            (e.g. ['PTFE tape', 'Replacement connector'])\n"
-        "  optional_materials      : array of strings — OPTIONAL materials that improve the result\n"
-        "                            (e.g. ['Thread sealant compound', 'Pipe lagging'])\n"
-        "  protective_gear         : array of strings — safety equipment\n"
-        "                            (e.g. ['Rubber gloves', 'Safety glasses'])\n"
-        "  estimated_time_minutes  : integer — realistic time for a competent DIYer\n\n"
+        "  tools                   : array of strings — ESSENTIAL tools, each with spec and purpose\n"
+        "  optional_tools          : array of strings — OPTIONAL tools, each with spec and purpose\n"
+        "  materials               : array of strings — ESSENTIAL consumable materials, each with brand,\n"
+        "                            pack size, and brief usage note\n"
+        "  optional_materials      : array of strings — OPTIONAL materials, each with brand and usage note\n"
+        "  protective_gear         : array of strings — safety equipment with one-line reason\n"
+        "  estimated_time_minutes  : integer — total realistic time including any drying/curing waits\n\n"
         "Return ONLY the JSON object.  No explanation, no markdown, no extra text."
     )
 
@@ -873,23 +989,58 @@ async def _stage_3_steps(
     )
 
     system_prompt = (
-        "You are a home repair instruction writer. "
-        "Given a repair diagnosis and a list of available tools and materials, "
-        "your job is to write clear, safe, step-by-step repair instructions "
-        "for a competent DIYer.\n\n"
+        "You are an experienced UK DIY advisor writing repair instructions for a homeowner.\n"
+        "Write like a knowledgeable tradesperson giving practical, honest advice — not like a textbook.\n"
+        "Be direct, specific, and realistic. UK context throughout.\n\n"
+        "STEP WRITING RULES — read every rule before writing:\n"
+        "1. ONE action per step. Never combine two actions (e.g. 'remove the screw AND clean the area')\n"
+        "   into one step. Split them into two separate steps.\n"
+        "2. Always begin with a clear PREP step (e.g. 'Lay dust sheets', 'Turn off the water supply',\n"
+        "   'Turn off the circuit breaker') before any work step.\n"
+        "3. Where a material must DRY or CURE, make that a separate step with a realistic wait time.\n"
+        "   Example: 'Leave the first coat of Polyfilla to dry fully — this takes 2 to 4 hours\n"
+        "   depending on depth and room temperature. The filler changes from pink to white when dry.'\n"
+        "4. Reference the tools and materials from the provided list by their exact names.\n"
+        "5. Each step description must say: (a) which tool or material, (b) the exact action,\n"
+        "   (c) what done correctly looks or feels like, (d) one warning sign that something is wrong.\n"
+        "6. For plaster/filler work: always mention feathering the edges, sanding between coats,\n"
+        "   and applying mist coat before painting. Mention primer where needed.\n"
+        "7. For any wet-area work (bathroom, kitchen): mention CT1 or silicone over standard filler,\n"
+        "   and allow 24 hours cure before exposing to water.\n"
+        "8. Use realistic language: 'press firmly', 'sand with light circular strokes', 'the surface\n"
+        "   should feel smooth under your fingertip', 'no ridges or proud edges'. Avoid 'ensure' and\n"
+        "   'make sure' — use direct imperatives instead ('press', 'sand', 'wipe').\n"
+        "9. Step titles must be short action phrases: 'Lay dust sheets', 'Apply first filler coat',\n"
+        "   'Sand the dried filler'. Never use step titles longer than 8 words.\n"
+        "10. Include 6 to 10 steps for typical repairs. Do not pad with unnecessary steps.\n\n"
+        "SAFETY NOTES RULES:\n"
+        "safety_notes must be an array of plain strings. Each string is one complete sentence.\n"
+        "Do NOT return objects or dicts inside safety_notes. CORRECT: [\"Wear safety glasses when sanding.\"]\n"
+        "WRONG: [{\"note\": \"Wear safety glasses when sanding.\"}]\n"
+        "Each note must be specific to the trade category and this problem — no generic platitudes.\n\n"
+        "RISK ASSESSMENT:\n"
+        "Set diy_recommended to false if the repair involves:\n"
+        "  - mains electrical wiring (230V), consumer units, or fuse boxes\n"
+        "  - gas pipes, boilers, or gas appliances (Gas Safe registration required by law)\n"
+        "  - structural load-bearing walls, beams, or foundations\n"
+        "  - significant water damage with risk of electrical exposure\n"
+        "  - asbestos (pre-2000 buildings, textured coatings, floor tiles, pipe lagging)\n"
+        "If diy_recommended is false, set professional_type to the exact trade: 'Gas Safe engineer',\n"
+        "'NICEIC-registered electrician', 'structural engineer', 'CIPHE-registered plumber', etc.\n"
+        "If diy_recommended is true, set professional_type to null.\n\n"
         "You must return a single JSON object with exactly these fields:\n"
         "  steps                      : array of step objects, each containing:\n"
         "    step_number              : integer starting at 1\n"
-        "    title                    : short action title (e.g. 'Shut off water supply')\n"
-        "    description              : full instruction paragraph\n"
-        "    warning                  : safety warning string, or null if not needed\n"
-        "  safety_notes               : array of 3–5 global safety notes\n"
-        "                              that apply throughout the entire repair\n"
+        "    title                    : short action phrase, max 8 words\n"
+        "    description              : practical instruction paragraph following the rules above\n"
+        "    warning                  : specific safety or quality warning string, or null\n"
+        "  safety_notes               : array of 3 to 5 plain strings — NOT objects, plain strings only\n"
         "  difficulty_level           : exactly one of: beginner, intermediate, advanced\n"
-        "  when_to_call_professional  : string — clear condition under which the\n"
-        "                              user should stop and call a qualified tradesperson\n\n"
-        "Make instructions specific and actionable.  Reference the tools and materials "
-        "by name.  Add a warning field only when there is a genuine safety risk.\n\n"
+        "  when_to_call_professional  : string — ALWAYS required, never null. If diy_recommended is true,\n"
+        "                              write the specific warning signs that mean the user should stop\n"
+        "                              and call a professional. If diy_recommended is false, explain why.\n"
+        "  diy_recommended            : boolean\n"
+        "  professional_type          : string or null\n\n"
         "Return ONLY the JSON object.  No explanation, no markdown, no extra text."
     )
 

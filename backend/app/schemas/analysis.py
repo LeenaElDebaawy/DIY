@@ -24,7 +24,7 @@ Analysis.structured_result as a JSONB dict.
 import datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,16 +51,140 @@ class Stage1Output(BaseModel):
     """
     What the vision model sees and classifies from the uploaded images.
 
-    trade_category is intentionally a clean normalised label
-    ("plumbing", "electrical", "carpentry", "appliance", "structural", "other").
-    This label is reused later for:
+    trade_category is intentionally a clean normalised label from the fixed
+    vocabulary below.  This label is reused later for:
       - routing nearby-services geo-queries (no extra LLM call needed)
       - structured tool/material lookups in a future hybrid approach
+      - frontend filtering in My Cases
+
+    Allowed trade_category values:
+      plumbing              - pipes, taps, drains, radiator leaks, water fittings
+      electrical            - wiring, sockets, switches, consumer units
+      appliance             - washing machine, dishwasher, boiler, oven
+      carpentry/joinery     - wooden frames, doors, sashes, hinges, latches, handles
+      glazing               - cracked glass, failed double-glazing (condensation between panes)
+      sealing/weatherproofing - draughts, failed silicone seals, water ingress around frames
+      plastering/decorating - cracked/missing plaster, peeling paint, damp patches on walls
+      structural            - load-bearing walls, foundations, lintels, masonry cracks, roofing
+      hvac                  - boiler controls, central heating, air conditioning, ventilation
+      general/other         - anything that does not fit the above
+
+    confidence is a self-rated integer 0-100.  Values at or below _LOW_CONFIDENCE
+    cause the pipeline to stop and ask the user for a clearer photo or description
+    instead of generating potentially wrong repair steps.
     """
     problem_type: str           # short human-readable description, e.g. "Leaking pipe joint"
     trade_category: str         # normalised trade label — see docstring
     severity: str               # "low" | "medium" | "high"
     observations: list[str]     # bullet-point list of what was visually identified
+    confidence: int = 75        # 0-100; below LOW_CONFIDENCE_THRESHOLD → clarification gate
+    needs_clarification: bool = False  # true when the image/text is not enough to diagnose
+    clarification_request: str = ""    # user-facing message when needs_clarification is true
+    confidence_reason: str = ""        # one-two sentence explanation of why this score was given
+    visual_evidence: list[str] = []    # every distinct object/feature clearly seen in the image
+    uncertainty_notes: str = ""        # what could not be confirmed; empty string if everything is clear
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _coerce_confidence(cls, v: object) -> int:
+        """Accept string digits or floats; clamp to 0-100."""
+        try:
+            val = int(float(str(v)))
+        except (TypeError, ValueError):
+            return 75
+        return max(0, min(100, val))
+
+    @field_validator("needs_clarification", mode="before")
+    @classmethod
+    def _coerce_needs_clarification(cls, v: object) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.lower() in ("true", "1", "yes")
+        return bool(v)
+
+    @field_validator("trade_category", mode="before")
+    @classmethod
+    def _normalise_trade_category(cls, v: object) -> str:
+        """
+        Normalise model output to the current 10-category vocabulary.
+
+        Old analyses stored in JSONB may carry legacy labels such as
+        "carpentry", "painting", "roofing", or "other".  New analyses
+        from models that ignore the prompt may return minor variants.
+        This validator maps all of them to the canonical label so the
+        rest of the pipeline and the frontend can rely on a stable set.
+        """
+        _CANONICAL = {
+            # Current vocabulary (pass through unchanged)
+            "plumbing":                 "plumbing",
+            "electrical":               "electrical",
+            "appliance":                "appliance",
+            "carpentry/joinery":        "carpentry/joinery",
+            "glazing":                  "glazing",
+            "sealing/weatherproofing":  "sealing/weatherproofing",
+            "plastering/decorating":    "plastering/decorating",
+            "structural":               "structural",
+            "hvac":                     "hvac",
+            "general/other":            "general/other",
+            # Legacy labels from the old 8-category prompt
+            "carpentry":                "carpentry/joinery",
+            "joinery":                  "carpentry/joinery",
+            "painting":                 "plastering/decorating",
+            "decorating":               "plastering/decorating",
+            "plastering":               "plastering/decorating",
+            "roofing":                  "structural",
+            "general":                  "general/other",
+            "other":                    "general/other",
+            # Plausible model variants
+            "sealing":                  "sealing/weatherproofing",
+            "weatherproofing":          "sealing/weatherproofing",
+            "heating":                  "hvac",
+            "ventilation":              "hvac",
+            "air conditioning":         "hvac",
+            "mechanical":               "hvac",
+            "glass":                    "glazing",
+            "windows":                  "glazing",
+        }
+        raw = str(v).strip().lower() if v else ""
+        return _CANONICAL.get(raw, "general/other")
+
+    @field_validator("clarification_request", mode="before")
+    @classmethod
+    def _coerce_clarification_request(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return str(v)
+
+    @field_validator("confidence_reason", mode="before")
+    @classmethod
+    def _coerce_confidence_reason(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return str(v)
+
+    @field_validator("visual_evidence", mode="before")
+    @classmethod
+    def _coerce_visual_evidence(cls, v: object) -> list[str]:
+        if not isinstance(v, list):
+            return []
+        result: list[str] = []
+        for item in v:
+            if isinstance(item, str):
+                result.append(item)
+            elif isinstance(item, dict):
+                for val in item.values():
+                    if isinstance(val, str) and val.strip():
+                        result.append(val.strip())
+                        break
+        return result
+
+    @field_validator("uncertainty_notes", mode="before")
+    @classmethod
+    def _coerce_uncertainty_notes(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return str(v)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -103,11 +227,55 @@ class Stage3Output(BaseModel):
 
     difficulty_level uses a fixed vocabulary so the frontend can render it
     with a consistent badge rather than parsing free text.
+
+    diy_recommended and professional_type provide structured risk assessment:
+      - diy_recommended: False means the repair is not safe for a DIYer to attempt
+      - professional_type: the specific trade to call (e.g. "licensed electrician")
+      - when_to_call_professional: plain-English explanation of the risk conditions
+
+    All three fields are always returned. For safe DIY repairs, diy_recommended
+    is True and professional_type is null.
+
+    Defaults ensure old stored JSONB analyses without these fields do not crash.
     """
     steps: list[RepairStep]
-    safety_notes: list[str]         # global notes that apply throughout the repair
-    difficulty_level: str           # "beginner" | "intermediate" | "advanced"
-    when_to_call_professional: str  # condition under which DIY should stop
+    safety_notes: list[str]              # global notes that apply throughout the repair
+    difficulty_level: str                # "beginner" | "intermediate" | "advanced"
+    when_to_call_professional: str = ""  # plain-English condition under which DIY should stop; empty string if fully DIY safe
+    diy_recommended: bool = True         # False if repair is unsafe for a DIYer
+    professional_type: Optional[str] = None  # e.g. "licensed electrician", "gas engineer"
+
+    @field_validator("safety_notes", mode="before")
+    @classmethod
+    def _coerce_safety_notes(cls, v: object) -> list[str]:
+        """
+        Llama 3.1 sometimes returns safety_notes as a list of dicts
+        e.g. [{"note": "Wear gloves."}] instead of ["Wear gloves."].
+        This validator extracts the string value from any dict entry so
+        Pydantic can proceed without a ValidationError.
+        Entries that are already strings pass through unchanged.
+        """
+        if not isinstance(v, list):
+            return v  # let Pydantic raise the type error normally
+        result: list[str] = []
+        for item in v:
+            if isinstance(item, str):
+                result.append(item)
+            elif isinstance(item, dict):
+                # grab the first string value found in the dict
+                for val in item.values():
+                    if isinstance(val, str) and val.strip():
+                        result.append(val.strip())
+                        break
+        return result
+
+    @field_validator("when_to_call_professional", mode="before")
+    @classmethod
+    def _coerce_when_to_call(cls, v: object) -> str:
+        """Return empty string instead of None so the field stays a str."""
+        if v is None:
+            return ""
+        return v
 
 
 # ─────────────────────────────────────────────────────────────────────────────

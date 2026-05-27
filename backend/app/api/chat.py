@@ -46,4 +46,4 @@ async def post_message(
     Persists the user message, calls the AI with full case context,
     persists the reply, and returns the assistant message.
     """
-    return await send_message(db, case_id, current_user.id, body.content)
+    return await send_message(db, case_id, current_user.id, body.content, body.image_ids)

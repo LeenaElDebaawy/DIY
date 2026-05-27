@@ -5,15 +5,44 @@ import httpx
 from nicegui import app, ui
 from nicegui.events import UploadEventArguments
 
-BACKEND = "http://127.0.0.1:8080"
+BACKEND = "http://127.0.0.1:8000"
 API     = f"{BACKEND}/api/v1"
 
 STATUS = {
-    "open":        {"stripe": "#6366f1", "bg": "#ede9fe", "fg": "#4c1d95", "label": "Open"},
-    "in_progress": {"stripe": "#f59e0b", "bg": "#fef3c7", "fg": "#78350f", "label": "In Progress"},
-    "resolved":    {"stripe": "#22c55e", "bg": "#dcfce7", "fg": "#14532d", "label": "Resolved"},
-    "closed":      {"stripe": "#94a3b8", "bg": "#f1f5f9", "fg": "#475569", "label": "Closed"},
+    "open":               {"stripe": "#6366f1", "bg": "#ede9fe", "fg": "#4c1d95", "label": "Open"},
+    "in_progress":        {"stripe": "#f59e0b", "bg": "#fef3c7", "fg": "#78350f", "label": "In Progress"},
+    "resolved":           {"stripe": "#22c55e", "bg": "#dcfce7", "fg": "#14532d", "label": "Resolved"},
+    "closed":             {"stripe": "#94a3b8", "bg": "#f1f5f9", "fg": "#475569", "label": "Closed"},
+    "complete":           {"stripe": "#22c55e", "bg": "#dcfce7", "fg": "#14532d", "label": "Complete"},
+    "failed":             {"stripe": "#ef4444", "bg": "#fee2e2", "fg": "#991b1b", "label": "Failed"},
+    "needs_clarification":{"stripe": "#f59e0b", "bg": "#fef3c7", "fg": "#78350f", "label": "Needs info"},
+    "running":            {"stripe": "#6366f1", "bg": "#ede9fe", "fg": "#4c1d95", "label": "Analysing"},
 }
+
+# Display labels for trade categories.
+# Maps the stored trade_category value (from Stage1Output) to a human-readable string.
+# Old legacy values are included so cases stored before the 10-category update still display correctly.
+_CATEGORY_LABELS: dict[str, str] = {
+    "plumbing":               "Plumbing",
+    "electrical":             "Electrical",
+    "appliance":              "Appliance",
+    "carpentry/joinery":      "Carpentry / Joinery",
+    "glazing":                "Glazing",
+    "sealing/weatherproofing":"Sealing / Weatherproofing",
+    "plastering/decorating":  "Plastering / Decorating",
+    "structural":             "Structural",
+    "hvac":                   "HVAC",
+    "general/other":          "General",
+    # Legacy labels stored before the 10-category update
+    "carpentry":              "Carpentry",
+    "painting":               "Decorating",
+    "roofing":                "Structural",
+    "other":                  "General",
+}
+
+def _cat_label(cat: str) -> str:
+    """Return a display-friendly label for a trade_category value."""
+    return _CATEGORY_LABELS.get((cat or "").lower(), (cat or "").replace("/", " / ").capitalize())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -344,7 +373,7 @@ def mobile_bar():
             border-radius:6px;display:flex;align-items:center;
             justify-content:center;font-size:13px;">&#128295;</div>
           <span style="color:white;font-size:1rem;font-weight:700;
-            letter-spacing:-0.02em;">Fixly</span>
+            letter-spacing:-0.02em;">Knitra</span>
         </div>
       </div>
     """)
@@ -375,7 +404,7 @@ def sidebar(active_path: str = "/cases"):
                   border-radius:7px;display:flex;align-items:center;
                   justify-content:center;font-size:16px;flex-shrink:0;">&#128295;</div>
                 <span style="color:white;font-size:1.05rem;font-weight:700;
-                  letter-spacing:-0.02em;">Fixly</span>
+                  letter-spacing:-0.02em;">Knitra</span>
               </div>
             """)
         logo.on("click", lambda: ui.navigate.to("/"))
@@ -487,7 +516,7 @@ def top_nav():
             )
             ui.html(
                 '<span style="color:white;font-size:1.05rem;font-weight:700;'
-                'letter-spacing:-0.02em;">Fixly</span>'
+                'letter-spacing:-0.02em;">Knitra</span>'
             )
         logo.on("click", lambda: ui.navigate.to("/"))
 
@@ -710,7 +739,7 @@ async def login_page():
                 '<h2 style="font-size:1.75rem;font-weight:800;color:#0f172a;'
                 'margin:0 0 6px;letter-spacing:-0.02em;">Welcome back</h2>'
                 '<p style="color:#64748b;margin:0;font-size:0.95rem;">'
-                'Log in to your Fixly account.</p></div>'
+                'Log in to your Knitra account.</p></div>'
             )
 
             with ui.card().style(
@@ -847,8 +876,53 @@ async def cases_page():
 
             ui.html(
                 '<div style="width:100%;height:1px;background:#e2e8f0;'
-                'margin-bottom:24px;"></div>'
+                'margin-bottom:20px;"></div>'
             )
+
+            # ── Filter bar ───────────────────────────────────────────────────
+            with ui.element("div").style(
+                "display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px;"
+            ):
+                _all_cat_opts = {
+                    "": "All categories",
+                    "plumbing":               "Plumbing",
+                    "electrical":             "Electrical",
+                    "appliance":              "Appliance",
+                    "carpentry/joinery":      "Carpentry / Joinery",
+                    "glazing":                "Glazing",
+                    "sealing/weatherproofing":"Sealing / Weatherproofing",
+                    "plastering/decorating":  "Plastering / Decorating",
+                    "structural":             "Structural",
+                    "hvac":                   "HVAC",
+                    "general/other":          "General",
+                }
+                _sort_opts    = {"desc": "Newest first", "asc": "Oldest first"}
+                _status_opts  = {
+                    "":                    "All statuses",
+                    "open":                "Open",
+                    "running":             "Analysing",
+                    "complete":            "Complete",
+                    "failed":              "Failed",
+                    "needs_clarification": "Needs info",
+                }
+                _conf_opts    = {
+                    "":     "All confidence",
+                    "high": "High (90+)",
+                    "good": "Good (76-89)",
+                    "low":  "Low (75 or below)",
+                }
+                _select_style = (
+                    "min-width:170px;font-size:0.82rem;"
+                    "background:white;"
+                )
+                flt_cat   = ui.select(_all_cat_opts,  value="", label="Category") \
+                              .style(_select_style)
+                flt_sort  = ui.select(_sort_opts,     value="desc", label="Sort") \
+                              .style(_select_style)
+                flt_stat  = ui.select(_status_opts,   value="", label="Status") \
+                              .style(_select_style)
+                flt_conf  = ui.select(_conf_opts,     value="", label="Confidence") \
+                              .style(_select_style)
 
             status_lbl = ui.label("").style(
                 "color:#94a3b8;font-size:0.875rem;display:block;margin-bottom:12px;"
@@ -857,13 +931,34 @@ async def cases_page():
                 "display:flex;flex-direction:column;gap:14px;"
             )
 
+            # All fetched cases — stored so filters can re-render without a new fetch
+            _all_cases: list[dict] = []
+
             async def render_card(case: dict):
-                cid = case["id"]
-                s   = STATUS.get(case["status"], STATUS["open"])
+                cid  = case["id"]
+                s    = STATUS.get(case["status"], STATUS["open"])
+                conf = case.get("confidence")
 
                 def open_delete(cid=cid):
                     delete_ref["case_id"] = cid
                     del_dlg.open()
+
+                # Build confidence badge HTML (empty string if no confidence yet)
+                if conf is not None:
+                    if conf >= 90:
+                        _cc, _cb = "#15803d", "#dcfce7"
+                    elif conf >= 76:
+                        _cc, _cb = "#92400e", "#fef3c7"
+                    else:
+                        _cc, _cb = "#dc2626", "#fee2e2"
+                    _conf_badge = (
+                        f'<span style="background:{_cb};color:{_cc};'
+                        f'padding:3px 10px;border-radius:100px;font-size:11px;'
+                        f'font-weight:700;white-space:nowrap;flex-shrink:0;">'
+                        f'{conf}% AI confidence</span>'
+                    )
+                else:
+                    _conf_badge = ""
 
                 with container:
                     with ui.element("div").classes("case-card"):
@@ -880,7 +975,7 @@ async def cases_page():
                                     "justify-content:space-between;gap:12px;"
                                 ):
                                     with ui.element("div").style(
-                                        "flex:1;display:flex;flex-direction:column;gap:2px;"
+                                        "flex:1;display:flex;flex-direction:column;gap:4px;"
                                     ):
                                         _title = case.get("title") or "Diagnosing…"
                                         ui.html(
@@ -888,10 +983,19 @@ async def cases_page():
                                             f'font-size:0.975rem;line-height:1.4;">'
                                             f'{_title}</span>'
                                         )
-                                        if case.get("category"):
+                                        # Category + confidence on same row
+                                        _cat_raw = case.get("category") or ""
+                                        _cat_html = (
+                                            f'<span style="font-size:0.78rem;color:#6366f1;'
+                                            f'font-weight:600;background:#ede9fe;'
+                                            f'padding:1px 8px;border-radius:100px;">'
+                                            f'{_cat_label(_cat_raw)}</span>'
+                                        ) if _cat_raw else ""
+                                        if _cat_html or _conf_badge:
                                             ui.html(
-                                                f'<span style="font-size:0.8rem;color:#94a3b8;">'
-                                                f'{case["category"].capitalize()}</span>'
+                                                f'<div style="display:flex;flex-wrap:wrap;'
+                                                f'align-items:center;gap:6px;">'
+                                                f'{_cat_html}{_conf_badge}</div>'
                                             )
                                     ui.html(
                                         f'<span style="background:{s["bg"]};color:{s["fg"]};'
@@ -936,7 +1040,85 @@ async def cases_page():
                                         lambda cid=cid: ui.navigate.to(f"/cases/{cid}")
                                     )
 
+            async def apply_filters():
+                """Re-render the container from _all_cases using current filter values."""
+                container.clear()
+                filtered = list(_all_cases)
+
+                # Category filter
+                cat_val = flt_cat.value or ""
+                if cat_val:
+                    filtered = [c for c in filtered if (c.get("category") or "") == cat_val]
+
+                # Status filter
+                stat_val = flt_stat.value or ""
+                if stat_val:
+                    filtered = [c for c in filtered if c.get("status") == stat_val]
+
+                # Confidence filter
+                conf_val = flt_conf.value or ""
+                if conf_val:
+                    def _conf_match(c: dict) -> bool:
+                        cv = c.get("confidence")
+                        if cv is None:
+                            return False   # old cases without confidence are excluded from specific tiers
+                        if conf_val == "high": return cv >= 90
+                        if conf_val == "good": return 76 <= cv <= 89
+                        if conf_val == "low":  return cv <= 75
+                        return True
+                    filtered = [c for c in filtered if _conf_match(c)]
+
+                # Sort
+                sort_val = flt_sort.value or "desc"
+                if sort_val == "asc":
+                    filtered = sorted(filtered, key=lambda c: c.get("created_at", ""))
+                # "desc" is already the default order from the API
+
+                if not filtered:
+                    with container:
+                        _active = any([cat_val, stat_val, conf_val])
+                        _msg = (
+                            "No cases match the current filters."
+                            if _active else
+                            "No cases yet"
+                        )
+                        _sub = (
+                            "Try clearing a filter to see more results."
+                            if _active else
+                            "Open your first case to get AI-guided repair instructions."
+                        )
+                        ui.html(
+                            f'<div style="background:white;border:1.5px dashed #e2e8f0;'
+                            f'border-radius:14px;padding:60px 32px;'
+                            f'display:flex;flex-direction:column;'
+                            f'align-items:center;text-align:center;gap:12px;">'
+                            f'<div style="font-size:2.8rem;opacity:0.3;">&#128295;</div>'
+                            f'<div style="font-weight:700;color:#334155;font-size:1.05rem;">'
+                            f'{_msg}</div>'
+                            f'<div style="color:#94a3b8;font-size:0.875rem;'
+                            f'max-width:280px;line-height:1.55;">'
+                            f'{_sub}</div></div>'
+                        )
+                        if not _active:
+                            ui.button("+ Open your first case",
+                                      on_click=lambda: ui.navigate.to("/new")) \
+                                .props("unelevated color=primary") \
+                                .style("font-weight:600;margin-top:4px;")
+                    return
+
+                for case in filtered:
+                    await render_card(case)
+
+            async def _on_filter_change(_=None):
+                await apply_filters()
+
+            flt_cat.on_value_change(_on_filter_change)
+            flt_sort.on_value_change(_on_filter_change)
+            flt_stat.on_value_change(_on_filter_change)
+            flt_conf.on_value_change(_on_filter_change)
+
             async def load_cases():
+                nonlocal _all_cases
                 container.clear()
                 status_lbl.set_text("Loading your cases…")
                 try:
@@ -947,30 +1129,9 @@ async def cases_page():
                             timeout=10.0,
                         )
                     if r.status_code == 200:
-                        cases = r.json()
+                        _all_cases = r.json()
                         status_lbl.set_text("")
-                        if not cases:
-                            with container:
-                                ui.html(
-                                    '<div style="background:white;border:1.5px dashed #e2e8f0;'
-                                    'border-radius:14px;padding:60px 32px;'
-                                    'display:flex;flex-direction:column;'
-                                    'align-items:center;text-align:center;gap:12px;">'
-                                    '<div style="font-size:2.8rem;opacity:0.3;">&#128295;</div>'
-                                    '<div style="font-weight:700;color:#334155;font-size:1.05rem;">'
-                                    'No cases yet</div>'
-                                    '<div style="color:#94a3b8;font-size:0.875rem;'
-                                    'max-width:260px;line-height:1.55;">'
-                                    'Open your first case to get AI-guided repair instructions.'
-                                    '</div></div>'
-                                )
-                                ui.button("+ Open your first case",
-                                          on_click=lambda: ui.navigate.to("/new")) \
-                                    .props("unelevated color=primary") \
-                                    .style("font-weight:600;margin-top:4px;")
-                            return
-                        for case in cases:
-                            await render_card(case)
+                        await apply_filters()
                     elif r.status_code == 401:
                         app.storage.user.clear()
                         ui.navigate.to("/login")
@@ -1140,7 +1301,9 @@ async def case_detail_page(case_id: int):
                     ):
                         with ui.element("div"):
                             _case_title = case.get("title") or "Diagnosing…"
-                            ui.html(
+                            # Keep a reference so _do_poll can update it in-place
+                            # when Stage 1 completes and the backend writes the real title.
+                            _title_el = ui.html(
                                 f'<h1 style="font-size:1.45rem;font-weight:800;color:#0f172a;'
                                 f'margin:0 0 10px;letter-spacing:-0.02em;">'
                                 f'{_case_title}</h1>'
@@ -1150,10 +1313,10 @@ async def case_detail_page(case_id: int):
                             ):
                                 if case.get("category"):
                                     ui.html(
-                                        f'<span style="background:#f1f5f9;color:#475569;'
+                                        f'<span style="background:#ede9fe;color:#4c1d95;'
                                         f'padding:4px 12px;border-radius:100px;'
                                         f'font-size:12px;font-weight:600;">'
-                                        f'{case["category"].capitalize()}</span>'
+                                        f'{_cat_label(case["category"])}</span>'
                                     )
                                 ui.html(
                                     f'<span style="background:{s["bg"]};color:{s["fg"]};'
@@ -1296,14 +1459,15 @@ async def case_detail_page(case_id: int):
 
             # ── Stage progress maps ───────────────────────────────────────────
             _STAGE_LABEL = {
-                None:                "Preparing&#8230;",
-                "stage_1_running":   "Reviewing your uploaded images&#8230;",
-                "stage_1_complete":  "Problem identified",
-                "stage_2_running":   "Gathering tools and materials&#8230;",
-                "stage_2_complete":  "Resources listed",
-                "stage_3_running":   "Preparing your repair steps&#8230;",
-                "stage_3_complete":  "Steps ready",
-                "complete":          "Analysis complete",
+                None:                     "Preparing&#8230;",
+                "stage_1_running":        "Reviewing your uploaded images&#8230;",
+                "stage_1_complete":       "Problem identified",
+                "stage_2_running":        "Gathering tools and materials&#8230;",
+                "stage_2_complete":       "Resources listed",
+                "stage_3_running":        "Preparing your repair steps&#8230;",
+                "stage_3_complete":       "Steps ready",
+                "complete":               "Analysis complete",
+                "needs_clarification":    "Clarification needed",
             }
             # pipeline_stage → approximate progress-bar percentage
             _STAGE_PCT = {
@@ -1332,12 +1496,33 @@ async def case_detail_page(case_id: int):
                 except Exception:
                     return None
 
-            async def _post_analyse():
-                """POST /analyse — returns (ok: bool, err_msg: str | None)."""
+            async def _get_case():
+                """GET /cases/{case_id} — returns dict or None."""
                 try:
+                    async with httpx.AsyncClient() as c:
+                        r = await c.get(
+                            f"{API}/cases/{case_id}",
+                            headers={"Authorization": f"Bearer {token}"},
+                            timeout=10.0,
+                        )
+                    return r.json() if r.status_code == 200 else None
+                except Exception:
+                    return None
+
+            async def _post_analyse(text_context: str | None = None):
+                """POST /analyse — returns (ok: bool, err_msg: str | None).
+
+                text_context is forwarded to the Stage 1 vision model so the user
+                can describe the issue when the photo alone was not clear enough.
+                """
+                try:
+                    body: dict = {}
+                    if text_context:
+                        body["text_context"] = text_context
                     async with httpx.AsyncClient() as c:
                         r = await c.post(
                             f"{API}/cases/{case_id}/analyse",
+                            json=body,
                             headers={"Authorization": f"Bearer {token}"},
                             timeout=10.0,
                         )
@@ -1405,7 +1590,7 @@ async def case_detail_page(case_id: int):
                         '<div style="color:#94a3b8;font-size:0.855rem;'
                         'max-width:320px;line-height:1.65;">'
                         'Upload at least one photo above, then click '
-                        '&#8220;Analyse this case&#8221;. Fixly will identify '
+                        '&#8220;Analyse this case&#8221;. Knitra will identify '
                         'the problem, list what you need, and write a '
                         'step-by-step repair plan.'
                         '</div>'
@@ -1511,6 +1696,11 @@ async def case_detail_page(case_id: int):
                 sev_s, sev_l = _sev.get(sev, ("background:#f1f5f9;color:#475569;",
                                                sev.capitalize() + " severity"))
 
+                # Risk assessment values — default to DIY safe for old analyses
+                # that pre-date Block 3 and do not have these fields stored
+                diy_ok   = s3.get("diy_recommended", True)
+                pro_type = s3.get("professional_type") or ""
+
                 diff = s3.get("difficulty_level", "")
                 _diff = {
                     "beginner":     ("background:#dcfce7;color:#15803d;", "Beginner"),
@@ -1535,7 +1725,7 @@ async def case_detail_page(case_id: int):
                             f'{s1.get("problem_type","Unknown")}</span>'
                             f'<span style="background:#ede9fe;color:#4c1d95;padding:2px 10px;'
                             f'border-radius:100px;font-size:11px;font-weight:600;">'
-                            f'{s1.get("trade_category","").capitalize()}</span>'
+                            f'{_cat_label(s1.get("trade_category",""))}</span>'
                             f'<span style="{sev_s}padding:2px 10px;'
                             f'border-radius:100px;font-size:11px;font-weight:600;">'
                             f'{sev_l}</span>'
@@ -1550,6 +1740,107 @@ async def case_detail_page(case_id: int):
                                 f'margin-top:2px;">&#8226;</span>'
                                 f'<span>{obs}</span></div>'
                             )
+
+                    # ── 1b. Confidence / evidence card ───────────────────────
+                    conf         = s1.get("confidence", 0)
+                    conf_reason  = (s1.get("confidence_reason") or "").strip()
+                    vis_evidence = s1.get("visual_evidence") or []
+                    unc_notes    = (s1.get("uncertainty_notes") or "").strip()
+
+                    if conf >= 90:
+                        conf_color, conf_bg, conf_label = "#15803d", "#dcfce7", "High"
+                    elif conf >= 76:
+                        conf_color, conf_bg, conf_label = "#92400e", "#fef3c7", "Good"
+                    else:
+                        conf_color, conf_bg, conf_label = "#dc2626", "#fee2e2", "Low"
+
+                    with ui.element("div").style(
+                        "background:#f8fafc;border:1px solid #e2e8f0;"
+                        "border-radius:10px;padding:14px 16px;"
+                        "display:flex;flex-direction:column;gap:8px;"
+                    ):
+                        # Header row: confidence % badge + label
+                        _reason_html = (
+                            f'<div style="font-size:0.78rem;color:#475569;'
+                            f'line-height:1.5;margin-top:1px;">{conf_reason}</div>'
+                        ) if conf_reason else ""
+                        ui.html(
+                            f'<div style="display:flex;align-items:center;gap:10px;'
+                            f'margin-bottom:2px;">'
+                            f'<div style="width:38px;height:38px;border-radius:50%;'
+                            f'background:{conf_bg};display:flex;align-items:center;'
+                            f'justify-content:center;flex-shrink:0;">'
+                            f'<span style="font-size:0.72rem;font-weight:800;'
+                            f'color:{conf_color};line-height:1;">{conf}%</span>'
+                            f'</div>'
+                            f'<div>'
+                            f'<div style="font-size:0.8rem;font-weight:700;color:#0f172a;">'
+                            f'AI Confidence: {conf_label}</div>'
+                            f'{_reason_html}'
+                            f'</div>'
+                            f'</div>'
+                        )
+                        # Visual evidence bullets
+                        if vis_evidence:
+                            ui.html(
+                                '<div style="font-size:0.72rem;font-weight:700;'
+                                'color:#94a3b8;letter-spacing:0.05em;'
+                                'text-transform:uppercase;margin-top:4px;">'
+                                'What the AI saw</div>'
+                            )
+                            with ui.element("div").style(
+                                "display:flex;flex-wrap:wrap;gap:5px;margin-top:2px;"
+                            ):
+                                for ev in vis_evidence:
+                                    ui.html(
+                                        f'<span style="background:white;border:1px solid #e2e8f0;'
+                                        f'border-radius:6px;padding:2px 8px;'
+                                        f'font-size:0.76rem;color:#475569;">'
+                                        f'{ev}</span>'
+                                    )
+                        # Uncertainty notes
+                        if unc_notes:
+                            ui.html(
+                                f'<div style="display:flex;align-items:flex-start;gap:6px;'
+                                f'background:#fffbeb;border:1px solid #fde68a;'
+                                f'border-radius:7px;padding:8px 10px;margin-top:2px;">'
+                                f'<span style="font-size:0.85rem;flex-shrink:0;">&#9888;&#65039;</span>'
+                                f'<div>'
+                                f'<div style="font-size:0.73rem;font-weight:700;'
+                                f'color:#92400e;margin-bottom:2px;">Unconfirmed</div>'
+                                f'<div style="font-size:0.78rem;color:#78350f;'
+                                f'line-height:1.5;">{unc_notes}</div>'
+                                f'</div></div>'
+                            )
+
+                    # ── 1c. DIY safety banner ─────────────────────────────────
+                    if diy_ok:
+                        ui.html(
+                            '<div style="display:flex;align-items:center;gap:10px;'
+                            'background:#dcfce7;border:1px solid #86efac;'
+                            'border-radius:10px;padding:12px 16px;">'
+                            '<span style="font-size:1.1rem;flex-shrink:0;">&#9989;</span>'
+                            '<div>'
+                            '<div style="font-weight:700;color:#14532d;font-size:0.88rem;">'
+                            'Suitable for DIY</div>'
+                            '<div style="color:#15803d;font-size:0.8rem;margin-top:1px;">'
+                            'A competent DIYer can safely carry out this repair.</div>'
+                            '</div></div>'
+                        )
+                    else:   # not diy_ok
+                        pro_label = pro_type.capitalize() if pro_type else "a qualified professional"
+                        ui.html(
+                            f'<div style="display:flex;align-items:center;gap:10px;'
+                            f'background:#fef2f2;border:1px solid #fca5a5;'
+                            f'border-radius:10px;padding:12px 16px;">'
+                            f'<span style="font-size:1.1rem;flex-shrink:0;">&#128721;</span>'
+                            f'<div>'
+                            f'<div style="font-weight:700;color:#991b1b;font-size:0.88rem;">'
+                            f'Professional required</div>'
+                            f'<div style="color:#b91c1c;font-size:0.8rem;margin-top:1px;">'
+                            f'This repair should be carried out by a {pro_label}.</div>'
+                            f'</div></div>'
+                        )
 
                     # ── 2. What you'll need ───────────────────────────────────
                     ui.html(
@@ -1685,26 +1976,38 @@ async def case_detail_page(case_id: int):
                                     f'<span>{note}</span></div>'
                                 )
 
-                    # ── 5. When to call a professional ────────────────────────
+                    # ── 5. Professional guidance ──────────────────────────────
                     wcp = s3.get("when_to_call_professional", "")
-                    if wcp:
+                    if wcp or not diy_ok:
                         ui.html(
                             '<div class="analysis-section-label">'
-                            'When to call a professional</div>'
+                            'Professional guidance</div>'
                         )
+                        panel_bg = "#fef2f2" if not diy_ok else "#fff7ed"
+                        panel_border = "#fecaca" if not diy_ok else "#fed7aa"
                         with ui.element("div").style(
-                            "background:#fef2f2;border:1px solid #fecaca;"
+                            f"background:{panel_bg};border:1px solid {panel_border};"
                             "border-radius:10px;padding:14px 16px;"
+                            "display:flex;flex-direction:column;gap:8px;"
                         ):
-                            ui.html(
-                                f'<div style="display:flex;align-items:flex-start;'
-                                f'gap:8px;">'
-                                f'<span style="font-size:1rem;'
-                                f'flex-shrink:0;">&#128680;</span>'
-                                f'<span style="font-size:0.845rem;color:#991b1b;'
-                                f'line-height:1.65;">{wcp}</span>'
-                                f'</div>'
-                            )
+                            if not diy_ok and pro_type:
+                                ui.html(
+                                    f'<div style="display:flex;align-items:center;gap:8px;">'
+                                    f'<span style="font-size:1rem;flex-shrink:0;">&#128272;</span>'
+                                    f'<span style="font-weight:700;color:#991b1b;'
+                                    f'font-size:0.845rem;">Contact a {pro_type}</span>'
+                                    f'</div>'
+                                )
+                            if wcp:
+                                ui.html(
+                                    f'<div style="display:flex;align-items:flex-start;'
+                                    f'gap:8px;">'
+                                    f'<span style="font-size:1rem;'
+                                    f'flex-shrink:0;">&#128680;</span>'
+                                    f'<span style="font-size:0.845rem;color:#991b1b;'
+                                    f'line-height:1.65;">{wcp}</span>'
+                                    f'</div>'
+                                )
 
                     # ── Metadata footer ───────────────────────────────────────
                     ms      = data.get("processing_time_ms") or 0
@@ -1721,6 +2024,197 @@ async def case_detail_page(case_id: int):
                         f'<span>Processing time: {t_str}</span>'
                         f'</div>'
                     )
+
+            def _draw_needs_clarification(data: dict):
+                """
+                Clarification gate — Stage 1 was not confident enough to diagnose.
+
+                Shows a detailed breakdown of WHY confidence was low, WHAT the model
+                saw vs. could not confirm, and exactly what photo or information is
+                needed.  Also provides an inline description field so the user can
+                add text context without leaving the page.
+                """
+                # ── Pull all Stage 1 data for explainability ──────────────────
+                s1 = (data.get("stage_outputs") or {}).get("stage_1") or {}
+
+                conf         = s1.get("confidence", 0)
+                conf_reason  = (s1.get("confidence_reason") or "").strip()
+                vis_evidence = s1.get("visual_evidence") or []
+                unc_notes    = (s1.get("uncertainty_notes") or "").strip()
+                observations = s1.get("observations") or []
+                clarif_req   = (s1.get("clarification_request") or "").strip()
+
+                # Fallback message if Stage 1 output is not available
+                msg = (
+                    clarif_req
+                    or data.get("validation_issues")
+                    or "Please upload a clearer, closer photo of the damaged area "
+                       "or describe the problem in more detail, then click Re-analyse."
+                )
+
+                # Confidence badge colours
+                if conf >= 76:
+                    _cc, _cb, _cl = "#92400e", "#fef3c7", "Medium"
+                else:
+                    _cc, _cb, _cl = "#dc2626", "#fee2e2", "Low"
+
+                # ── Detect what type of input the model needs ─────────────────
+                _combined_hints = (clarif_req + " " + conf_reason).lower()
+                _photo_tips: list[tuple[str, str]] = []
+                if any(w in _combined_hints for w in ["close", "closer", "close-up", "detail", "clearer"]):
+                    _photo_tips.append(("🔍", "Upload a closer, more detailed photo of the damaged area"))
+                if any(w in _combined_hints for w in ["wider", "wide", "context", "surround", "full"]):
+                    _photo_tips.append(("📐", "Include more surroundings — a wider shot shows the full extent"))
+                if any(w in _combined_hints for w in ["light", "bright", "dark", "lit", "illumin", "blurr"]):
+                    _photo_tips.append(("💡", "Take the photo in better light or move to a brighter area"))
+                if any(w in _combined_hints for w in ["describe", "written", "description", "explain", "unclear", "not sure", "cannot determine"]):
+                    _photo_tips.append(("✏️", "Add a written description of what you see and what the problem is"))
+                if not _photo_tips:
+                    _photo_tips = [
+                        ("📷", "Upload a new photo — closer, well-lit, and in focus"),
+                        ("✏️", "Add a written description to give the AI a second evidence stream"),
+                    ]
+
+                with ui.element("div").style("padding:22px 24px;"
+                                             "display:flex;flex-direction:column;gap:16px;"):
+
+                    # ── 1. Confidence explainability card ─────────────────────
+                    ui.html('<div class="analysis-section-label">Why more information is needed</div>')
+                    with ui.element("div").style(
+                        "background:#fafafa;border:1px solid #e2e8f0;"
+                        "border-radius:10px;padding:16px 18px;"
+                        "display:flex;flex-direction:column;gap:10px;"
+                    ):
+                        # Confidence score row
+                        _nc_reason_html = (
+                            f'<div style="font-size:0.78rem;color:#475569;'
+                            f'margin-top:2px;line-height:1.5;">{conf_reason}</div>'
+                        ) if conf_reason else ""
+                        ui.html(
+                            f'<div style="display:flex;align-items:center;gap:10px;">'
+                            f'<div style="width:42px;height:42px;border-radius:50%;'
+                            f'background:{_cb};display:flex;align-items:center;'
+                            f'justify-content:center;flex-shrink:0;">'
+                            f'<span style="font-size:0.7rem;font-weight:800;'
+                            f'color:{_cc};line-height:1;">{conf}%</span>'
+                            f'</div>'
+                            f'<div>'
+                            f'<div style="font-size:0.82rem;font-weight:700;color:#0f172a;">'
+                            f'AI Confidence: {_cl}</div>'
+                            f'{_nc_reason_html}'
+                            f'</div></div>'
+                        )
+
+                        # What the model could see
+                        if observations or vis_evidence:
+                            ui.html(
+                                '<div style="font-size:0.72rem;font-weight:700;'
+                                'color:#94a3b8;letter-spacing:0.05em;'
+                                'text-transform:uppercase;margin-top:2px;">'
+                                'What the AI could see</div>'
+                            )
+                            _evidence = vis_evidence if vis_evidence else observations
+                            with ui.element("div").style(
+                                "display:flex;flex-wrap:wrap;gap:5px;"
+                            ):
+                                for ev in _evidence:
+                                    ui.html(
+                                        f'<span style="background:white;border:1px solid #e2e8f0;'
+                                        f'border-radius:6px;padding:2px 9px;'
+                                        f'font-size:0.75rem;color:#475569;">{ev}</span>'
+                                    )
+
+                        # What it could NOT confirm
+                        if unc_notes:
+                            ui.html(
+                                f'<div style="display:flex;align-items:flex-start;gap:7px;'
+                                f'background:#fff7ed;border:1px solid #fed7aa;'
+                                f'border-radius:7px;padding:9px 11px;">'
+                                f'<span style="font-size:0.9rem;flex-shrink:0;">&#10067;</span>'
+                                f'<div>'
+                                f'<div style="font-size:0.73rem;font-weight:700;'
+                                f'color:#9a3412;margin-bottom:2px;">Could not confirm</div>'
+                                f'<div style="font-size:0.78rem;color:#7c2d12;'
+                                f'line-height:1.5;">{unc_notes}</div>'
+                                f'</div></div>'
+                            )
+
+                    # ── 2. What is needed card ────────────────────────────────
+                    ui.html('<div class="analysis-section-label">What would help</div>')
+                    with ui.element("div").style(
+                        "background:#fffbeb;border:1px solid #fcd34d;"
+                        "border-radius:10px;padding:16px 18px;"
+                        "display:flex;flex-direction:column;gap:10px;"
+                    ):
+                        # The model's specific request
+                        if msg:
+                            ui.html(
+                                f'<div style="font-size:0.845rem;color:#78350f;'
+                                f'line-height:1.6;font-weight:500;">{msg}</div>'
+                            )
+                            ui.html('<div style="border-top:1px solid #fde68a;"></div>')
+
+                        # Actionable photo / input tips
+                        for _icon, _tip in _photo_tips:
+                            ui.html(
+                                f'<div style="display:flex;align-items:flex-start;gap:8px;">'
+                                f'<span style="font-size:1rem;flex-shrink:0;">{_icon}</span>'
+                                f'<span style="font-size:0.82rem;color:#78350f;'
+                                f'line-height:1.5;">{_tip}</span>'
+                                f'</div>'
+                            )
+
+                        ui.html('<div style="border-top:1px solid #fde68a;"></div>')
+
+                        # ── Inline description input ──────────────────────────
+                        ui.html(
+                            '<div style="display:flex;align-items:center;gap:6px;'
+                            'font-size:0.82rem;font-weight:700;color:#92400e;">'
+                            '<span>&#128172;</span>'
+                            '<span>Describe what you see and what the problem is</span>'
+                            '</div>'
+                        )
+                        clarif_input = ui.textarea(
+                            placeholder=(
+                                "e.g. 'This is a hairline crack running diagonally across "
+                                "my kitchen wall plaster near the window frame. It appeared "
+                                "after some heavy rain.'"
+                            )
+                        ).props("outlined dense autogrow rows=2") \
+                         .style(
+                            "width:100%;font-size:0.86rem;"
+                            "background:white;border-radius:8px;"
+                        )
+                        ui.html(
+                            '<div style="font-size:0.77rem;color:#92400e;opacity:0.75;">'
+                            'Your description gives the AI a second evidence stream alongside the photo. '
+                            'Leave blank to re-analyse the photo only.'
+                            '</div>'
+                        )
+
+                        # ── Re-analyse button ─────────────────────────────────
+                        async def _on_clarification_analyse():
+                            text = clarif_input.value.strip() or None
+                            ok, err = await _post_analyse(text)
+                            if ok:
+                                fresh = await _get_analysis()
+                                _redraw(fresh)
+                                poll_timer.active = True
+                            else:
+                                ui.notify(
+                                    err or "Failed to start analysis.",
+                                    type="negative",
+                                    position="top-right",
+                                )
+
+                        ui.button(
+                            "Re-analyse →",
+                            on_click=_on_clarification_analyse,
+                        ).props("unelevated color=warning") \
+                         .style(
+                            "font-weight:700;font-size:0.875rem;"
+                            "align-self:flex-start;"
+                        )
 
             def _draw_failed(data: dict):
                 """Error state — shows validation_issues and a retry button."""
@@ -1751,8 +2245,10 @@ async def case_detail_page(case_id: int):
                 # Button area
                 btn_area.clear()
                 with btn_area:
-                    if status == "running":
-                        # No button while running — can't cancel mid-flight
+                    if status in ("running", "needs_clarification"):
+                        # running     — no button, pipeline can't be cancelled mid-flight
+                        # needs_clarification — button lives inside the card so the user
+                        #   can type a description and submit in one place
                         pass
                     else:
                         # Choose label and style based on current state
@@ -1789,6 +2285,8 @@ async def case_detail_page(case_id: int):
                         _draw_running(data)
                     elif status == "complete":
                         _draw_complete(data)
+                    elif status == "needs_clarification":
+                        _draw_needs_clarification(data)
                     elif status == "failed":
                         _draw_failed(data)
 
@@ -1796,13 +2294,34 @@ async def case_detail_page(case_id: int):
             # Fires every 3.5 s while the pipeline is in flight.
             # Deactivates itself the moment status leaves {pending, running}.
             # Can be reactivated by the Analyse / Re-analyse / Retry button.
-            _was_running = False   # tracks whether we started in a running state
+            _was_running   = False   # tracks whether we started in a running state
+            _title_updated = False   # ensures we only re-fetch the case title once
 
             async def _do_poll():
-                nonlocal _was_running
-                data = await _get_analysis()
-                st   = (data or {}).get("status")
+                nonlocal _was_running, _title_updated
+                data  = await _get_analysis()
+                st    = (data or {}).get("status")
+                stage = (data or {}).get("pipeline_stage")
                 _redraw(data)
+
+                # Update the case header title as soon as Stage 1 writes it to the DB.
+                # Stage 1 completes before Stage 2 starts, so the title is available
+                # at stage_1_complete. Re-fetching the case object is the only way to
+                # get the updated title without a page reload.
+                if not _title_updated and stage in ("stage_1_complete", "stage_2_running",
+                                                     "stage_2_complete", "stage_3_running",
+                                                     "stage_3_complete", "complete"):
+                    fresh_case = await _get_case()
+                    if fresh_case:
+                        new_title = fresh_case.get("title") or ""
+                        if new_title and new_title != "Diagnosing…":
+                            _title_el.set_content(
+                                f'<h1 style="font-size:1.45rem;font-weight:800;color:#0f172a;'
+                                f'margin:0 0 10px;letter-spacing:-0.02em;">'
+                                f'{new_title}</h1>'
+                            )
+                            _title_updated = True
+
                 if st not in ("pending", "running"):
                     poll_timer.active = False
                     # If the pipeline just finished while the user was watching,
@@ -1811,6 +2330,8 @@ async def case_detail_page(case_id: int):
                     if _was_running and st == "complete":
                         _was_running = False
                         await _render_chat_section(True)
+                    elif _was_running and st in ("failed", "needs_clarification"):
+                        _was_running = False
 
             poll_timer = ui.timer(3.5, _do_poll, active=False)
 
@@ -1850,7 +2371,7 @@ async def case_detail_page(case_id: int):
                                 '<div style="font-size:2rem;margin-bottom:10px;'
                                 'opacity:0.4;">&#128172;</div>'
                                 '<div style="font-weight:700;color:#334155;'
-                                'font-size:0.95rem;margin-bottom:6px;">Ask Fixly</div>'
+                                'font-size:0.95rem;margin-bottom:6px;">Ask Knitra</div>'
                                 '<div style="color:#94a3b8;font-size:0.83rem;'
                                 'line-height:1.5;">'
                                 'The repair chat will open once the AI has finished '
@@ -1880,7 +2401,7 @@ async def case_detail_page(case_id: int):
                             with ui.element("div"):
                                 ui.html(
                                     '<div style="font-size:1rem;font-weight:700;'
-                                    'color:#0f172a;">Ask Fixly</div>'
+                                    'color:#0f172a;">Ask Knitra</div>'
                                 )
                                 ui.html(
                                     '<div style="font-size:0.75rem;color:#94a3b8;'
@@ -1938,75 +2459,405 @@ async def case_detail_page(case_id: int):
                             except Exception:
                                 pass
 
-                        # Input row
+                        # ── Input area ────────────────────────────────────────
+                        # Token stored in JS so the chat mic/upload buttons can
+                        # call the backend directly without going through Python.
+                        ui.run_javascript(
+                            f"window._knitraToken = {repr(token)};"
+                            f"window._knitraCaseId = {case_id};"
+                            f"window._knitraApi = {repr(API)};"
+                        )
+
                         with ui.element("div").style(
                             "padding:14px 20px;"
                             "border-top:1px solid #f1f5f9;"
-                            "display:flex;gap:10px;align-items:flex-end;"
-                        ):
-                            chat_input = ui.textarea(
-                                placeholder="Ask a follow-up question about your repair…"
-                            ).props("outlined dense autogrow rows=1") \
-                             .style("flex:1;font-size:0.875rem;")
+                        ).classes("chat-input-row"):
 
-                            async def _send_chat():
-                                content = chat_input.value.strip()
-                                if not content:
-                                    return
-                                chat_input.set_value("")
+                            # Toolbar: mic + attachment (above the textarea)
+                            with ui.element("div").style(
+                                "display:flex;align-items:center;gap:6px;"
+                                "margin-bottom:8px;"
+                            ):
+                                # Mic button — SVG microphone icon, class gives hover + active styles
+                                ui.html(
+                                    '<button id="knitra-chat-mic" '
+                                    'onclick="knitraChatToggleVoice()" '
+                                    'title="Voice input — tap and speak" '
+                                    'class="fixly-icon-btn">'
+                                    '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"'
+                                    ' viewBox="0 0 24 24" fill="none" stroke="currentColor"'
+                                    ' stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+                                    '<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>'
+                                    '<path d="M19 10v2a7 7 0 0 1-14 0v-2"/>'
+                                    '<line x1="12" x2="12" y1="19" y2="22"/>'
+                                    '</svg>'
+                                    '</button>'
+                                )
+                                # Attach button — paperclip SVG icon, triggers hidden file input
+                                ui.html(
+                                    '<button onclick="document.getElementById(\'knitra-chat-file\').click()" '
+                                    'title="Attach a photo to this case" '
+                                    'class="fixly-icon-btn">'
+                                    '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"'
+                                    ' viewBox="0 0 24 24" fill="none" stroke="currentColor"'
+                                    ' stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+                                    '<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57'
+                                    ' A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>'
+                                    '</svg>'
+                                    '</button>'
+                                    '<input id="knitra-chat-file" type="file" '
+                                    'accept="image/*,video/*" multiple style="display:none" '
+                                    'onchange="knitraChatUpload(this)">'
+                                )
+                                # Status line (voice recording / upload feedback)
+                                ui.html(
+                                    '<span id="knitra-chat-status" '
+                                    'style="font-size:0.78rem;color:#94a3b8;'
+                                    'margin-left:4px;"></span>'
+                                )
 
-                                with chat_messages:
-                                    ui.html(
-                                        f'<div class="chat-bubble-user">{content}</div>'
-                                    )
-                                    typing = ui.html(
-                                        '<div class="chat-bubble-typing">'
-                                        'Fixly is thinking&#8230;</div>'
-                                    )
+                            # Textarea + Send row
+                            with ui.element("div").style(
+                                "display:flex;gap:10px;align-items:flex-end;"
+                            ):
+                                chat_input = ui.textarea(
+                                    placeholder="Ask about your repair… (Enter to send, Shift+Enter for newline)"
+                                ).props("outlined dense autogrow rows=1") \
+                                 .style("flex:1;font-size:0.875rem;") \
+                                 .classes("knitra-chat-textarea")
 
+                                send_btn = ui.button("Send", on_click=lambda: asyncio.create_task(_send_chat())) \
+                                    .props("unelevated color=primary") \
+                                    .style("font-weight:600;flex-shrink:0;") \
+                                    .classes("knitra-send-btn")
+
+                        # Enter-to-send: JS intercepts Enter (not Shift+Enter)
+                        # and clicks the Send button so Python handles the send.
+                        ui.run_javascript("""
+                            (function setupEnter() {
+                                const row = document.querySelector('.knitra-chat-textarea textarea');
+                                if (!row) { setTimeout(setupEnter, 150); return; }
+                                row.addEventListener('keydown', function(e) {
+                                    if (e.key === 'Enter' && !e.shiftKey) {
+                                        e.preventDefault();
+                                        const btn = document.querySelector('.knitra-send-btn');
+                                        if (btn) btn.click();
+                                    }
+                                });
+                            })();
+                        """)
+
+                        async def _send_chat():
+                            # Primary: read from NiceGUI-synced value
+                            content = chat_input.value.strip()
+
+                            # Fallback: if Vue/Quasar WebSocket sync hasn't fired yet
+                            # (common after mic transcription injects text via JS),
+                            # read directly from the DOM textarea value.
+                            if not content:
                                 try:
-                                    async with httpx.AsyncClient() as c:
-                                        r = await c.post(
-                                            f"{API}/cases/{case_id}/chat",
-                                            json={"content": content},
-                                            headers={"Authorization": f"Bearer {token}"},
-                                            timeout=120.0,
-                                        )
-                                    typing.delete()
-                                    if r.status_code == 200:
-                                        reply = r.json()
-                                        with chat_messages:
-                                            ui.html(
-                                                f'<div class="chat-bubble-assistant">'
-                                                f'{reply["content"]}</div>'
-                                            )
-                                    elif r.status_code == 503:
-                                        with chat_messages:
-                                            ui.html(
-                                                '<div class="chat-bubble-assistant" '
-                                                'style="color:#dc2626;">'
-                                                'AI model unavailable &#8212; '
-                                                'is Ollama running?</div>'
-                                            )
-                                    else:
-                                        with chat_messages:
-                                            ui.html(
-                                                f'<div class="chat-bubble-assistant" '
-                                                f'style="color:#dc2626;">'
-                                                f'Error {r.status_code}</div>'
-                                            )
+                                    dom_val = await ui.run_javascript(
+                                        "(document.querySelector('.knitra-chat-textarea textarea')"
+                                        "?.value || '').trim()",
+                                        timeout=2.0,
+                                    )
+                                    if dom_val:
+                                        content = str(dom_val).strip()
                                 except Exception:
-                                    typing.delete()
+                                    pass
+
+                            # Second fallback: text stored by the JS transcription handler
+                            if not content:
+                                try:
+                                    stored = await ui.run_javascript(
+                                        "window._knitraTranscribedText || ''",
+                                        timeout=1.0,
+                                    )
+                                    if stored:
+                                        content = str(stored).strip()
+                                except Exception:
+                                    pass
+
+                            if not content:
+                                return
+
+                            # Collect any pending image IDs and clear them atomically
+                            image_ids: list[int] = []
+                            try:
+                                raw_ids = await ui.run_javascript(
+                                    "(window._knitraPendingImageIds || []).slice()",
+                                    timeout=2.0,
+                                )
+                                if isinstance(raw_ids, list):
+                                    image_ids = [int(x) for x in raw_ids if str(x).isdigit()]
+                            except Exception:
+                                pass
+
+                            chat_input.set_value("")
+                            # Clear JS-side state + toolbar status/thumbs strip
+                            await ui.run_javascript(
+                                "window._knitraTranscribedText = '';"
+                                "window._knitraPendingImageIds = [];"
+                                "var _st=document.getElementById('knitra-chat-status');"
+                                "if(_st)_st.textContent='';"
+                                "var _th=document.getElementById('knitra-chat-thumbs');"
+                                "if(_th)_th.innerHTML='';"
+                            )
+
+                            with chat_messages:
+                                # Show attachment notice if photos were attached
+                                if image_ids:
+                                    n = len(image_ids)
+                                    noun = "photo" if n == 1 else "photos"
+                                    ui.html(
+                                        f'<div class="chat-bubble-user" '
+                                        f'style="font-style:italic;opacity:0.75;">'
+                                        f'&#128247; You attached {n} {noun}</div>'
+                                    )
+                                ui.html(
+                                    f'<div class="chat-bubble-user">{content}</div>'
+                                )
+                                typing = ui.html(
+                                    '<div class="chat-bubble-typing">'
+                                    'Knitra is thinking&#8230;</div>'
+                                )
+
+                            try:
+                                async with httpx.AsyncClient() as c:
+                                    r = await c.post(
+                                        f"{API}/cases/{case_id}/chat",
+                                        json={"content": content, "image_ids": image_ids},
+                                        headers={"Authorization": f"Bearer {token}"},
+                                        timeout=120.0,
+                                    )
+                                typing.delete()
+                                if r.status_code == 200:
+                                    reply = r.json()
+                                    with chat_messages:
+                                        ui.html(
+                                            f'<div class="chat-bubble-assistant">'
+                                            f'{reply["content"]}</div>'
+                                        )
+                                elif r.status_code == 503:
                                     with chat_messages:
                                         ui.html(
                                             '<div class="chat-bubble-assistant" '
                                             'style="color:#dc2626;">'
-                                            'Cannot reach the backend.</div>'
+                                            'AI model unavailable &#8212; '
+                                            'is Ollama running?</div>'
                                         )
+                                else:
+                                    with chat_messages:
+                                        ui.html(
+                                            f'<div class="chat-bubble-assistant" '
+                                            f'style="color:#dc2626;">'
+                                            f'Error {r.status_code}</div>'
+                                        )
+                            except Exception:
+                                typing.delete()
+                                with chat_messages:
+                                    ui.html(
+                                        '<div class="chat-bubble-assistant" '
+                                        'style="color:#dc2626;">'
+                                        'Cannot reach the backend.</div>'
+                                    )
 
-                            ui.button("Send", on_click=_send_chat) \
-                                .props("unelevated color=primary") \
-                                .style("font-weight:600;flex-shrink:0;")
+                        # Chat mic + photo upload JS (scoped to chat, not the new-case form)
+                        ui.add_body_html("""<script>
+(function() {
+  // Guard: only inject once even if chat section is rebuilt
+  if (window._knitraChatJsReady) return;
+  window._knitraChatJsReady = true;
+
+  window._knitraChatRecorder    = null;
+  window._knitraChatAudio       = [];
+  window._knitraChatTimerInt    = null;   // interval ID for the recording clock
+  window._knitraTranscribedText = '';     // last mic transcription — read by Python _send_chat
+  window._knitraPendingImageIds = [];     // upload IDs queued for next chat send
+
+  function _chatStatus(msg, color) {
+    const el = document.getElementById('knitra-chat-status');
+    if (el) { el.textContent = msg; el.style.color = color || '#94a3b8'; }
+  }
+
+  function _chatTimerStart() {
+    let secs = 0;
+    window._knitraChatTimerInt = setInterval(function() {
+      secs++;
+      const m = Math.floor(secs / 60).toString().padStart(2, '0');
+      const s = (secs % 60).toString().padStart(2, '0');
+      _chatStatus('Recording ' + m + ':' + s + ' — tap mic to stop', '#6366f1');
+    }, 1000);
+  }
+
+  function _chatTimerStop() {
+    if (window._knitraChatTimerInt) {
+      clearInterval(window._knitraChatTimerInt);
+      window._knitraChatTimerInt = null;
+    }
+  }
+
+  // Show small thumbnails below the toolbar when photos are attached to the chat
+  function _chatShowThumbs(files) {
+    let strip = document.getElementById('knitra-chat-thumbs');
+    if (!strip) {
+      strip = document.createElement('div');
+      strip.id = 'knitra-chat-thumbs';
+      strip.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;';
+      const statusEl = document.getElementById('knitra-chat-status');
+      if (statusEl && statusEl.parentNode) {
+        statusEl.parentNode.insertBefore(strip, statusEl.nextSibling);
+      }
+    }
+    strip.innerHTML = '';
+    files.forEach(function(file) {
+      const url = URL.createObjectURL(file);
+      const img = document.createElement('img');
+      img.src = url;
+      img.style.cssText = 'width:48px;height:48px;object-fit:cover;border-radius:6px;' +
+                           'border:1.5px solid #bbf7d0;flex-shrink:0;';
+      img.onload = function() { URL.revokeObjectURL(url); };
+      strip.appendChild(img);
+    });
+  }
+
+  function _chatClearThumbs() {
+    const strip = document.getElementById('knitra-chat-thumbs');
+    if (strip) strip.innerHTML = '';
+  }
+
+  window.knitraChatToggleVoice = async function() {
+    const btn = document.getElementById('knitra-chat-mic');
+
+    // Already recording → stop
+    if (window._knitraChatRecorder && window._knitraChatRecorder.state === 'recording') {
+      window._knitraChatRecorder.stop();
+      return;
+    }
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      _chatStatus('Mic blocked — allow access in browser settings.', '#dc2626');
+      return;
+    }
+
+    const mime = ['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4']
+      .find(t => MediaRecorder.isTypeSupported(t)) || '';
+    window._knitraChatAudio = [];
+    let rec;
+    try { rec = new MediaRecorder(stream, mime ? { mimeType: mime } : {}); }
+    catch(e) { rec = new MediaRecorder(stream); }
+    window._knitraChatRecorder = rec;
+
+    rec.ondataavailable = function(e) {
+      if (e.data && e.data.size > 0) window._knitraChatAudio.push(e.data);
+    };
+
+    rec.onstop = async function() {
+      _chatTimerStop();
+      stream.getTracks().forEach(t => t.stop());
+      if (btn) { btn.classList.remove('active'); }
+      const blob = new Blob(window._knitraChatAudio, { type: mime || 'audio/webm' });
+      if (blob.size < 1000) { _chatStatus('Nothing recorded — try again.', '#94a3b8'); return; }
+      _chatStatus('Transcribing…', '#0369a1');
+      const fd = new FormData();
+      fd.append('audio', blob, 'recording.webm');
+      try {
+        const resp = await fetch('http://127.0.0.1:8000/api/v1/transcribe', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + (window._knitraToken || '') },
+          body: fd,
+        });
+        if (!resp.ok) throw new Error('Server error ' + resp.status);
+        const { text } = await resp.json();
+        if (text) {
+          const trimmed = text.trim();
+          // 1. Store in window variable so Python _send_chat() can read it as fallback
+          window._knitraTranscribedText = (window._knitraTranscribedText
+            ? window._knitraTranscribedText.trimEnd() + ' ' : '') + trimmed;
+          // 2. Also inject into the DOM textarea so user can see / edit it
+          const ta = document.querySelector('.knitra-chat-textarea textarea');
+          if (ta) {
+            ta.value = (ta.value ? ta.value.trimEnd() + ' ' : '') + trimmed;
+            // Dispatch both 'input' and 'change' — Quasar listens to 'input'
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+            ta.dispatchEvent(new Event('change', { bubbles: true }));
+            ta.focus();
+          }
+          _chatStatus('✔ Transcribed — press Send', '#15803d');
+          setTimeout(function() { _chatStatus('', ''); }, 4000);
+        } else {
+          _chatStatus('Nothing heard — try again.', '#94a3b8');
+        }
+      } catch(err) {
+        _chatStatus('Transcription failed: ' + err.message, '#dc2626');
+      }
+    };
+
+    rec.start(200);
+    if (btn) { btn.classList.add('active'); }
+    _chatStatus('Recording 00:00 — tap mic to stop', '#6366f1');
+    _chatTimerStart();
+  };
+
+  window.knitraChatUpload = async function(input) {
+    const files = Array.from(input.files);
+    if (!files.length) return;
+    const caseId = window._knitraCaseId;
+    const token  = window._knitraToken;
+    if (!caseId || !token) { _chatStatus('Upload error: not authenticated.', '#dc2626'); return; }
+
+    // Show thumbnails immediately for instant confirmation
+    _chatShowThumbs(files);
+    _chatStatus('Uploading ' + files.length + ' file' + (files.length > 1 ? 's' : '') + '…', '#0369a1');
+
+    // Ensure pending ID list exists
+    if (!Array.isArray(window._knitraPendingImageIds)) {
+      window._knitraPendingImageIds = [];
+    }
+
+    let ok = 0, failMsg = '';
+    for (const file of files) {
+      const fd = new FormData();
+      fd.append('file', file);
+      try {
+        const resp = await fetch('http://127.0.0.1:8000/api/v1/cases/' + caseId + '/uploads', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + token },
+          body: fd,
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          // Store the upload ID so _send_chat can forward it to Knitra
+          if (data && data.id) {
+            window._knitraPendingImageIds.push(data.id);
+          }
+          ok++;
+        } else if (resp.status === 413) {
+          failMsg = 'File too large (max 10 MB).';
+        } else if (resp.status === 415) {
+          failMsg = 'Unsupported file type.';
+        } else {
+          failMsg = 'Server error ' + resp.status + '.';
+        }
+      } catch(e) {
+        failMsg = 'Network error — check connection.';
+      }
+    }
+    input.value = '';  // reset so same file can be re-selected
+    if (ok > 0) {
+      const noun = ok > 1 ? 'files' : 'file';
+      _chatStatus(ok + ' ' + noun + ' ready — press Send to ask Knitra ✔', '#15803d');
+      // Don't auto-clear status/thumbs — let user see what's queued until they send
+    } else {
+      _chatClearThumbs();
+      _chatStatus(failMsg || 'Upload failed — check connection.', '#dc2626');
+    }
+  };
+})();
+</script>""")
 
                         async def _quick_send(text: str):
                             chat_input.set_value(text)
@@ -2301,7 +3152,7 @@ async def new_case_page():
         fd.append('audio', blob, 'recording.webm');
 
         try {
-          const resp = await fetch('http://localhost:8080/api/v1/transcribe', {
+          const resp = await fetch('http://127.0.0.1:8000/api/v1/transcribe', {
             method: 'POST',
             headers: { 'Authorization': 'Bearer ' + window._fixlyToken },
             body: fd,
@@ -2379,7 +3230,7 @@ async def new_case_page():
                 '<h1 style="font-size:1.6rem;font-weight:800;color:#0f172a;'
                 'margin:0 0 2px;letter-spacing:-0.02em;">Diagnose a repair</h1>'
                 '<p style="color:#94a3b8;font-size:0.875rem;margin:0;">'
-                'Snap a photo of the problem &#8212; Fixly identifies it and '
+                'Snap a photo of the problem &#8212; Knitra identifies it and '
                 'writes your repair guide automatically.</p>'
             )
 
@@ -2652,7 +3503,7 @@ async def new_case_page():
 
 ui.run(
     port=3000,
-    title="Fixly",
+    title="Knitra",
     reload=False,
     storage_secret="fixly-dev-secret",
 )

@@ -15,8 +15,15 @@ backend/uvicorn_test.log
 frontend/frontend.log
 frontend/frontend_err.log
 
-# Uploaded files (local storage)
+# Uploaded files
 backend/uploads/
 
 # NiceGUI user session storage
+frontend/.nicegui/
 frontend/.nicegui/storage-user-*.json
+
+# IDE / local editor config
+.vscode/
+*.code-workspace
+pyrightconfig.json
+backend/pyrightconfig.json

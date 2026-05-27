@@ -13,7 +13,7 @@ def health_check():
     # Simple route to confirm the backend is running
     return {
         "status": "ok",
-        "message": "Fixly backend is running",
+        "message": "Knitra backend is running",
     }
 
 

@@ -136,6 +136,34 @@ class Session(Base):
         back_populates="session", cascade="all, delete-orphan"
     )
 
+    @property
+    def confidence(self) -> Optional[int]:
+        """
+        AI confidence score (0-100) extracted from the latest completed analysis.
+
+        Derived at read-time from Analysis.structured_result JSONB so no extra
+        column is needed.  Returns None for cases that have no completed analysis
+        yet (e.g. still running, failed, or never analysed).
+
+        Requires the `analyses` relationship to be pre-loaded (selectinload) before
+        this property is accessed.  If the relationship is not loaded (e.g. on routes
+        that return a freshly created or patched case without a selectinload), the
+        try/except ensures we return None gracefully instead of raising MissingGreenlet.
+        """
+        try:
+            rows = list(getattr(self, "analyses", None) or [])
+        except Exception:
+            # SQLAlchemy raises MissingGreenlet when a lazy-load is attempted inside
+            # an async context.  Return None rather than propagating the error.
+            return None
+        for analysis in sorted(rows, key=lambda a: a.id, reverse=True):
+            if analysis.status == "complete" and analysis.structured_result:
+                s1 = (analysis.structured_result or {}).get("stage_1") or {}
+                v = s1.get("confidence")
+                if isinstance(v, int):
+                    return v
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Upload

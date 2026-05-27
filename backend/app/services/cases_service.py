@@ -33,10 +33,17 @@ async def list_cases(
     db: AsyncSession,
     user_id: int,
 ) -> list[RepairSession]:
-    """Return all cases owned by the given user, newest first."""
+    """
+    Return all cases owned by the given user, newest first.
+
+    Analyses are selectinload-ed so that Session.confidence (a Python
+    property that reads structured_result JSONB) is accessible without
+    triggering lazy-load errors in the async context.
+    """
     result = await db.execute(
         select(RepairSession)
         .where(RepairSession.user_id == user_id)
+        .options(selectinload(RepairSession.analyses))
         .order_by(RepairSession.created_at.desc())
     )
     return list(result.scalars().all())

@@ -1,4 +1,4 @@
-# Knitra — Multimodal AI Repair Assessment Platform
+# Knitra : Multimodal AI Repair Assessment Platform
 
 Knitra is a locally-hosted, privacy-first AI repair assistant that helps homeowners and tradespeople diagnose household problems and plan repairs from a photo. Upload an image of the fault, optionally describe the problem by typing or speaking, and receive a fully structured repair assessment: problem classification, confidence score, visual evidence reasoning, essential and optional tools and materials, safety-graded step-by-step repair instructions, and a contextual AI chat assistant that already knows your case.
 
@@ -187,7 +187,7 @@ Upload photos + text context
    session.status → "complete"
 ```
 
-### Stage 1 — Vision and Issue Detection
+### Stage 1 : Vision and Issue Detection
 
 Qwen2.5-VL examines the uploaded images alongside any text description provided by the user. It classifies the problem type, assigns a trade category from the controlled 10-category vocabulary, assesses severity (`low` / `medium` / `high`), records visual evidence it can confirm, records what it cannot confirm, produces a confidence score (0–100), and — if confidence is below threshold — generates a specific clarification request explaining what additional information would resolve the uncertainty.
 
@@ -195,7 +195,7 @@ Qwen2.5-VL examines the uploaded images alongside any text description provided 
 
 **Image preprocessing**: images are resized to a configurable max dimension (default 512 px) with aspect ratio preserved and re-encoded as JPEG before base64 encoding. This reduces the token count sent to the vision model by 60–80% versus full-resolution phone photos, with no meaningful loss in diagnostic accuracy for macro-scale home repair faults.
 
-### Stage 2 — Repair Planning
+### Stage 2 : Repair Planning
 
 Mistral:7b-instruct receives the Stage 1 output and generates a structured list of:
 - Essential tools (must-have)
@@ -207,7 +207,7 @@ Mistral:7b-instruct receives the Stage 1 output and generates a structured list 
 
 Essential and optional items are stored and displayed separately in the UI.
 
-### Stage 3 — Step-by-Step Generation
+### Stage 3 : Step-by-Step Generation
 
 Llama3.1:8b receives Stage 1 and Stage 2 outputs and generates:
 - Numbered repair steps (each with an optional warning note)
@@ -321,7 +321,7 @@ The confidence score is also shown on case cards in the My Cases list, allowing 
 
 ---
 
-## 7. Ask Knitra — Contextual Chat Assistant
+## 7. Ask Knitra : Contextual Chat Assistant
 
 ### How It Works
 
@@ -448,7 +448,7 @@ FixIT/
 
 ---
 
-### Step 1 — Start PostgreSQL
+### Step 1 : Start PostgreSQL
 
 ```bash
 docker compose up -d db
@@ -458,7 +458,7 @@ PostgreSQL will start on port `5433` (non-default to avoid conflicts with any lo
 
 ---
 
-### Step 2 — Pull AI Models
+### Step 2 : Pull AI Models
 
 One-time download, approximately 10 GB total. All models run fully locally after this step.
 
@@ -476,7 +476,7 @@ curl http://localhost:11434/api/tags
 
 ---
 
-### Step 3 — Backend Setup
+### Step 3 : Backend Setup
 
 ```bash
 cd backend
@@ -495,7 +495,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 ---
 
-### Step 4 — Frontend Setup
+### Step 4 : Frontend Setup
 
 Open a second terminal:
 

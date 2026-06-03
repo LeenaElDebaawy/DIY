@@ -58,7 +58,7 @@ async def patch_my_case(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Partial update — only non-null fields are written."""
+    """Partial update, only non-null fields are written."""
     case = await patch_case(
         db, case_id, current_user.id,
         title=body.title, category=body.category, status=body.status,
@@ -77,7 +77,7 @@ async def delete_my_case(
     """
     Permanently delete a case and all its uploads, messages, and analyses.
 
-    Ownership is enforced — a user can only delete their own cases.
+    Ownership is enforced, a user can only delete their own cases.
     Returns 204 No Content on success, 404 if the case is not found or
     belongs to another user (same response to avoid leaking existence).
     """

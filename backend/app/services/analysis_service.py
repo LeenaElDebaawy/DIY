@@ -1,5 +1,5 @@
 """
-Three-stage AI analysis pipeline — all models served locally via Ollama.
+Three-stage AI analysis pipeline, all models served locally via Ollama.
 
 Architecture
 ────────────
@@ -27,7 +27,7 @@ Model assignments
 
 Stage 2 output separates tools and materials into:
   - essential (must-have to complete the repair)
-  - optional  (helpful but not required — shown as "Nice to have" in the UI)
+  - optional  (helpful but not required, shown as "Nice to have" in the UI)
 
 Why asyncio.create_task instead of BackgroundTasks?
 ────────────────────────────────────────────────────
@@ -70,6 +70,9 @@ from app.database import AsyncSessionLocal
 from app.models import Analysis, Session as RepairSession, Upload
 from app.schemas.analysis import (
     AnalysisResult,
+    AssessmentOutput,
+    CareOutput,
+    ClarificationOutput,
     RepairStep,
     Stage1Output,
     Stage2Output,
@@ -89,7 +92,7 @@ STAGE_2_MODEL        = os.getenv("STAGE_2_MODEL",        "mistral:7b-instruct")
 STAGE_3_MODEL        = os.getenv("STAGE_3_MODEL",        "llama3.1:8b")
 PIPELINE_RETRY_COUNT = int(os.getenv("PIPELINE_RETRY_COUNT", "1"))
 
-# Per-stage context window and output budgets — read from .env so they can be
+# Per-stage context window and output budgets, read from .env so they can be
 # tuned per-machine without code changes.
 #
 # STAGE_1_NUM_CTX must be large enough to hold:
@@ -109,10 +112,10 @@ CHAT_NUM_PREDICT    = int(os.getenv("CHAT_NUM_PREDICT",    "768"))
 # Set to "0" on RAM-constrained machines to unload immediately.
 OLLAMA_KEEP_ALIVE   = os.getenv("OLLAMA_KEEP_ALIVE", "5m")
 
-# Upload directory — resolved the same way as uploads_service.py so paths match.
+# Upload directory, resolved the same way as uploads_service.py so paths match.
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
 
-# One shared async Ollama client — created once at module load, reused for all
+# One shared async Ollama client, created once at module load, reused for all
 # pipeline calls.  AsyncClient is safe to share across coroutines.
 _ollama = ollama.AsyncClient(host=OLLAMA_BASE_URL)
 
@@ -133,6 +136,10 @@ _S2_RUNNING = "stage_2_running"
 _S2_DONE    = "stage_2_complete"
 _S3_RUNNING = "stage_3_running"
 _S3_DONE    = "stage_3_complete"
+_SA_RUNNING = "stage_a_running"   # assessment-first mode
+_SA_DONE    = "stage_a_complete"
+_SC_RUNNING = "stage_c_running"   # care mode
+_SC_DONE    = "stage_c_complete"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -156,10 +163,10 @@ async def create_analysis(
       - at least one photo has been uploaded
       - no pipeline is currently running for this case (prevents duplicate runs)
     """
-    # 1. Verify ownership — raises 404 if case not found or not owned
+    # 1. Verify ownership, raises 404 if case not found or not owned
     await _require_owned_case(db, case_id, user_id)
 
-    # 2. Refuse if no photos exist — the vision stage needs at least one image
+    # 2. Refuse if no photos exist, the vision stage needs at least one image
     uploads_result = await db.execute(
         select(Upload).where(Upload.session_id == case_id)
     )
@@ -196,13 +203,13 @@ async def create_analysis(
     await db.commit()
     await db.refresh(analysis)
 
-    # 5. Extract just the storage paths — do not pass ORM objects across session
+    # 5. Extract just the storage paths, do not pass ORM objects across session
     #    boundaries.  The request session closes when this function returns; the
     #    background task creates its own session and only needs these strings to
     #    locate the image files on disk.
     upload_paths = [u.storage_path for u in uploads]
 
-    # 6. Launch pipeline — non-blocking, runs concurrently with other requests
+    # 6. Launch pipeline, non-blocking, runs concurrently with other requests
     asyncio.create_task(_run_pipeline(analysis.id, case_id, upload_paths, text_context))
 
     return analysis
@@ -259,14 +266,14 @@ def _load_images_as_base64(storage_paths: list[str]) -> list[str]:
     and return as base64-encoded strings for the Ollama vision API.
 
     Resizing before encoding reduces the base64 payload sent to the vision
-    model by 60–80% for typical phone photos, cutting Stage 1 inference time
-    noticeably with no meaningful loss in diagnostic accuracy — home repair
+    model by 60-80% for typical phone photos, cutting Stage 1 inference time
+    noticeably with no meaningful loss in diagnostic accuracy, home repair
     problems are large, visible features that don't need full-resolution images.
 
     Compression pipeline per image:
       1. Open with Pillow.
       2. Convert non-RGB modes (RGBA, P, etc.) to RGB so JPEG save works.
-      3. thumbnail(1024, 1024) — preserves aspect ratio, in-place.
+      3. thumbnail(1024, 1024), preserves aspect ratio, in-place.
       4. Save to BytesIO as JPEG quality=82.
       5. base64-encode the compressed bytes.
 
@@ -279,10 +286,10 @@ def _load_images_as_base64(storage_paths: list[str]) -> list[str]:
         _pil_available = True
     except ImportError:
         _pil_available = False
-        log.warning("Pillow not installed — images will be sent at full resolution. "
+        log.warning("Pillow not installed, images will be sent at full resolution. "
                     "Run: pip install Pillow")
 
-    # 512px is sufficient for home repair diagnosis — the damage features are large
+    # 512px is sufficient for home repair diagnosis, the damage features are large
     # and visible at low resolution.  Smaller images mean fewer ViT patch tokens,
     # which is the primary inference-time bottleneck for Qwen2.5-VL on CPU.
     # Changing this to 768 or 1024 improves fine-detail accuracy at the cost of
@@ -316,7 +323,7 @@ def _load_images_as_base64(storage_paths: list[str]) -> list[str]:
                     result.append(encoded)
                     continue
                 except Exception as pil_exc:
-                    log.warning("Pillow resize failed for %s (%s) — using raw bytes",
+                    log.warning("Pillow resize failed for %s (%s), using raw bytes",
                                 path, pil_exc)
 
             # Fallback: send raw bytes without resize
@@ -325,6 +332,89 @@ def _load_images_as_base64(storage_paths: list[str]) -> list[str]:
         except OSError as exc:
             log.warning("Could not read image %s: %s", full, exc)
     return result
+
+
+# Em / en dashes read as "AI-generated". We normalise them to plain punctuation
+# in EVERY model output, regardless of source, so nothing dash-styled reaches the
+# user. The static prompts and UI are also cleaned at source. These functions use
+# unicode escapes so this code itself stays free of the literal characters.
+_DASHES = (chr(0x2014), chr(0x2013), chr(0x2015))  # em, en, horizontal-bar dashes
+
+
+def _strip_em_dashes(s: str) -> str:
+    """Replace em/en dashes with plain punctuation: ' X ' -> ', ', bare X -> '-'."""
+    if not isinstance(s, str) or not s:
+        return s
+    for d in _DASHES:
+        s = s.replace(" " + d + " ", ", ")   # clause separator -> comma
+        s = s.replace(d, "-")                 # any remaining -> hyphen
+    return s
+
+
+def _normalise_dashes_deep(obj):
+    """Recursively apply _strip_em_dashes to every string in a dict / list / str."""
+    if isinstance(obj, str):
+        return _strip_em_dashes(obj)
+    if isinstance(obj, list):
+        return [_normalise_dashes_deep(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _normalise_dashes_deep(v) for k, v in obj.items()}
+    return obj
+
+
+# Tier tags live in Stage 2 output where the UI renders them as styled chips,
+# but Llama (Stage 3) sometimes copies the literal "[Tier]" prefix into the
+# step prose ("Use a [Likely] chisel ..."). The Stage 3 prompt forbids this,
+# this regex is a deterministic backstop that strips the tags from step
+# titles/descriptions/warnings and the global safety notes after Stage 3 has
+# returned. It only affects PROSE strings, never the Stage 2 list items where
+# the tags are meaningful structured data.
+import re as _re
+_TIER_TAG_RE = _re.compile(r"\s*\[(?:Confirmed|Likely|Verify First|Do Not Buy Yet)\]\s*")
+
+
+def _strip_tier_tags(s: str) -> str:
+    """Remove '[Confirmed]' / '[Likely]' / '[Verify First]' / '[Do Not Buy Yet]'
+    fragments from a prose string, collapsing the resulting whitespace and
+    fixing the most common 'use a  chisel' / 'a  vacuum' double-space + dangling
+    article artefacts."""
+    if not isinstance(s, str) or not s:
+        return s
+    cleaned = _TIER_TAG_RE.sub(" ", s)
+    # Tidy up double spaces and "a/an" left dangling before a now-bare noun
+    cleaned = _re.sub(r"\s{2,}", " ", cleaned).strip()
+    # "use a  chisel" already collapsed above; nothing further needed.
+    return cleaned
+
+
+def _scrub_stage3_prose(s3: "Stage3Output") -> int:
+    """Strip tier tags from every prose string in a Stage3Output, in place.
+    Returns the number of strings actually modified (for transparency / logging)."""
+    changed = 0
+    for step in (s3.steps or []):
+        for attr in ("title", "description", "warning"):
+            v = getattr(step, attr, None)
+            if isinstance(v, str):
+                cleaned = _strip_tier_tags(v)
+                if cleaned != v:
+                    setattr(step, attr, cleaned)
+                    changed += 1
+    new_notes = []
+    for n in (s3.safety_notes or []):
+        if isinstance(n, str):
+            cleaned = _strip_tier_tags(n)
+            if cleaned != n:
+                changed += 1
+            new_notes.append(cleaned)
+        else:
+            new_notes.append(n)
+    s3.safety_notes = new_notes
+    if isinstance(s3.when_to_call_professional, str):
+        cleaned = _strip_tier_tags(s3.when_to_call_professional)
+        if cleaned != s3.when_to_call_professional:
+            s3.when_to_call_professional = cleaned
+            changed += 1
+    return changed
 
 
 def _clean_json(text: str) -> str:
@@ -356,7 +446,7 @@ def _heal_truncated_json(text: str) -> str:
     Attempt to repair JSON that was cut off mid-generation (truncated by num_predict
     or num_ctx limits).  Closes any unclosed strings, arrays, and objects.
 
-    This is a best-effort recovery — it will not always produce semantically
+    This is a best-effort recovery, it will not always produce semantically
     correct JSON, but it often lets the Pydantic validator extract partial
     data rather than failing completely.
     """
@@ -440,13 +530,23 @@ async def _call_stage(
     ──────────
     model        : Ollama model name (e.g. "mistral:latest")
     messages     : list of chat message dicts (role + content, optionally images)
-    schema_class : Pydantic model class — used to validate and construct the result
+    schema_class : Pydantic model class, used to validate and construct the result
     stage_name   : human-readable label for log messages
     """
     last_error = None
     last_raw   = ""
+    # Two independent retry budgets:
+    #   - validation_attempts: bad JSON / schema mismatch (bounded by PIPELINE_RETRY_COUNT).
+    #   - transient_retries: the Ollama model runner crashing ("model runner has
+    #     unexpectedly stopped" / status 500) or a dropped connection. This happens
+    #     intermittently under memory pressure when the heavy Stage-1 7B vision model
+    #     is swapped out for the next stage's model. The fix is simply to wait a few
+    #     seconds for Ollama to respawn the runner / free VRAM, then retry, so one
+    #     hiccup never fails the whole analysis (important for a live demo).
+    validation_attempts    = 0
+    transient_retries_left = 3
 
-    for attempt in range(PIPELINE_RETRY_COUNT + 1):
+    while True:
         try:
             options = {
                 "temperature": 0.1,   # deterministic → schema-compliant
@@ -467,43 +567,63 @@ async def _call_stage(
             log.debug("%s raw (%d chars): %s…", stage_name, len(raw), raw[:120])
 
             cleaned = _clean_json(raw)
-            data    = json.loads(cleaned)
+            data    = _normalise_dashes_deep(json.loads(cleaned))
             return schema_class(**data)
 
         except (json.JSONDecodeError, ValidationError) as exc:
             last_error = exc
             log.warning(
-                "%s attempt %d/%d — parse error: %s | raw[:80]=%r",
-                stage_name, attempt + 1, PIPELINE_RETRY_COUNT + 1,
+                "%s validation attempt %d/%d, parse error: %s | raw[:80]=%r",
+                stage_name, validation_attempts + 1, PIPELINE_RETRY_COUNT + 1,
                 exc, last_raw[:80],
             )
 
             # Before retrying, attempt to heal a truncated response.
             # If healing succeeds we return immediately without using another
-            # model call — cheaper and faster than a full retry.
+            # model call, cheaper and faster than a full retry.
             if last_raw:
                 try:
                     healed = _heal_truncated_json(_clean_json(last_raw))
-                    data   = json.loads(healed)
+                    data   = _normalise_dashes_deep(json.loads(healed))
                     result = schema_class(**data)
-                    log.info("%s — healed truncated JSON successfully", stage_name)
+                    log.info("%s, healed truncated JSON successfully", stage_name)
                     return result
                 except Exception:
-                    pass    # healing failed — proceed to retry
+                    pass    # healing failed, proceed to retry
 
-            if attempt < PIPELINE_RETRY_COUNT:
+            validation_attempts += 1
+            if validation_attempts <= PIPELINE_RETRY_COUNT:
                 await asyncio.sleep(1.0)
+                continue
+            raise ValueError(
+                f"{stage_name} failed after {validation_attempts} attempts. "
+                f"Last error: {type(last_error).__name__}: {last_error}"
+            ) from exc
 
         except Exception as exc:
+            # Is this a transient Ollama/connection failure worth retrying?
+            msg = str(exc).lower()
+            transient = any(s in msg for s in (
+                "unexpectedly stopped", "resource limit", "status code: 500",
+                "status code: 502", "status code: 503", "connection",
+                "timed out", "timeout", "eof occurred", "disconnect",
+                "remoteprotocol",
+            ))
+            if transient and transient_retries_left > 0:
+                transient_retries_left -= 1
+                last_error = exc
+                log.warning(
+                    "%s, transient Ollama error, backing off 4s then retrying "
+                    "(%d retr%s left): %s",
+                    stage_name, transient_retries_left,
+                    "y" if transient_retries_left == 1 else "ies", exc,
+                )
+                await asyncio.sleep(4.0)   # let Ollama respawn the runner / free VRAM
+                continue
             raise RuntimeError(
                 f"Ollama call failed for {stage_name} (model={model}): "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
-
-    raise ValueError(
-        f"{stage_name} failed after {PIPELINE_RETRY_COUNT + 1} attempts. "
-        f"Last error: {type(last_error).__name__}: {last_error}"
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -529,7 +649,7 @@ async def _run_pipeline(
     If any stage raises an unhandled exception:
       - status is set to "failed"
       - validation_issues stores the error string
-      - the pipeline stops — it does not try to continue with partial results
+      - the pipeline stops, it does not try to continue with partial results
 
     This function creates its own DB session.  The analysis_id integer is the
     only thing that crosses the session boundary safely.
@@ -548,13 +668,13 @@ async def _run_pipeline(
             # This keeps Session.status in sync so the My Cases status filter works.
             case_row = await db.get(RepairSession, case_id)
 
-            # Mark running — mirror to case so the Cases list shows "Analysing"
+            # Mark running, mirror to case so the Cases list shows "Analysing"
             analysis.status = "running"
             if case_row is not None:
                 case_row.status = "running"
             await db.commit()
 
-            # ── STAGE 1 — Image / Problem Analysis ───────────────────────────
+            # ── STAGE 1, Image / Problem Analysis ───────────────────────────
             analysis.pipeline_stage = _S1_RUNNING
             await db.commit()
 
@@ -564,21 +684,21 @@ async def _run_pipeline(
                 s1: Stage1Output = await _stage_1_analyse(upload_paths, text_context)
             except RuntimeError as _s1_exc:
                 # RuntimeError = Ollama connection/OOM/server error.
-                # These are NOT parse failures — retrying immediately will not help
+                # These are NOT parse failures, retrying immediately will not help
                 # and continuing with fake Stage1Output produces garbage downstream.
                 # Fail fast with a clear message so the user knows to retry.
                 log.error(
-                    "Stage 1 runtime failure (OOM or Ollama error) — failing pipeline. Error: %s",
+                    "Stage 1 runtime failure (OOM or Ollama error), failing pipeline. Error: %s",
                     _s1_exc,
                 )
                 raise  # re-raise → pipeline catches it in the outer except and marks failed
             except ValueError as _s1_exc:
                 # ValueError = all retries exhausted on parse/validation errors.
-                # Only fall back to text context if the user provided one — that gives
+                # Only fall back to text context if the user provided one, that gives
                 # Stages 2+3 something real to work from rather than a generic placeholder.
                 if text_context and text_context.strip():
                     log.warning(
-                        "Stage 1 parse failure — falling back to user text context. Error: %s",
+                        "Stage 1 parse failure, falling back to user text context. Error: %s",
                         _s1_exc,
                     )
                     s1 = Stage1Output(
@@ -586,59 +706,96 @@ async def _run_pipeline(
                         trade_category="other",
                         severity="medium",
                         observations=[
-                            "Image could not be automatically analysed — using your description instead.",
+                            "Image could not be automatically analysed, using your description instead.",
                             "For a better diagnosis, try uploading a clearer or wider photo.",
                         ],
                     )
                     _s1_fallback = True
                 else:
                     log.error(
-                        "Stage 1 failed and no text context provided — failing pipeline. Error: %s",
+                        "Stage 1 failed and no text context provided, failing pipeline. Error: %s",
                         _s1_exc,
                     )
-                    raise  # no text context to fall back to — fail the pipeline
+                    raise  # no text context to fall back to, fail the pipeline
             _ms_s1 = int((time.monotonic() - _t_s1) * 1000)
             log.info("Stage 1 in %.1fs%s", _ms_s1 / 1000,
                      " [fallback]" if _s1_fallback else "")
+
+            # ── Stage 1 reliability pass (Priority 5) ─────────────────────────
+            # De-dupe echoey observations/evidence and reconcile self-reported
+            # confidence with the model's own uncertainty BEFORE it can influence
+            # the gate or propagate into Stages 2 and 3. Grounded in real cases
+            # #54 (triple-duplicated observation) and #56/#57 (overconfidence).
+            _s1_fixes = _sanitize_stage_1(s1)
+            if _s1_fixes:
+                log.info("Stage 1 reliability pass: %s", "; ".join(_s1_fixes))
+
+            # ── Thin one-way safety net ───────────────────────────────────────
+            # For a few inherently dangerous trades, raise the model's risk signals
+            # to a cautious floor if it under-called them. Never lowers a signal.
+            # Runs BEFORE the decision + the gate so everything downstream sees the
+            # floored signals. The model's reasoning still drives everything else.
+            _net_notes = _apply_safety_net(s1)
+            if _net_notes:
+                log.info("Safety net raised signals (%s): %s", s1.trade_category, "; ".join(_net_notes))
+
+            # Derive the pipeline reactions purely from the (model-decided, possibly
+            # net-raised) signals, no category logic in here.
+            _decision = _decide_actions(s1)
 
             analysis.stage_outputs = {
                 **analysis.stage_outputs,
                 "stage_1": s1.model_dump(),
                 **({"stage_1_fallback": True} if _s1_fallback else {}),
+                **({"stage_1_sanitised": _s1_fixes} if _s1_fixes else {}),
+                "risk_signals": {
+                    "risk_level": s1.risk_level,
+                    "hidden_damage_risk": s1.hidden_damage_risk,
+                    "diy_suitability": s1.diy_suitability,
+                    "professional_assessment_recommended": s1.professional_assessment_recommended,
+                    "safety_concerns": s1.safety_concerns,
+                    "assessment_first": _decision["assessment_first"],
+                    "verify_first": _decision["verify_first"],
+                    **({"safety_net_raised": _net_notes} if _net_notes else {}),
+                },
             }
             analysis.pipeline_stage = _S1_DONE
             await db.commit()
 
-            # ── Confidence gate ───────────────────────────────────────────────
-            # If Stage 1 is not confident enough to diagnose the problem, stop
-            # the pipeline and ask the user for a clearer photo or more context
-            # instead of generating unreliable repair steps.
-            # Threshold is 75 (not 50) because Qwen2.5-VL:3b tends to hallucinate
-            # confidence values of 60-70 even for featureless/dark images.
-            # 75 catches those while still allowing genuine 80+ readings through.
-            _LOW_CONFIDENCE = 75
-            if not _s1_fallback and (s1.needs_clarification or s1.confidence < _LOW_CONFIDENCE):
+            # ── Clarify gate (model-led, generic floor) ───────────────────────
+            # Ask the user for more when the MODEL is not confident enough or it
+            # asked to clarify. The floor is a single generic value for every
+            # trade, the model, not a category table, decides danger (handled by
+            # the assessment-first reaction after Stage 3). 75 is used because the
+            # vision model tends to emit 60-70 even on featureless/dark images.
+            if not _s1_fallback and (s1.needs_clarification or s1.confidence < _BASE_CONFIDENCE_FLOOR):
                 log.info(
-                    "Stage 1 confidence=%d needs_clarification=%s — stopping pipeline, "
-                    "asking user for clarification.",
-                    s1.confidence, s1.needs_clarification,
+                    "Stage 1 confidence=%d (floor=%d, trade=%s) needs_clarification=%s, "
+                    "stopping pipeline, asking user for clarification.",
+                    s1.confidence, _BASE_CONFIDENCE_FLOOR, s1.trade_category, s1.needs_clarification,
                 )
-                clarification_msg = (
-                    s1.clarification_request.strip()
-                    if s1.clarification_request.strip()
-                    else (
+                # Prefer the model's own clarifying questions, then its clarification
+                # request, then a sensible generic fallback.
+                if s1.clarifying_questions:
+                    clarification_msg = (
+                        "I need a bit more to be sure before advising. "
+                        + " ".join(q.strip().rstrip("?") + "?" for q in s1.clarifying_questions[:3])
+                    )
+                elif s1.clarification_request.strip():
+                    clarification_msg = s1.clarification_request.strip()
+                else:
+                    clarification_msg = (
                         "The photo is not clear enough to identify a specific home repair problem. "
                         "Please upload a closer, well-lit photo of the damaged area, "
                         "or describe the issue in the text field above."
                     )
-                )
                 analysis.status = "needs_clarification"
                 analysis.pipeline_stage = "needs_clarification"
                 analysis.validation_issues = clarification_msg
                 if case_row is not None:
                     case_row.status = "needs_clarification"
                 await db.commit()
-                return  # stop — do not run Stage 2 or 3
+                return  # stop, do not run Stage 2 or 3
 
             # Auto-title: overwrite the placeholder "Diagnosing…" with the AI result
             if case_row is not None:
@@ -646,57 +803,228 @@ async def _run_pipeline(
                 case_row.category = s1.trade_category
                 await db.commit()
 
-            # ── STAGE 2 — Tools, Materials, Protective Gear ───────────────────
-            analysis.pipeline_stage = _S2_RUNNING
+            # ── Output-mode branch ────────────────────────────────────────────
+            # _determine_output_mode selects the pipeline path from Stage 1 signals.
+            # The current implementation branches on assessment_first (Stage A) vs
+            # the full DIY path (Stage 2 + Stage 3). Future steps add branches for
+            # clarification (step 4) and care (step 3).
+            _mode = _determine_output_mode(s1)
+            log.info("Output mode: %s (trade=%s risk=%s diy=%s prof=%s hazards=%d q=%d)",
+                     _mode, s1.trade_category, s1.risk_level, s1.diy_suitability,
+                     s1.professional_assessment_recommended, len(s1.safety_concerns),
+                     len(s1.clarifying_questions))
+            analysis.stage_outputs = {
+                **analysis.stage_outputs,
+                "output_mode": _mode,
+            }
             await db.commit()
 
-            _t_s2 = time.monotonic()
-            s2: Stage2Output = await _stage_2_resources(s1)
-            _ms_s2 = int((time.monotonic() - _t_s2) * 1000)
-            log.info("Stage 2 complete in %.1fs", _ms_s2 / 1000)
+            _ms_total = 0   # initialised here so finalise block always has it
 
-            analysis.stage_outputs = {**analysis.stage_outputs, "stage_2": s2.model_dump()}
-            analysis.pipeline_stage = _S2_DONE
-            await db.commit()
+            if _mode == "assessment_first":
+                # ── STAGE A — Assessment / escalation output ──────────────────
+                # Skip Stage 2 and Stage 3 entirely. The model's role is now
+                # stabilisation, safety, and professional escalation — not repair.
+                analysis.pipeline_stage = _SA_RUNNING
+                await db.commit()
 
-            # ── STAGE 3 — Step-by-step Repair Instructions ────────────────────
-            analysis.pipeline_stage = _S3_RUNNING
-            await db.commit()
+                _t_sa = time.monotonic()
+                stage_a: AssessmentOutput = await _stage_A_assessment(s1)
+                _ms_sa = int((time.monotonic() - _t_sa) * 1000)
+                log.info("Stage A (assessment) complete in %.1fs", _ms_sa / 1000)
 
-            _t_s3 = time.monotonic()
-            s3: Stage3Output = await _stage_3_steps(s1, s2)
-            _ms_s3 = int((time.monotonic() - _t_s3) * 1000)
-            log.info("Stage 3 complete in %.1fs", _ms_s3 / 1000)
+                analysis.stage_outputs = {
+                    **analysis.stage_outputs,
+                    "stage_a": stage_a.model_dump(),
+                }
+                analysis.pipeline_stage = _SA_DONE
+                await db.commit()
 
-            analysis.stage_outputs = {**analysis.stage_outputs, "stage_3": s3.model_dump()}
-            analysis.pipeline_stage = _S3_DONE
-            await db.commit()
+                # ── Finalise assessment-first ──────────────────────────────────
+                combined = AnalysisResult(
+                    output_mode="assessment_first",
+                    stage_1=s1,
+                    assessment=stage_a,
+                    # stage_2 and stage_3 intentionally omitted (None)
+                )
+                _ms_total = int((time.monotonic() - start) * 1000)
+                analysis.structured_result  = combined.model_dump()
+                analysis.status             = "complete"
+                analysis.pipeline_stage     = "complete"
+                if case_row is not None:
+                    case_row.status = "complete"
+                analysis.processing_time_ms = _ms_total
+                analysis.provider           = "ollama"
+                analysis.model              = f"{STAGE_1_MODEL} | {STAGE_3_MODEL}(A)"
+                analysis.validation_issues  = (
+                    f'{{"stage_1_ms":{_ms_s1},"stage_a_ms":{_ms_sa},"total_ms":{_ms_total}}}'
+                )
+                log.info("Pipeline complete (assessment_first), S1:%ds SA:%ds total:%ds",
+                         _ms_s1 // 1000, _ms_sa // 1000, _ms_total // 1000)
+                await db.commit()
 
-            # ── FINALISE ──────────────────────────────────────────────────────
-            combined = AnalysisResult(stage_1=s1, stage_2=s2, stage_3=s3)
-            _ms_total = int((time.monotonic() - start) * 1000)
+            elif _mode == "clarification":
+                # ── Clarification mode — surface questions, skip Stage 2 + 3 ──
+                # Build ClarificationOutput DETERMINISTICALLY from Stage 1 data.
+                # No extra model call — Stage 1 already identified the unknowns.
+                _unc_lines = [l.strip() for l in (s1.uncertainty_notes or "").split(".")
+                              if l.strip() and len(l.strip()) > 10]
+                _what_unclear = _unc_lines[:4] if _unc_lines else (
+                    ["The exact repair method cannot be confirmed from the photo alone."]
+                )
+                _diy_hint = {
+                    "conditional": (
+                        "Once these questions are answered, this should be a manageable DIY repair."
+                    ),
+                    "suitable": (
+                        "This is likely DIY-suitable once the details above are clarified."
+                    ),
+                }.get(s1.diy_suitability, "")
+                _plural = len(s1.clarifying_questions) > 1
+                _why = (
+                    f"{'These answers' if _plural else 'This answer'} will affect the repair "
+                    f"method, the materials or parts to buy, and whether the job is safe to "
+                    f"do yourself. {_diy_hint}"
+                ).strip()
+                clarif = ClarificationOutput(
+                    what_is_known=(
+                        f"{s1.problem_type}: " + "; ".join(s1.observations[:3])
+                        if s1.observations else s1.problem_type
+                    ),
+                    what_is_unclear=_what_unclear,
+                    clarifying_questions=list(s1.clarifying_questions[:3]),
+                    optional_questions=list((s1.optional_questions or [])[:1]),
+                    why_it_matters=_why,
+                )
+                combined = AnalysisResult(
+                    output_mode="clarification",
+                    stage_1=s1,
+                    clarification=clarif,
+                )
+                _ms_total = int((time.monotonic() - start) * 1000)
+                analysis.structured_result  = combined.model_dump()
+                analysis.status             = "complete"
+                analysis.pipeline_stage     = "complete"
+                if case_row is not None:
+                    case_row.status = "needs_info"
+                analysis.processing_time_ms = _ms_total
+                analysis.provider           = "ollama"
+                analysis.model              = f"{STAGE_1_MODEL} (clarification)"
+                analysis.validation_issues  = (
+                    f'{{"stage_1_ms":{_ms_s1},"total_ms":{_ms_total},"mode":"clarification"}}'
+                )
+                log.info("Pipeline complete (clarification), S1:%ds total:%ds, questions=%d",
+                         _ms_s1 // 1000, _ms_total // 1000, len(s1.clarifying_questions))
+                await db.commit()
 
-            analysis.structured_result  = combined.model_dump()
-            analysis.status             = "complete"
-            analysis.pipeline_stage     = "complete"
-            if case_row is not None:
-                case_row.status = "complete"
-            analysis.processing_time_ms = _ms_total
-            analysis.provider           = "ollama"
-            analysis.model              = f"{STAGE_1_MODEL} | {STAGE_2_MODEL} | {STAGE_3_MODEL}"
-            # Store per-stage timing in validation_issues as a JSON note (non-breaking)
-            analysis.validation_issues  = (
-                f'{{"stage_1_ms":{_ms_s1},"stage_2_ms":{_ms_s2},"stage_3_ms":{_ms_s3},'
-                f'"total_ms":{_ms_total}}}'
-            )
-            log.info(
-                "Pipeline complete — S1:%ds S2:%ds S3:%ds total:%ds",
-                _ms_s1 // 1000, _ms_s2 // 1000, _ms_s3 // 1000, _ms_total // 1000,
-            )
-            await db.commit()
+            elif _mode == "care":
+                # ── STAGE C — Care-mode output ────────────────────────────────
+                # Skip Stage 2 and Stage 3. The model gives maintenance/care
+                # advice for the object, not a repair execution plan.
+                analysis.pipeline_stage = _SC_RUNNING
+                await db.commit()
+
+                _t_sc = time.monotonic()
+                stage_c: CareOutput = await _stage_C_care(s1)
+                _ms_sc = int((time.monotonic() - _t_sc) * 1000)
+                log.info("Stage C (care) complete in %.1fs", _ms_sc / 1000)
+
+                analysis.stage_outputs = {
+                    **analysis.stage_outputs,
+                    "stage_c": stage_c.model_dump(),
+                }
+                analysis.pipeline_stage = _SC_DONE
+                await db.commit()
+
+                # ── Finalise care ─────────────────────────────────────────────
+                combined = AnalysisResult(
+                    output_mode="care",
+                    stage_1=s1,
+                    care=stage_c,
+                )
+                _ms_total = int((time.monotonic() - start) * 1000)
+                analysis.structured_result  = combined.model_dump()
+                analysis.status             = "complete"
+                analysis.pipeline_stage     = "complete"
+                if case_row is not None:
+                    case_row.status = "complete"
+                analysis.processing_time_ms = _ms_total
+                analysis.provider           = "ollama"
+                analysis.model              = f"{STAGE_1_MODEL} | {STAGE_3_MODEL}(C)"
+                analysis.validation_issues  = (
+                    f'{{"stage_1_ms":{_ms_s1},"stage_c_ms":{_ms_sc},"total_ms":{_ms_total}}}'
+                )
+                log.info("Pipeline complete (care), S1:%ds SC:%ds total:%ds",
+                         _ms_s1 // 1000, _ms_sc // 1000, _ms_total // 1000)
+                await db.commit()
+
+            else:
+                # ── Full DIY pipeline (diy / verify_first; clarification in Step 4)
+                # ── STAGE 2, Tools, Materials, Protective Gear ────────────────
+                analysis.pipeline_stage = _S2_RUNNING
+                await db.commit()
+
+                _t_s2 = time.monotonic()
+                s2: Stage2Output = await _stage_2_resources(s1)
+                _ms_s2 = int((time.monotonic() - _t_s2) * 1000)
+                log.info("Stage 2 complete in %.1fs", _ms_s2 / 1000)
+
+                analysis.stage_outputs = {**analysis.stage_outputs, "stage_2": s2.model_dump()}
+                analysis.pipeline_stage = _S2_DONE
+                await db.commit()
+
+                # ── STAGE 3, Step-by-step Repair Instructions ─────────────────
+                analysis.pipeline_stage = _S3_RUNNING
+                await db.commit()
+
+                _t_s3 = time.monotonic()
+                s3: Stage3Output = await _stage_3_steps(s1, s2)
+                _ms_s3 = int((time.monotonic() - _t_s3) * 1000)
+                log.info("Stage 3 complete in %.1fs", _ms_s3 / 1000)
+
+                # Strip leaked tier tags from Stage 3 prose (deterministic backstop).
+                _scrubbed = _scrub_stage3_prose(s3)
+                if _scrubbed:
+                    log.info("Stage 3 prose: scrubbed %d leaked tier tag string(s)", _scrubbed)
+
+                # Consistency backstop: enforce Stage 1 decision on Stage 3 output.
+                _decision_notes = _apply_decision_to_stage3(s3, _decision, s1)
+                if _decision_notes:
+                    log.info("Stage 3 decision enforcement: %s", "; ".join(_decision_notes))
+
+                analysis.stage_outputs = {
+                    **analysis.stage_outputs,
+                    "stage_3": s3.model_dump(),
+                    **({"stage_3_decision": _decision_notes} if _decision_notes else {}),
+                }
+                analysis.pipeline_stage = _S3_DONE
+                await db.commit()
+
+                # ── Finalise DIY path ──────────────────────────────────────────
+                combined = AnalysisResult(
+                    output_mode=_mode,
+                    stage_1=s1, stage_2=s2, stage_3=s3,
+                )
+                _ms_total = int((time.monotonic() - start) * 1000)
+                analysis.structured_result  = combined.model_dump()
+                analysis.status             = "complete"
+                analysis.pipeline_stage     = "complete"
+                if case_row is not None:
+                    case_row.status = "complete"
+                analysis.processing_time_ms = _ms_total
+                analysis.provider           = "ollama"
+                analysis.model              = f"{STAGE_1_MODEL} | {STAGE_2_MODEL} | {STAGE_3_MODEL}"
+                analysis.validation_issues  = (
+                    f'{{"stage_1_ms":{_ms_s1},"stage_2_ms":{_ms_s2},"stage_3_ms":{_ms_s3},'
+                    f'"total_ms":{_ms_total}}}'
+                )
+                log.info("Pipeline complete (%s), S1:%ds S2:%ds S3:%ds total:%ds",
+                         _mode, _ms_s1 // 1000, _ms_s2 // 1000,
+                         _ms_s3 // 1000, _ms_total // 1000)
+                await db.commit()
 
         except Exception as exc:
-            # Catch all unhandled exceptions — never let the background task
+            # Catch all unhandled exceptions, never let the background task
             # crash silently.  Write the error to the DB so the frontend can
             # surface it and the user can decide whether to re-trigger.
             log.error("Pipeline failed for analysis_id=%d: %s", analysis_id, exc, exc_info=True)
@@ -711,7 +1039,7 @@ async def _run_pipeline(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STAGE FUNCTIONS  (real Ollama calls — replaces Session 1 stubs)
+# STAGE FUNCTIONS  (real Ollama calls, replaces Session 1 stubs)
 #
 # ─── DESIGN PRINCIPLE ─────────────────────────────────────────────────────────
 # Each function:
@@ -721,11 +1049,577 @@ async def _run_pipeline(
 #   - explicitly describes the expected JSON schema in the prompt
 #     (belt-and-suspenders alongside format="json")
 #   - calls _call_stage() which handles retry, parsing, and validation
-#   - returns a validated Pydantic object — never raw text
+#   - returns a validated Pydantic object, never raw text
 #
 # The pipeline orchestrator (_run_pipeline) never changes regardless of whether
 # the stage function calls a local model, a cloud API, or a DB lookup.
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 1 RELIABILITY PASS  (Priority 5)
+#
+# Qwen2.5-VL:3b has three recurring failure modes seen in the real saved cases:
+#   • echoey duplicate observations   (case #54: "Soil and debris on the ground
+#                                       around the pipe" listed three times)
+#   • overconfidence on a weak read   (case #56: confidence 90 on a hallucinated
+#                                       "cabinet"; case #57: confidence 80 while
+#                                       missing a structural hole)
+#   • near-duplicate evidence that pads the list without adding information
+#
+# This deterministic post-processor cleans the structured output BEFORE it can
+# propagate into Stages 2 and 3.  It never invents content, it only de-dupes,
+# trims, and reconciles the self-reported confidence with the model's own
+# uncertainty.  Returns a list of human-readable notes describing what it changed
+# (logged + appended to validation_issues for transparency).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Phrases that, when they appear in uncertainty_notes, mean the model is NOT
+# actually sure about the core diagnosis, so a 90% confidence is inconsistent.
+_UNSURE_MARKERS = (
+    "cannot determine", "can't determine", "cannot confirm", "can't confirm",
+    "cannot tell", "can't tell", "unable to determine", "unable to confirm",
+    "not clear whether", "unclear whether", "cannot identify", "hard to tell",
+    "could be", "may be either", "multiple possible", "not certain",
+)
+
+# When the model admits it cannot establish the CAUSE/root of the problem,
+# confidence is capped here so the UI never shows near-certainty on a guess.
+_UNCERTAINTY_CONF_CAP = 84
+
+# ── Extended clarification backfill keyword groups ────────────────────────────
+# Used by block 6 of _sanitize_stage_1 to catch Qwen's specific failure mode:
+# the model fills uncertainty_notes with real method-changing unknowns but still
+# returns diy_suitability="suitable" and clarifying_questions=[].
+#
+# Each entry is (trade_categories, uncertainty_keywords, targeted_questions).
+# A group fires when trade_category is in the tuple AND any keyword appears as
+# a substring in uncertainty_notes (casefold). Only method-changing unknowns
+# qualify — things the user genuinely cannot proceed without knowing.
+# Trade-specific tuples prevent false positives on cabinet holes, shoes, etc.
+_CLARIF_EXTENDED_GROUPS: list[tuple[tuple[str, ...], tuple[str, ...], list[str]]] = [
+    (
+        # Plumbing: pipe material and fitting type change the entire repair method.
+        # Without knowing these the user cannot buy the correct coupler or seal.
+        ("plumbing",),
+        ("pipe", "fitting", "connector", "compression", "push-fit", "push fit",
+         "threaded", "solvent weld", "solvent-weld", "copper", "plastic",
+         "steel", "joint type", "fitting type", "pipe material", "pipe type",
+         "material of the pipe", "corrosion"),
+        [
+            "What material is the pipe — copper, plastic, or steel?",
+            "What type of fitting is currently installed — compression, push-fit, or threaded?",
+        ],
+    ),
+    (
+        # Plastering/decorating: substrate and moisture source are blocking.
+        # Filler choice, primer type, and whether it is safe to start at all depend on these.
+        ("plastering/decorating",),
+        ("substrate", "damp", "moisture", "water ingress", "plasterboard",
+         "drywall", "concrete", "moisture source", "source of damp",
+         "cause of the damp", "wet", "saturated"),
+        [
+            "What is the wall material — plaster, plasterboard/drywall, or bare concrete?",
+            "Is there any sign of dampness or a moisture source behind the surface?",
+        ],
+    ),
+]
+
+# ── Trade-specific uncertainty defaults for step 2b ───────────────────────────
+# When the model leaves uncertainty_notes empty on a damage case, step 2b injects
+# one of these. Trade-specific defaults contain the keywords that block 6 uses,
+# so the two mechanisms work together: 2b ensures the field is non-empty and
+# meaningful; block 6 can then detect method-changing unknowns from the text.
+# The generic fallback covers all other trades.
+_UNCERTAINTY_DEFAULTS: dict[str, str] = {
+    "plumbing": (
+        "Cannot confirm the pipe material (copper, plastic, or steel), "
+        "the fitting type (compression, push-fit, or threaded), or the full "
+        "extent of any corrosion or internal damage from the photo alone."
+    ),
+    "plastering/decorating": (
+        "Cannot confirm the wall substrate (plaster, plasterboard/drywall, or bare "
+        "concrete), whether there is any damp or moisture source behind the surface, "
+        "or the full depth/extent of the damage from the photo alone."
+    ),
+}
+_UNCERTAINTY_DEFAULT_GENERIC = (
+    "Cannot confirm from the photo alone: the exact material, any hidden or internal "
+    "damage, the full depth/extent, or whether a repair or a full replacement is the "
+    "appropriate fix."
+)
+
+
+def _dedupe_strings(items: list[str], jaccard_threshold: float = 0.7) -> list[str]:
+    """
+    Order-preserving de-duplication that also collapses near-duplicates.
+
+    Two strings are treated as duplicates when either:
+      • they are identical after casefold + whitespace normalisation, or
+      • their word sets overlap by >= jaccard_threshold (catches the
+        "Soil and debris around the pipe" / "Soil and debris on the ground
+        around the pipe" variants that exact-match dedup would keep).
+    """
+    out: list[str] = []
+    seen_token_sets: list[set[str]] = []
+    for raw in items:
+        if not isinstance(raw, str):
+            continue
+        text = raw.strip()
+        if not text:
+            continue
+        norm = " ".join(text.casefold().split())
+        tokens = set(norm.split())
+        is_dup = False
+        for prev in seen_token_sets:
+            if not tokens or not prev:
+                continue
+            inter = len(tokens & prev)
+            union = len(tokens | prev)
+            if union and (inter / union) >= jaccard_threshold:
+                is_dup = True
+                break
+        if is_dup:
+            continue
+        out.append(text)
+        seen_token_sets.append(tokens)
+    return out
+
+
+def _sanitize_stage_1(s1: Stage1Output) -> list[str]:
+    """
+    Clean a validated Stage1Output in place. Returns notes on what changed.
+
+    Safe to call on any Stage1Output, including the text-only fallback object.
+    """
+    fixes: list[str] = []
+
+    # 1. De-dupe observations (exact + near-duplicate).
+    if s1.observations:
+        deduped = _dedupe_strings(s1.observations)
+        if len(deduped) != len(s1.observations):
+            fixes.append(
+                f"removed {len(s1.observations) - len(deduped)} duplicate observation(s)"
+            )
+            s1.observations = deduped
+
+    # 2. De-dupe visual_evidence the same way.
+    if s1.visual_evidence:
+        deduped_ev = _dedupe_strings(s1.visual_evidence)
+        if len(deduped_ev) != len(s1.visual_evidence):
+            fixes.append(
+                f"removed {len(s1.visual_evidence) - len(deduped_ev)} duplicate evidence item(s)"
+            )
+            s1.visual_evidence = deduped_ev
+
+    # 2b. For damage cases the model often returns an EMPTY uncertainty_notes even
+    #     though material, hidden damage, extent and repair-vs-replace are genuinely
+    #     unknown from a photo. Inject a trade-specific default so every downstream
+    #     stage receives an honest "what we cannot confirm" signal.
+    #     Trade-specific text ensures block 6 can detect method-changing unknowns
+    #     (e.g. pipe material for plumbing, substrate for decorating) even when the
+    #     model left uncertainty_notes completely empty.
+    if not (s1.uncertainty_notes or "").strip() and (s1.severity or "").strip().lower() in ("medium", "high"):
+        tc_2b = (s1.trade_category or "").strip().lower()
+        s1.uncertainty_notes = _UNCERTAINTY_DEFAULTS.get(tc_2b, _UNCERTAINTY_DEFAULT_GENERIC)
+        fixes.append(
+            f"added {'trade-specific' if tc_2b in _UNCERTAINTY_DEFAULTS else 'generic'} "
+            f"uncertainty note (model left it empty on a {s1.severity} damage case)"
+        )
+
+    # 3. Confidence ↔ uncertainty consistency. If the model both claims high
+    #    confidence AND admits in its own words that it cannot establish the
+    #    core problem/cause, cap the score so the UI does not read as certain.
+    unc = (s1.uncertainty_notes or "").casefold()
+    if unc and s1.confidence > _UNCERTAINTY_CONF_CAP:
+        if any(marker in unc for marker in _UNSURE_MARKERS):
+            old = s1.confidence
+            s1.confidence = _UNCERTAINTY_CONF_CAP
+            fixes.append(
+                f"capped confidence {old}->{_UNCERTAINTY_CONF_CAP} "
+                f"(uncertainty notes admit an unconfirmed detail)"
+            )
+
+    # 4. Very low diversity after dedup = the model echoed itself rather than
+    #    truly reading the image → it is not as sure as it claims.
+    if not s1.needs_clarification and len(s1.observations) <= 1 and s1.confidence > 80:
+        old = s1.confidence
+        s1.confidence = 80
+        fixes.append(
+            f"capped confidence {old}->80 (only one distinct observation extracted)"
+        )
+
+    # 5. Clarifying-question backfill (deterministic consistency guard).
+    #    The model said 'conditional' (meaningful unknown must be resolved before
+    #    proceeding) but produced no questions. This is internally inconsistent:
+    #    if it's conditional, something specific needs checking — the model just
+    #    forgot to generate the question.  Synthesise up to one generic question
+    #    from uncertainty_notes so the pipeline can trigger clarification mode.
+    #    Only fires when there is real uncertainty text to draw from.
+    if (
+        s1.diy_suitability == "conditional"
+        and not s1.clarifying_questions
+        and (s1.uncertainty_notes or "").strip()
+    ):
+        unc = s1.uncertainty_notes.strip()
+        # Convert "Cannot confirm X" → "To proceed safely, what is X?" format
+        # This is a deterministic fallback — the Step 4 prompt fix should make it
+        # rare by training the model to always pair conditional+questions.
+        backfill_q = (
+            f"To give you the right advice, I need to know a bit more. "
+            f"Specifically: {unc.rstrip('.')}"
+            f" — can you check or upload a closer photo?"
+        )
+        s1.clarifying_questions = [backfill_q]
+        fixes.append("backfilled 1 clarifying_question from uncertainty_notes (conditional but empty)")
+
+    # 6. Extended backfill: "suitable" + method-changing uncertainty contradiction.
+    #
+    #    Qwen's specific failure mode: the model populates uncertainty_notes with
+    #    real unknowns (pipe material, fitting type, substrate, damp source) but
+    #    still defaults to diy_suitability="suitable" with clarifying_questions=[].
+    #    "Suitable" is internally inconsistent when those unknowns directly change
+    #    the repair method, parts, or safety assessment.
+    #
+    #    Narrow triggers (ALL must be true before any keyword check):
+    #      - diy_suitability is "suitable"   (block 5 already handles "conditional")
+    #      - clarifying_questions is empty    (nothing generated by model or block 5)
+    #      - uncertainty_notes is non-empty   (real text to draw from)
+    #      - professional_assessment_recommended is False  (assessment-first cases stay put)
+    #      - safety_concerns is empty         (hazard cases stay on their path)
+    #    Then: trade + uncertainty keywords must match a known method-changing pattern.
+    if (
+        s1.diy_suitability == "suitable"
+        and not s1.clarifying_questions
+        and (s1.uncertainty_notes or "").strip()
+        and not s1.professional_assessment_recommended
+        and not s1.safety_concerns
+    ):
+        unc_lower = (s1.uncertainty_notes or "").casefold()
+        tc = (s1.trade_category or "").strip().lower()
+        for trade_tuple, unc_keywords, questions in _CLARIF_EXTENDED_GROUPS:
+            if tc in trade_tuple and any(kw in unc_lower for kw in unc_keywords):
+                s1.diy_suitability = "conditional"
+                s1.clarifying_questions = list(questions)
+                fixes.append(
+                    f"extended backfill: suitable->conditional, added "
+                    f"{len(questions)} question(s) "
+                    f"(trade={tc}, uncertainty contains method-changing unknown)"
+                )
+                break  # first matching group wins; never fire two groups
+
+    return fixes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI-LED RISK REACTIONS + THIN ONE-WAY SAFETY NET
+#
+# Design contract (model-led, not rule-led):
+#   • The MODEL decides risk: it fills risk_level, hidden_damage_risk,
+#     diy_suitability, professional_assessment_recommended, safety_concerns and
+#     clarifying_questions by reasoning about THIS scene (see the Stage 1 prompt).
+#   • The PIPELINE only REACTS to those model signals:
+#       - ask           when the model is not confident enough / wants clarifying
+#       - assessment    when the model says professional assessment is needed or
+#                       the job is not DIY-suitable (and it can name a hazard)
+#       - verify-first  when the model flags high risk or hidden damage
+#   • CATEGORY is a thin one-way SAFETY NET only. For a small set of inherently
+#     dangerous trades it may RAISE the model's signals to a cautious floor when
+#     the model has clearly under-called them (a known failure mode of a local
+#     vision model). It can NEVER lower a signal and is never the primary driver.
+#
+# This generalises: a crash-damaged vehicle has no matching trade_category, yet a
+# model that reads it as high risk / not DIY-suitable / hidden-damage will still
+# become assessment-first, because the reaction keys on the SIGNALS, not the name.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Inherently dangerous trades where a local vision model sometimes UNDER-rates the
+# risk. The net only ever escalates and supplies a concrete professional + hazard.
+_SAFETY_NET_TRADES = {
+    "electrical": {
+        "professional": "NICEIC-registered electrician",
+        "hazard": "electric shock from mains electricity",
+    },
+    "hvac": {
+        "professional": "Gas Safe registered engineer",
+        "hazard": "gas or heating-system hazard",
+    },
+    "structural": {
+        "professional": "structural engineer",
+        "hazard": "possible structural failure",
+    },
+}
+
+_RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+_DIY_ORDER = {"suitable": 0, "conditional": 1, "not_recommended": 2}
+
+_BASE_CONFIDENCE_FLOOR = 75   # generic ask-gate; same for every trade (model-led)
+
+# ── Care-mode hazard gate ─────────────────────────────────────────────────────
+# Words that are incompatible with genuine care/maintenance subjects (shoes,
+# jewellery, fabric, furniture finishes). If any appear in problem_type or
+# observations when care mode would otherwise fire, the model has most likely
+# misclassified a hazardous scene as a safe maintenance task.
+#
+# Designed to catch the demonstrated failure: an electrical sparking image
+# classified as "Sparks from welding or cutting", trade=general/other, risk=low
+# → routed to care → produced cleaning advice for what could be live electrics.
+#
+# When triggered: route to clarification (ask what the situation is) rather than
+# assessment_first (which requires a named hazard the model did not provide).
+# This is a one-way safety net only — it never lowers risk for a genuine care case.
+_CARE_HAZARD_WORDS: frozenset[str] = frozenset({
+    "spark", "sparks", "electric", "electrical", "electricity",
+    "smoke", "smoking", "burning", "burn", "fire", "flame",
+    "mains", "voltage", "live wire", "live conductor",
+    "fuse", "arc flash", "short circuit", "short-circuit",
+    "gas leak", "welding", "blowtorch", "soldering iron",
+})
+
+
+def _apply_safety_net(s1: Stage1Output) -> list[str]:
+    """
+    Thin one-way safety net (guardrail, NOT decision-maker).
+
+    For a few inherently dangerous trades, RAISE the model's own risk signals to a
+    cautious floor when it under-called them. Never lowers any signal. Mutates s1
+    and returns human-readable notes (logged + stored for transparency).
+    """
+    tc = (s1.trade_category or "").strip().lower()
+    net = _SAFETY_NET_TRADES.get(tc)
+    if not net:
+        return []   # not a safety-net trade → the model's signals stand unchanged
+
+    notes: list[str] = []
+    if _RISK_ORDER.get(s1.risk_level, 1) < _RISK_ORDER["high"]:
+        notes.append(f"risk_level {s1.risk_level}->high")
+        s1.risk_level = "high"
+    if _DIY_ORDER.get(s1.diy_suitability, 1) < _DIY_ORDER["not_recommended"]:
+        notes.append(f"diy_suitability {s1.diy_suitability}->not_recommended")
+        s1.diy_suitability = "not_recommended"
+    if not s1.professional_assessment_recommended:
+        s1.professional_assessment_recommended = True
+        notes.append("professional_assessment_recommended->True")
+    if not s1.safety_concerns:
+        s1.safety_concerns = [net["hazard"]]
+        notes.append("added default safety_concern")
+    return notes
+
+
+def _decide_actions(s1: Stage1Output) -> dict:
+    """
+    Derive the pipeline's reactions PURELY from the (model-decided, possibly
+    net-raised) Stage 1 signals. No category logic here, the safety net has
+    already done its one-way raise upstream.
+
+    Returns a dict describing what the pipeline should do, with a 'professional'
+    hint taken from the safety-net trade when available.
+    """
+    diy = (s1.diy_suitability or "conditional").strip().lower()
+    has_hazard = bool(s1.safety_concerns)
+
+    # Assessment-first when the model says a professional should look first OR the
+    # job is not DIY-suitable. CONSISTENCY GUARD: require a named hazard so we do
+    # not act on an over-call the model could not justify (e.g. "not_recommended"
+    # with empty safety_concerns). The safety net always supplies a hazard, so
+    # genuinely dangerous trades are unaffected by this guard.
+    assessment_first = (
+        (s1.professional_assessment_recommended or diy == "not_recommended")
+        and has_hazard
+    )
+
+    # Verify-first (lighter touch): the model flags real danger or that important
+    # damage may be hidden, but the job can still be DIY with checks first.
+    verify_first = (not assessment_first) and (
+        s1.hidden_damage_risk == "high"
+        or s1.risk_level in ("high", "critical")
+    )
+
+    pro_hint = _SAFETY_NET_TRADES.get(
+        (s1.trade_category or "").strip().lower(), {}
+    ).get("professional")
+
+    return {
+        "assessment_first": assessment_first,
+        "verify_first": verify_first,
+        "professional_hint": pro_hint,
+    }
+
+
+def _determine_output_mode(s1: Stage1Output) -> str:
+    """
+    Determine which pipeline output mode this Stage 1 result calls for.
+
+    Priority order (highest wins):
+
+    assessment_first
+        The model (or safety net) determined that professional in-person
+        assessment is needed AND named at least one concrete hazard.
+        Consistency guard: a named hazard is required so we do not act on a
+        vague over-call ('not_recommended' with no justification).
+        Stages 2 and 3 will NOT run. A focused AssessmentOutput is produced
+        instead: immediate actions, what NOT to do, why, professional guidance.
+
+    clarification
+        Meaningful unknowns exist that would materially change the diagnosis,
+        risk assessment, DIY suitability, repair method, tool or material
+        choice, or professional assessment decision.
+        Triggered by EITHER:
+          a) The model generated clarifying_questions (most direct signal), OR
+          b) The model set diy_suitability='conditional' (explicitly "only do
+             it after checking X") — that IS a meaningful unknown by definition.
+        NOT triggered by information that is merely missing but would not change
+        the recommendation (e.g. the brand of a product, the age of the item).
+        Stages 2 and 3 will NOT run. A ClarificationOutput is produced.
+
+    care
+        A low-risk, low-severity subject that is maintenance or care rather
+        than a repair execution task (e.g. shoe care, cleaning, preserving).
+        Identified by: severity=low + risk=low + diy=suitable + no hazards +
+        trade=general/other. A short care-recommendations output is produced,
+        without the safety/professional/step apparatus that implies danger.
+
+    verify_first
+        The job is plausibly DIY but hidden damage risk is high, meaning the
+        true extent cannot be established from the photo alone. Stages 2 and 3
+        run, but verification steps come first and the output carries a clear
+        "check before you commit" framing.
+
+    diy
+        Default for clear, straightforward, visible repairs where the model is
+        confident about the diagnosis, method, and suitability. Full pipeline.
+
+    This function is PURELY DETERMINISTIC given a Stage1Output. It has no side
+    effects and no model calls. All five test cases must return the expected mode
+    before any other pipeline stage runs.
+    """
+    diy = (s1.diy_suitability or "conditional").strip().lower()
+    has_hazard = bool(s1.safety_concerns)
+
+    # ── 1. Assessment-first ───────────────────────────────────────────────────
+    # Model said professional assessment is needed OR the job is not DIY-suitable,
+    # AND it can name a concrete hazard to justify that call.
+    if (s1.professional_assessment_recommended or diy == "not_recommended") and has_hazard:
+        return "assessment_first"
+
+    # ── 2. Clarification ──────────────────────────────────────────────────────
+    # Model generated questions (most direct signal) OR said "conditional"
+    # (which by definition means "there is an unknown that must be resolved
+    # before you can safely proceed"). Either is a meaningful unknown.
+    if s1.clarifying_questions or diy == "conditional":
+        return "clarification"
+
+    # ── 3. Verify-first ───────────────────────────────────────────────────────
+    # High hidden-damage risk without full professional assessment requirement:
+    # the repair may be DIY but there is significant unknown behind the surface.
+    # This is checked BEFORE care because hidden=high always warrants a warning
+    # even on an otherwise low-risk maintenance subject.
+    if s1.hidden_damage_risk == "high":
+        return "verify_first"
+
+    # ── 4. Care ───────────────────────────────────────────────────────────────
+    # Low-risk maintenance subject: no hazards, low severity, DIY-suitable,
+    # and classified as general/other (prevents real trades being mislabelled).
+    # Checked after verify_first so hidden=high cannot silently produce a
+    # care output with no verification warning.
+    if (
+        s1.severity == "low"
+        and s1.risk_level == "low"
+        and diy == "suitable"
+        and not has_hazard
+        and s1.trade_category == "general/other"
+    ):
+        # ── Care-mode hazard gate ─────────────────────────────────────────
+        # Before returning care, verify the language is consistent with a
+        # safe maintenance subject. If problem_type or observations contain
+        # hazard-indicator words (sparks, fire, electric, smoke, mains…) the
+        # model has likely misclassified a dangerous scene. Route to
+        # clarification instead — ask the user what is happening rather than
+        # confidently giving cleaning/polishing advice for a potential hazard.
+        _problem_lower = (s1.problem_type or "").casefold()
+        _obs_lower = " ".join(s1.observations or []).casefold()
+        _combined = _problem_lower + " " + _obs_lower
+        if any(word in _combined for word in _CARE_HAZARD_WORDS):
+            log.info(
+                "care_mode_hazard_gate_triggered",
+                extra={
+                    "problem_type": s1.problem_type,
+                    "matched_in": "problem_type or observations",
+                    "trade": s1.trade_category,
+                },
+            )
+            # Inject a clarification question so the pipeline has something to
+            # surface to the user (block 2 in _determine_output_mode fires next).
+            if not s1.clarifying_questions:
+                s1.clarifying_questions = [
+                    "Can you describe what is happening in more detail? "
+                    "For example, is this an electrical component, metalwork, "
+                    "or something else? A clearer description will help identify "
+                    "the safest next step."
+                ]
+            return "clarification"
+        return "care"
+
+    # ── 5. Default ────────────────────────────────────────────────────────────
+    return "diy"
+
+
+def _apply_decision_to_stage3(
+    s3: Stage3Output,
+    decision: dict,
+    s1: Stage1Output,
+) -> list[str]:
+    """
+    Enforce the model-derived decision on the final Stage 3 output. This is a
+    deterministic CONSISTENCY backstop, Stage 3 is also given the signals in its
+    prompt, but a local model may forget to escalate, so we make the outcome match
+    the assessment the model already produced in Stage 1.
+
+    Mutates s3 in place. Returns notes on what changed.
+    """
+    notes: list[str] = []
+    concerns = "; ".join(s1.safety_concerns) if s1.safety_concerns else ""
+
+    if decision["assessment_first"]:
+        pro = (s3.professional_type or "").strip() or decision.get("professional_hint") \
+            or "a suitably qualified professional"
+        if s3.diy_recommended:
+            s3.diy_recommended = False
+            notes.append("forced diy_recommended=False (model: assessment-first)")
+        if not (s3.professional_type or "").strip():
+            s3.professional_type = pro
+            notes.append(f"set professional_type='{pro}'")
+        lead = (
+            "Do not attempt this as a DIY repair yet. "
+            + (f"The main hazard here is {concerns}. " if concerns else "")
+            + f"Make the area safe, avoid using or disturbing it, and get {pro} to "
+            "assess it in person before any work."
+        )
+        if lead not in s3.safety_notes:
+            s3.safety_notes = [lead] + list(s3.safety_notes)
+            notes.append("prepended assessment-first escalation note")
+        if not (s3.when_to_call_professional or "").strip():
+            s3.when_to_call_professional = lead
+        return notes
+
+    if decision["verify_first"]:
+        unknowns = (s1.uncertainty_notes or "").strip() or (
+            "hidden damage, the true extent, and which materials are involved"
+        )
+        verify = (
+            "Check what the photo cannot show before any irreversible work: "
+            f"{unknowns} If it turns out worse than it looks, stop and get it "
+            "assessed by a professional."
+        )
+        if verify not in s3.safety_notes:
+            s3.safety_notes = [verify] + list(s3.safety_notes)
+            notes.append("prepended verify-first note (model: high risk / hidden damage)")
+        if s3.diy_recommended and not (s3.when_to_call_professional or "").strip():
+            s3.when_to_call_professional = verify
+            notes.append("set when_to_call_professional from verify-first requirement")
+
+    return notes
+
 
 async def _stage_1_analyse(
     upload_paths: list[str],
@@ -734,7 +1628,7 @@ async def _stage_1_analyse(
     """
     Stage 1: image / problem analysis using Qwen2.5-VL (vision model).
 
-    REAL — reads each uploaded image from disk, encodes as base64, and sends
+    REAL, reads each uploaded image from disk, encodes as base64, and sends
     to Qwen2.5-VL via Ollama.  The model examines the images and classifies
     the home repair problem into a structured Stage1Output.
 
@@ -746,7 +1640,7 @@ async def _stage_1_analyse(
     trade_category constraint:
       The value must be from a fixed vocabulary so it can drive downstream
       structured queries (e.g. nearby services geo-lookup) without another
-      LLM call.  The prompt enforces this — the model must pick one label
+      LLM call.  The prompt enforces this, the model must pick one label
       from the allowed set, not invent its own.
     """
     images_b64 = _load_images_as_base64(upload_paths)
@@ -760,16 +1654,22 @@ async def _stage_1_analyse(
         "Your job is to examine photos submitted by homeowners and identify what is damaged, "
         "broken, worn, or malfunctioning.\n\n"
         "IMPORTANT rules:\n"
-        "- Only describe what is LITERALLY VISIBLE in the image. Do not invent problems.\n"
-        "- For the observations and visual_evidence, list only what you can concretely see.\n\n"
+        "- Describe ONLY what is LITERALLY VISIBLE. Do not invent problems or mechanisms.\n"
+        "- observations and visual_evidence must be directly visible facts (e.g. 'a hole through\n"
+        "  the cabinet door panel', 'water spraying from the joint'). Do NOT state that a part is\n"
+        "  detached, loose, warped, missing, rotten, internally cracked, or 'not aligned' UNLESS\n"
+        "  that exact condition is plainly visible. If you are INFERRING a likely cause, failure\n"
+        "  mode, or hidden damage, do NOT put it in observations, put it in uncertainty_notes.\n\n"
         "You must return a single JSON object with exactly these fields:\n"
-        "  problem_type        : string — a short description of the specific item that needs repair\n"
-        "                        (e.g. 'Loose door handle', 'Leaking pipe joint', 'Cracked wall plaster',\n"
-        "                        'Failed window seal', 'Draughty window frame')\n"
-        "  trade_category      : string — EXACTLY one of these 10 values (use the exact string):\n"
+        "  problem_type        : string, name the specific damage you can actually SEE, matching\n"
+        "                        your main observation (e.g. 'Hole through cabinet door panel',\n"
+        "                        'Leaking pipe joint', 'Cracked wall plaster'). Do not guess a\n"
+        "                        mechanism you cannot see (e.g. do not say 'Loose cabinet door' for\n"
+        "                        a holed but still-mounted door).\n"
+        "  trade_category      : string, EXACTLY one of these 11 values (use the exact string):\n"
         "                        plumbing, electrical, appliance, carpentry/joinery,\n"
         "                        glazing, sealing/weatherproofing, plastering/decorating,\n"
-        "                        structural, hvac, general/other\n"
+        "                        stone/masonry, structural, hvac, general/other\n"
         "\n"
         "                        Use these rules to pick the correct value:\n"
         "                        WINDOW-SPECIFIC:\n"
@@ -785,13 +1685,18 @@ async def _stage_1_analyse(
         "                          wiring, sockets, switches, consumer units → electrical\n"
         "                          washing machine, dishwasher, boiler body, oven → appliance\n"
         "                          cracked/missing plaster, peeling paint, damp patches on walls → plastering/decorating\n"
+        "                          chipped/cracked/stained natural stone (marble, granite, slate,\n"
+        "                            limestone, travertine), cracked or loose ceramic/porcelain\n"
+        "                            tiles, broken grout, damaged brickwork or stone fireplace,\n"
+        "                            worktops/hearths/floor or wall tiles in stone or ceramic →\n"
+        "                            stone/masonry  (NOT plastering, NOT general/other)\n"
         "                          load-bearing walls, foundations, lintels, masonry cracks → structural\n"
         "                          boiler controls, central heating, air conditioning, ventilation → hvac\n"
         "                          anything else → general/other\n"
-        "  severity            : string — exactly one of: low, medium, high\n"
-        "  observations        : array of strings — 3 to 5 specific visual observations\n"
+        "  severity            : string, exactly one of: low, medium, high\n"
+        "  observations        : array of strings, 3 to 5 specific visual observations\n"
         "                        describing exactly what you see in the image\n"
-        "  confidence          : integer 0-100 — your confidence that you can clearly identify\n"
+        "  confidence          : integer 0-100, your confidence that you can clearly identify\n"
         "                        a specific home repair problem from this image and any user text.\n"
         "                        STRICT RULES for confidence:\n"
         "                        90-100 = damage is crystal clear in a sharp, well-lit, close-up photo.\n"
@@ -801,26 +1706,120 @@ async def _stage_1_analyse(
         "                                 sky, text document, screenshot), too blurry to identify any object,\n"
         "                                 or where you are guessing rather than seeing clear damage.\n"
         "                        If you are not certain what is shown, you MUST use 0-75.\n"
-        "  needs_clarification : boolean — true if confidence is 75 or below OR the image does not\n"
+        "  needs_clarification : boolean, true if confidence is 75 or below OR the image does not\n"
         "                        show a recognisable home repair problem; false otherwise.\n"
-        "  clarification_request: string — if needs_clarification is true, write ONE specific sentence\n"
+        "  clarification_request: string, if needs_clarification is true, write ONE specific sentence\n"
         "                        telling the user exactly what better photo or information would help\n"
         "                        (e.g. 'Please upload a closer, well-lit photo of the damaged pipe joint').\n"
         "                        If needs_clarification is false, use an empty string.\n"
-        "  confidence_reason   : string — one to two sentences explaining exactly why you gave this\n"
+        "  confidence_reason   : string, one to two sentences explaining exactly why you gave this\n"
         "                        confidence score. Be specific about what made the image clear or unclear.\n"
         "                        Example: 'Sharp close-up clearly shows a diagonal crack through painted\n"
         "                        plaster with visible dust below; damage extent and location are unambiguous.'\n"
-        "  visual_evidence     : array of strings — list every distinct object or feature you can clearly\n"
+        "  visual_evidence     : array of strings, list every distinct object or feature you can clearly\n"
         "                        see in the image, not just the damaged part. Be specific and factual.\n"
         "                        Example: ['White painted wall', 'Diagonal hairline crack approx 20cm',\n"
         "                        'Plaster dust on skirting board below crack', 'Painted skirting board']\n"
         "                        Do NOT include items you cannot actually see.\n"
-        "  uncertainty_notes   : string — describe ONLY what you cannot confirm from the image alone\n"
-        "                        (e.g. depth of crack, hidden damage behind surface, age of problem).\n"
-        "                        If you are confident about everything relevant, use an empty string \"\".\n"
-        "                        Example: 'Cannot determine whether crack penetrates full plaster depth\n"
-        "                        or is surface-only; no sign of damp but cannot rule it out.'\n\n"
+        "  uncertainty_notes   : string, what you CANNOT confirm from the photo alone. For ANY\n"
+        "                        damage you MUST fill this in: typically the material type, whether\n"
+        "                        there is hidden/internal damage, the depth/extent, and whether a\n"
+        "                        repair or a full replacement is the right fix. Use an empty string\n"
+        "                        \"\" ONLY if the problem and its fix are completely unambiguous.\n"
+        "                        Example: 'Cannot confirm if the door panel is solid timber or\n"
+        "                        hollow/MDF, how deep the damage goes, or whether it can be patched\n"
+        "                        or needs replacing.'\n\n"
+        "RISK ASSESSMENT, reason about these for a careful NON-EXPERT DIY homeowner (basic hand\n"
+        "tools, no trade qualifications). IMPORTANT MINDSET: most ordinary household repairs ARE\n"
+        "suitable for a careful DIY user, filling a hole, replacing a panel or door, tightening or\n"
+        "swapping a fitting, sealing, sanding, painting. Do NOT treat a repair as risky just because\n"
+        "the visible DAMAGE looks bad. Severity (how bad the damage is) is SEPARATE from risk (how\n"
+        "dangerous the REPAIR is for a DIYer). A big hole in a cabinet door is high severity but LOW\n"
+        "risk. Judge each field from THIS scene, not from the trade name:\n"
+        "  risk_level          : one of low, medium, high, critical, how dangerous it is for a DIY\n"
+        "                        user to DO this repair. Drive it from real stored/again energy or\n"
+        "                        consequence: mains electricity, gas, water under pressure, structural\n"
+        "                        loads, working at height, vehicle/airbag/fuel systems, heavy or\n"
+        "                        razor-sharp parts. low = ordinary hand-tool work (wood, filler,\n"
+        "                        sealant, a panel). high = a real chance of serious injury. critical =\n"
+        "                        a mistake could kill or disable a safety system (live mains, gas,\n"
+        "                        load-bearing failure). If NONE of those energy/consequence factors is\n"
+        "                        present, risk_level is low even if the damage looks severe.\n"
+        "  hidden_damage_risk  : one of low, medium, high, how likely important damage is NOT visible\n"
+        "                        (internal/structural/behind surfaces). A fully-visible surface defect\n"
+        "                        is low; suspected concealed/internal damage is high.\n"
+        "  diy_suitability     : one of suitable, conditional, not_recommended.\n"
+        "                        'conditional' = the repair is DIY-ok BUT the user must resolve a\n"
+        "                        specific unknown before buying parts or starting work. You MUST use\n"
+        "                        'conditional' (NOT 'suitable') when uncertainty_notes mentions any\n"
+        "                        of these unknowns:\n"
+        "                          - material type (copper vs plastic, plaster vs drywall vs concrete,\n"
+        "                            solid timber vs hollow MDF, stone type, paint type)\n"
+        "                          - fitting or connector type (compression vs push-fit vs threaded)\n"
+        "                          - pipe or cable size / diameter\n"
+        "                          - substrate or base material\n"
+        "                        If uncertainty_notes mentions any of the above, diy_suitability MUST\n"
+        "                        be 'conditional' (not 'suitable') and clarifying_questions MUST\n"
+        "                        contain at least one specific question to resolve it.\n"
+        "                        'suitable' = everything needed is clear from the photo.\n"
+        "                        'not_recommended' = real hazard or professional expertise needed.\n"
+        "  professional_assessment_recommended : boolean, true ONLY when an in-person professional\n"
+        "                        should inspect BEFORE any repair, because the photo cannot establish\n"
+        "                        safety or the correct fix AND a real hazard is present. False for\n"
+        "                        ordinary visible DIY repairs.\n"
+        "  safety_concerns     : array naming the SPECIFIC hazards you can actually justify from the\n"
+        "                        scene (e.g. 'electric shock from live conductors', 'concealed\n"
+        "                        structural damage', 'fuel/airbag systems'). CONSISTENCY RULE: if you\n"
+        "                        set risk_level to high or critical, OR diy_suitability to\n"
+        "                        not_recommended, OR professional_assessment_recommended to true, you\n"
+        "                        MUST name at least one concrete hazard here. If you cannot name a\n"
+        "                        real hazard, the risk is LOW and the job is suitable, leave this [].\n"
+        "  clarifying_questions: Work through these three checks before deciding what to ask:\n"
+        "      CHECK 1: What am I NOT sure about that would change my DIAGNOSIS of what is broken?\n"
+        "      CHECK 2: What would change whether this is safe for DIY or needs a professional?\n"
+        "      CHECK 3: What would change WHICH method, tool, or material the user should buy?\n"
+        "      COMPREHENSIVENESS RULE: Ask ALL questions you need at once. If you need to know\n"
+        "      cause AND size AND surface condition, put all three here. Do not hold back to\n"
+        "      keep the list short — a user looping through multiple re-analyses because you\n"
+        "      asked one question at a time has a far worse experience than being asked three\n"
+        "      questions upfront. Think ahead: what is the complete set of unknowns that would\n"
+        "      change your routing decision?\n"
+        "      CONTEXT RULE: If the user message contains previous answers (look for lines like\n"
+        "      'Q1: ... A1: ...'), read them carefully. Only ask about uncertainties that those\n"
+        "      answers did NOT resolve. Do not repeat or rephrase already-answered questions.\n"
+        "      For each unresolved check that produces a 'yes', write one specific, answerable\n"
+        "      question. Maximum 3 questions, ordered by importance. Plain English.\n"
+        "      GOOD questions (change the recommendation):\n"
+        "        'Is the pipe copper, plastic, or steel?' - changes the fitting and method.\n"
+        "        'Is the wall plaster, drywall, or concrete?' - changes the filler and primer.\n"
+        "        'Is the area above the ceiling still wet?' - changes safety and method.\n"
+        "        'What caused the burn mark — heat, chemical, or friction?' - changes method.\n"
+        "        'Approximately how wide is the damaged area?' - changes repair vs replace.\n"
+        "      BAD questions (never ask — they do not change the recommendation):\n"
+        "        'Can you describe the damage more?', 'How old is the fitting?',\n"
+        "        'What brand is it?', 'Can you provide more context?'\n"
+        "      EMPTY ONLY when all three checks produce 'nothing important is unclear'.\n"
+        "      For most real damage photos, at least one check will produce a useful question.\n"
+        "  optional_questions: At most 1. A photo in better lighting, a wider shot, or one minor\n"
+        "      detail that would improve advice quality but is NOT needed to make a routing\n"
+        "      decision. Only include something here if it is genuinely optional — i.e., you\n"
+        "      could give safe, specific advice without it. Leave [] if nothing is optional.\n"
+        "  EXAMPLES (calibration):\n"
+        "  Hole in a cabinet door -> risk_level low, diy_suitability suitable,\n"
+        "  clarifying_questions [] (nothing unclear), optional_questions [].\n"
+        "  Leaking pipe joint, fitting type unknown -> diy_suitability conditional,\n"
+        "  clarifying_questions ['Is the pipe copper, plastic, or steel?',\n"
+        "  'Is the fitting a compression, push-fit, or threaded type?'],\n"
+        "  optional_questions [].\n"
+        "  Burn mark on floor, cause/size/depth all unknown -> diy_suitability conditional,\n"
+        "  clarifying_questions ['What caused the burn mark (e.g. heat, cigarette, chemical)?',\n"
+        "  'Approximately how wide is the mark?',\n"
+        "  'Does the surface feel soft, cracked, raised, or deeply charred?'],\n"
+        "  optional_questions ['Can you upload a closer photo in natural light?'].\n"
+        "  Exposed/live mains, consumer unit, or scorched wiring -> risk_level critical,\n"
+        "  diy_suitability not_recommended, professional_assessment_recommended true,\n"
+        "  safety_concerns ['electric shock from live mains'], clarifying_questions [],\n"
+        "  optional_questions [].\n\n"
         "Return ONLY the JSON object.  No explanation, no markdown, no extra text."
     )
 
@@ -837,7 +1836,7 @@ async def _stage_1_analyse(
         {
             "role": "user",
             "content": user_prompt,
-            "images": images_b64,       # base64-encoded image bytes — Ollama vision API
+            "images": images_b64,       # base64-encoded image bytes, Ollama vision API
         },
     ]
 
@@ -853,6 +1852,314 @@ async def _stage_1_analyse(
         extra_options={
             "num_ctx":     STAGE_1_NUM_CTX,     # 4096
             "num_predict": STAGE_1_NUM_PREDICT,  # bumped to 600 in .env
+            "temperature": 0.0,                 # greedy → reduce run-to-run variance
+        },
+    )
+
+
+# ── Stage 2 per-trade profiles ──────────────────────────────────────────────
+# Injected into the Stage 2 prompt based on Stage 1's trade_category so the model
+# reasons within ONE trade's vocabulary instead of a generic cross-trade brand
+# menu. Each block states where tools/materials legitimately live, the
+# repair-vs-replace cue, and a hard "never recommend" list that stops cross-trade
+# leakage (e.g. plaster bonding agent showing up on a cabinet-door job).
+_STAGE_2_TRADE_PROFILES = {
+    "carpentry/joinery": (
+        "TRADE FOCUS, carpentry/joinery:\n"
+        "- Decide repair vs replace FIRST. A large hole or break through a THIN, HOLLOW or\n"
+        "  MDF/particleboard panel (typical kitchen/cabinet doors) is normally REPLACE, a\n"
+        "  matching replacement door/panel, because filler cannot rebuild a missing panel\n"
+        "  section and will crack or sink. Only SOLID timber with a SMALL hole is a sensible\n"
+        "  patch (glued timber offcut + two-part wood filler).\n"
+        "- Legitimate items: replacement door/panel, interior or two-part wood filler, timber\n"
+        "  offcut/patch, wood glue, wood screws, sandpaper, matching paint/finish. Hinges,\n"
+        "  handles or runners ONLY if the observations actually mention hinge/handle damage.\n"
+        "- NEVER recommend: plaster fillers or bonding agents, wall emulsion, plumbing or\n"
+        "  electrical parts, ladders/access gear for floor-level units. Do NOT assume the door\n"
+        "  is detached, warped, or off its hinges unless an observation says so."
+    ),
+    "plumbing": (
+        "TRADE FOCUS, plumbing:\n"
+        "- First action is almost always: isolate the water supply (stopcock/isolation valve)\n"
+        "  and release the pressure before anything else.\n"
+        "- Commit to ONE joint/fitting type from the evidence: compression, push-fit, solvent-\n"
+        "  weld, threaded (thread-seal tape/compound), or soldered (often a pro job). Listing\n"
+        "  more than one sealing/jointing method as required is contradictory, do NOT do it.\n"
+        "- Legitimate items: the one chosen fitting/coupler/seal, towels/bucket, pipe cleaner\n"
+        "  or deburr tool. NEVER recommend wall fillers, paint, or wood products.\n"
+        "- If the fitting type is not clear from the photo, mark the specific parts\n"
+        "  [Verify First] and tell the user to identify the fitting and pipe size before buying.\n"
+        "- For an outdoor/buried supply pipe, note it may be the homeowner's responsibility past\n"
+        "  the boundary stopcock and that buried services/pressure raise the risk."
+    ),
+    "electrical": (
+        "TRADE FOCUS, electrical:\n"
+        "- Default to STOP and ESCALATE. For most homeowners the only safe [Confirmed] action\n"
+        "  is: isolate the circuit at the consumer unit and call a registered electrician.\n"
+        "- Keep items minimal (isolation; a socket/voltage tester at most, [Verify First]).\n"
+        "- NEVER recommend buying parts for DIY mains (230V) install or imply DIY rewiring."
+    ),
+    "plastering/decorating": (
+        "TRADE FOCUS, plastering/decorating:\n"
+        "- Match filler grade to the damage: fine filler for hairline cracks, deeper/flexible\n"
+        "  filler for wider or movement cracks; bonding agent only on smooth/previously-sealed\n"
+        "  surfaces. Generic type first, brand only as an example.\n"
+        "- Legitimate items: filler, abrasive, primer/mist coat, matching paint.\n"
+        "- NEVER recommend wood, plumbing, or electrical parts."
+    ),
+    "glazing": (
+        "TRADE FOCUS, glazing:\n"
+        "- Cracked/broken glass and failed sealed (misted) units are normally REPLACE, usually\n"
+        "  measured and fitted by a glazier. Lead with measured replacement glass/unit as\n"
+        "  [Likely] plus a [Verify First] step to measure the pane and confirm single vs double\n"
+        "  glazing. NEVER recommend fillers or paint."
+    ),
+    "sealing/weatherproofing": (
+        "TRADE FOCUS, sealing/weatherproofing:\n"
+        "- Pick ONE correct sealant for the location (frame/exterior sealant, or sanitary\n"
+        "  silicone for wet areas) plus removal of the old bead. One sealant type only.\n"
+        "- NEVER recommend structural, wood, or plumbing parts unless the evidence shows them."
+    ),
+    "stone/masonry": (
+        "TRADE FOCUS, stone/masonry (natural stone like marble/granite/slate/limestone, and\n"
+        "ceramic/porcelain tiling):\n"
+        "- A crack/chip in stone is STABILISE-AND-FILL, NEVER chisel-and-demolish. Do NOT list\n"
+        "  hammers, chisels or breakers for crack repair, that is the wrong method. Only consider\n"
+        "  a chisel if the stone is genuinely broken into separate pieces that need to be lifted\n"
+        "  for a full replacement (a different job).\n"
+        "- The PRIMARY repair material is a knife-grade two-part stone/marble epoxy (or\n"
+        "  clear-setting cyanoacrylate for very fine hairlines), [Confirmed] or [Likely], NEVER\n"
+        "  [Do Not Buy Yet]. For colour-matching, knife-grade epoxy can be tinted with stone-dust\n"
+        "  or pigment of the same stone type, [Likely].\n"
+        "- Other essentials: acetone or IPA for degreasing the crack (acidic cleaners ETCH stone,\n"
+        "  do NOT recommend vinegar/lemon/general bathroom cleaner). Low-tack painter's tape to\n"
+        "  mask the crack edges. Clean lint-free cloth. Razor blade or stone scraper for trimming\n"
+        "  proud epoxy once cured. Wet/dry sandpaper progressing 400 -> 800 -> 1500 -> 3000 for\n"
+        "  polishing back to gloss on polished marble/granite (omit for honed/matte finishes).\n"
+        "  Tin-oxide marble polish or a diamond polishing pad to restore the original sheen.\n"
+        "- NEVER recommend wood filler, plaster filler, builder's caulk, decorator's caulk, or\n"
+        "  general-purpose silicone for a stone crack, they discolour, shrink and cannot be\n"
+        "  polished. NEVER recommend grout for cracked stone (grout is for joints between tiles).\n"
+        "- For cracked grout between TILES (not the tile itself): grout removal tool/saw plus\n"
+        "  matching grout, NOT epoxy."
+    ),
+    "structural": (
+        "TRADE FOCUS, structural:\n"
+        "- Default to ESCALATE: recommend assessment by a structural engineer or builder before\n"
+        "  any work or purchase. Keep any DIY materials minimal and [Verify First]."
+    ),
+}
+
+_STAGE_2_TRADE_GENERIC = (
+    "TRADE FOCUS, {tc}:\n"
+    "- Recommend only items the observations and visual evidence directly support, described\n"
+    "  generically. If the correct approach cannot be determined from the photo, mark the key\n"
+    "  items [Verify First] and state the check the user must do. Escalate to a qualified\n"
+    "  professional where safety or compliance is involved."
+)
+
+
+def _stage_2_trade_profile(trade_category: str) -> str:
+    """Return the per-trade guidance block for the Stage 2 prompt (gated by trade)."""
+    tc = (trade_category or "general/other").strip().lower()
+    return _STAGE_2_TRADE_PROFILES.get(tc, _STAGE_2_TRADE_GENERIC.format(tc=tc))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE A — Assessment-first output (replaces Stage 2 + 3 when the model has
+# determined that professional in-person assessment is needed before any repair)
+#
+# Design principle: the model's role is now stabilisation, safety, and
+# escalation — not repair execution. The prompt teaches it to reason about:
+#   (1) what the user must do RIGHT NOW to make things safe
+#   (2) what they must NOT do (worsen the danger or the damage)
+#   (3) why a professional is needed (specific to THIS scene)
+#   (4) what information to gather before the professional arrives
+#   (5) who to call and how urgently
+#
+# Nothing in this output describes how to perform the repair.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _stage_A_assessment(stage_1: Stage1Output) -> AssessmentOutput:
+    """
+    Stage A: assessment-first output using Llama 3.1:8b (text model).
+
+    Called INSTEAD of Stage 2 and Stage 3 when output_mode == 'assessment_first'.
+    Receives the Stage 1 diagnosis as context and produces AssessmentOutput:
+    stabilisation actions, what NOT to do, risk explanation, information to
+    gather, and professional guidance.
+
+    Never produces repair steps, tool lists, or material lists.
+    """
+    _vis     = "; ".join(stage_1.visual_evidence[:6]) if stage_1.visual_evidence else "none recorded"
+    _unc     = stage_1.uncertainty_notes.strip() if stage_1.uncertainty_notes else "none"
+    _hazards = "; ".join(stage_1.safety_concerns) if stage_1.safety_concerns else "not specified"
+    context  = (
+        f"Problem                : {stage_1.problem_type}\n"
+        f"Trade                  : {stage_1.trade_category}\n"
+        f"Severity               : {stage_1.severity}\n"
+        f"Diagnosis confidence   : {stage_1.confidence}%\n"
+        f"Risk level             : {stage_1.risk_level}\n"
+        f"Hidden damage risk     : {stage_1.hidden_damage_risk}\n"
+        f"Named hazards          : {_hazards}\n"
+        f"Visually confirmed     : {_vis}\n"
+        f"Cannot confirm         : {_unc}\n"
+        f"Observations           :\n"
+        + "\n".join(f"  - {obs}" for obs in stage_1.observations)
+    )
+
+    system_prompt = (
+        "You are a safety-first remote assessor advising a homeowner who has sent you a photo.\n"
+        "The diagnosis above indicates this situation requires in-person professional assessment\n"
+        "before any repair work is attempted.\n\n"
+        "YOUR ROLE HAS CHANGED. You are NOT providing repair guidance. You are providing:\n"
+        "  1. Stabilisation: what the user must do right now to make things safe\n"
+        "  2. Caution: what they must NOT do under any circumstances\n"
+        "  3. Explanation: why a professional must assess it (specific to this scene)\n"
+        "  4. Preparation: what information/evidence to gather for the professional\n"
+        "  5. Escalation: who to call and how urgently\n\n"
+        "RULES:\n"
+        "- Do NOT describe how to perform the repair or any part of it.\n"
+        "- Do NOT suggest DIY tools, materials, or methods.\n"
+        "- Do NOT give speculative repair estimates.\n"
+        "- Be specific to THIS scene. Use the diagnosis context to name the exact hazards.\n"
+        "- Immediate actions must be doable right now with no special tools.\n"
+        "  Examples: 'Turn off the water at the stopcock', 'Switch off the circuit at\n"
+        "  the consumer unit and leave it off', 'Do not use the room until assessed',\n"
+        "  'Place a bucket under the leak'.\n"
+        "- do_not_do must name specific actions that could worsen the danger for THIS case.\n"
+        "  Examples: 'Do not attempt to open the consumer unit', 'Do not remove ceiling\n"
+        "  panels', 'Do not apply weight to the affected area'.\n"
+        "- why_assessment_needed must explain the specific risk in plain English.\n"
+        "  Do NOT use generic phrases like 'this is dangerous'. Say WHY it is dangerous\n"
+        "  for this specific scene (e.g. 'water near electrical wiring above the ceiling\n"
+        "  creates a risk of electrocution even if the immediate area looks dry').\n"
+        "- information_needed is what a professional would want to know or see when they\n"
+        "  arrive. Be practical: 'photograph the source of the leak', 'note when it\n"
+        "  started', 'check if the circuit breaker has tripped'.\n"
+        "- professional_urgency must be exactly one of: 'immediately', 'within 24 hours',\n"
+        "  'within the week', 'when convenient'. Use 'immediately' only for active\n"
+        "  danger (live exposed wiring, active structural failure, gas smell).\n\n"
+        "Return a single JSON object with exactly these fields:\n"
+        "  immediate_actions    : array of 2 to 5 plain strings, each one specific action\n"
+        "  do_not_do            : array of 2 to 4 plain strings, each one specific prohibition\n"
+        "  why_assessment_needed: string, 2 to 3 sentences, specific to this scene\n"
+        "  information_needed   : array of 2 to 4 plain strings, evidence to gather\n"
+        "  professional_type    : string, exact trade to call (e.g. 'CIPHE-registered plumber',\n"
+        "                         'NICEIC-registered electrician', 'structural engineer')\n"
+        "  professional_urgency : string, exactly one of: immediately | within 24 hours |\n"
+        "                         within the week | when convenient\n\n"
+        "Return ONLY the JSON object. No explanation, no markdown, no extra text."
+    )
+
+    user_prompt = (
+        f"Based on this assessment:\n\n{context}\n\n"
+        "Provide stabilisation guidance and professional escalation. "
+        "Do not provide repair instructions."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_prompt},
+    ]
+
+    return await _call_stage(
+        model=STAGE_3_MODEL,   # reuse Llama 3.1:8b — same quality, avoids extra model load
+        messages=messages,
+        schema_class=AssessmentOutput,
+        stage_name="stage_A (assessment)",
+        extra_options={
+            "num_ctx":     STAGE_3_NUM_CTX,
+            "num_predict": 600,       # assessment output is shorter than a full repair plan
+            "temperature": 0.0,
+        },
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE C — Care-mode output (replaces Stage 2 + 3 when the model determines
+# this is a low-risk maintenance or care task, not a repair execution task)
+#
+# Design principle: the model advises on care and maintenance of the specific
+# object and material. No safety notes, no protective gear, no professional
+# guidance, no repair execution steps. The tone is practical and friendly,
+# like advice from a product-care specialist, not a tradesperson.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _stage_C_care(stage_1: Stage1Output) -> CareOutput:
+    """
+    Stage C: care-mode output using Llama 3.1:8b (text model).
+
+    Called INSTEAD of Stage 2 and Stage 3 when output_mode == 'care'.
+    Receives the Stage 1 diagnosis as context and produces CareOutput:
+    a plain-English condition summary, ordered care recommendations,
+    things to avoid, and what the result should look like.
+
+    Never produces repair steps, tool lists, safety warnings, or professional
+    guidance — this is care and maintenance advice only.
+    """
+    _vis = "; ".join(stage_1.visual_evidence[:5]) if stage_1.visual_evidence else "none recorded"
+    _obs = "\n".join(f"  - {o}" for o in stage_1.observations)
+    context = (
+        f"Object / problem type  : {stage_1.problem_type}\n"
+        f"Visually confirmed     : {_vis}\n"
+        f"Observations           :\n{_obs}"
+    )
+
+    system_prompt = (
+        "You are a practical care and maintenance advisor. The user has sent you a photo of "
+        "an object that needs care or maintenance, not a structural repair.\n\n"
+        "YOUR ROLE: give specific, friendly, practical advice on how to care for and restore "
+        "this object based on what was observed. Think like a product-care specialist who "
+        "knows the material, not a builder or tradesperson.\n\n"
+        "RULES:\n"
+        "- Be specific to the ACTUAL object and material shown. Name the material if visible.\n"
+        "- Recommendations must be ordered: preparation first, then cleaning, then treatment,\n"
+        "  then protection/finishing. Skip steps that do not apply.\n"
+        "- Do NOT include safety warnings, protective gear, professional guidance, or repair\n"
+        "  steps. This is maintenance and care advice only.\n"
+        "- Do NOT include dust sheets, work gloves, or other trade-level precautions.\n"
+        "- Use plain, friendly language. 'Wipe gently with a damp cloth' not 'Apply a\n"
+        "  cleaning agent to the substrate using circular motions'.\n"
+        "- what_to_avoid must be specific to the material (e.g. 'Do not use bleach on\n"
+        "  leather, it dries and cracks the surface'). Generic warnings are not useful.\n"
+        "- expected_outcome is one sentence describing what the item looks/feels like after\n"
+        "  following the advice. Be realistic and specific.\n\n"
+        "Return a single JSON object with exactly these fields:\n"
+        "  condition_summary  : string, 1-2 sentences describing what the photo shows in\n"
+        "                       plain English (e.g. 'The leather upper shows surface\n"
+        "                       discolouration and light scuff marks; the sole shows wear\n"
+        "                       but the structure looks intact.')\n"
+        "  recommendations    : array of 2 to 6 strings, specific ordered care actions.\n"
+        "                       Each string is one action: what to use, how to apply it,\n"
+        "                       what done-right looks like. Keep each under 30 words.\n"
+        "  what_to_avoid      : array of 0 to 3 strings, material-specific pitfalls. Empty\n"
+        "                       array if nothing specific applies. Do NOT list generic\n"
+        "                       cautions like 'be careful' or 'test a small area first' -\n"
+        "                       only include if there is a real material-specific risk.\n"
+        "  expected_outcome   : string, one sentence on what the result should look like.\n\n"
+        "Return ONLY the JSON object. No explanation, no markdown, no extra text."
+    )
+
+    user_prompt = (
+        f"Based on this observation:\n\n{context}\n\n"
+        "Provide specific care and maintenance advice for this object."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_prompt},
+    ]
+
+    return await _call_stage(
+        model=STAGE_3_MODEL,   # Llama 3.1:8b — good at practical advice
+        messages=messages,
+        schema_class=CareOutput,
+        stage_name="stage_C (care)",
+        extra_options={
+            "num_ctx":     STAGE_3_NUM_CTX,
+            "num_predict": 500,   # care output is compact
+            "temperature": 0.1,   # slight warmth for friendly tone, still deterministic
         },
     )
 
@@ -861,12 +2168,12 @@ async def _stage_2_resources(stage_1: Stage1Output) -> Stage2Output:
     """
     Stage 2: tools / materials / protective gear using Mistral (text model).
 
-    REAL — receives Stage 1's structured output as context and asks Mistral
+    REAL, receives Stage 1's structured output as context and asks Mistral
     to list what the user needs before starting the repair.
 
     Context passed forward:
       The stage_1 object is serialised to a readable text block so the model
-      understands the full diagnosis — not just the problem type, but also
+      understands the full diagnosis, not just the problem type, but also
       the severity and what was visually observed.
 
     Hybrid-design note:
@@ -883,52 +2190,77 @@ async def _stage_2_resources(stage_1: Stage1Output) -> Stage2Output:
     # Serialise Stage 1 output into a readable context block for the prompt.
     # Using field-by-field text rather than raw JSON makes it easier for the
     # model to understand what was diagnosed.
+    # Confidence / uncertainty context from Stage 1.  Stage 2 uses this to decide
+    # how firmly to recommend specific parts/sizes versus flag them for verification:
+    # a low confidence or a populated "uncertain" list means the exact fitting, size,
+    # or material type is an inference from the photo, not a confirmed fact.
+    _vis = "; ".join(stage_1.visual_evidence[:8]) if stage_1.visual_evidence else "none recorded"
+    _unc = stage_1.uncertainty_notes.strip() if stage_1.uncertainty_notes else "none recorded"
+    _reason = stage_1.confidence_reason.strip() if stage_1.confidence_reason else "not given"
     context = (
-        f"Problem type  : {stage_1.problem_type}\n"
-        f"Trade         : {stage_1.trade_category}\n"
-        f"Severity      : {stage_1.severity}\n"
+        f"Problem type           : {stage_1.problem_type}\n"
+        f"Trade                  : {stage_1.trade_category}\n"
+        f"Severity               : {stage_1.severity}\n"
+        f"Diagnosis confidence   : {stage_1.confidence}% ({_reason})\n"
+        f"Visually confirmed     : {_vis}\n"
+        f"NOT confirmed/uncertain: {_unc}\n"
         f"Observations  :\n"
         + "\n".join(f"  - {obs}" for obs in stage_1.observations)
     )
 
+    _trade_block = _stage_2_trade_profile(stage_1.trade_category)
     system_prompt = (
-        "You are an experienced UK DIY advisor helping a homeowner prepare for a repair.\n"
-        "Your job is to list exactly what they need before starting — tools, materials, and safety gear.\n\n"
-        "RULES:\n"
-        "1. Recommend SPECIFIC UK products and brands where relevant. Examples by trade:\n"
-        "   Plasterwork/filling: Polyfilla Ready Mixed (small cracks up to 5mm), Toupret TX110 Fibre (cracks\n"
-        "     5-20mm or on damp/movement-prone surfaces), Toupret Interior Filler (general patching),\n"
-        "     Blue Grit bonding agent (before skim coat on smooth surfaces), Gyproc EasiFill (for large areas).\n"
-        "   Adhesives/sealants: UniBond No More Nails (general bonding), Gorilla Grab Adhesive,\n"
-        "     CT1 Sealant (superior waterproof multipurpose sealant for wet areas),\n"
-        "     Dow Corning 785 or UniBond Silicone (bathroom/kitchen silicone), Everbuild Flash Band.\n"
-        "   Paints/primers: Dulux or Johnstone's Trade matt emulsion (interior walls), Zinsser Bulls Eye 1-2-3\n"
-        "     (stain-blocking primer), Johnstone's Exterior Gloss (exterior woodwork), Dulux Weathershield.\n"
-        "   Plumbing: PTFE tape (standard 12mm thread seal), Fernox F1 or Sentinel X100 (heating system\n"
-        "     inhibitor if relevant), push-fit fittings (e.g. John Guest or Speedfit), solvent weld fittings.\n"
-        "   Wood/timber: Ronseal Exterior Wood Filler (two-part, for outdoor wood), Ronseal Interior Wood\n"
-        "     Filler (ready mixed, for indoor), Ronseal Hardener + Filler (for soft/rotten timber),\n"
-        "     Osmo Polyx Oil or Ronseal Hardwood Decking Oil (for hardwood), Sadolin Classic (softwood).\n"
-        "   Fixings: Rawlplug or Fischer wall plugs (specify size: red=6mm, brown=7mm, yellow=5mm),\n"
-        "     Resin anchor (Hilti HIT-RE 500 or Fischer FIS EV) for structural fixings.\n"
-        "2. Size and spec every tool entry. Example: 'No.2 cross-head (Pozidriv) screwdriver — for the\n"
-        "   M5 pan-head screws securing the bracket'. Never list a bare tool name.\n"
-        "3. For materials, include the pack/tube size and mixing ratio where relevant.\n"
-        "   Example: 'Polyfilla Ready Mixed (500g tub — apply with filling knife, no mixing required,\n"
-        "   dries white in 2-4 hours depending on depth)'.\n"
-        "4. Separate ESSENTIAL items (job cannot be done without them) from OPTIONAL (improve the result\n"
-        "   or speed up the work but not strictly required).\n"
-        "5. Include realistic estimated_time_minutes — this must account for drying/curing wait times\n"
-        "   where relevant (e.g. a two-coat filler repair is not 30 min, it is 3-4 hours including drying).\n\n"
-        "You must return a single JSON object with exactly these fields:\n"
-        "  tools                   : array of strings — ESSENTIAL tools, each with spec and purpose\n"
-        "  optional_tools          : array of strings — OPTIONAL tools, each with spec and purpose\n"
-        "  materials               : array of strings — ESSENTIAL consumable materials, each with brand,\n"
-        "                            pack size, and brief usage note\n"
-        "  optional_materials      : array of strings — OPTIONAL materials, each with brand and usage note\n"
-        "  protective_gear         : array of strings — safety equipment with one-line reason\n"
-        "  estimated_time_minutes  : integer — total realistic time including any drying/curing waits\n\n"
-        "Return ONLY the JSON object.  No explanation, no markdown, no extra text."
+        "You are an experienced UK tradesperson preparing a homeowner for a repair.\n"
+        "You are working from a photo-based diagnosis, you CANNOT see the image yourself, so\n"
+        "treat the diagnosis as evidence, not proof. List ONLY what the evidence supports and be\n"
+        "honest about what is not yet known. Sound like a careful tradesperson, never a guesser.\n\n"
+        "TIER EVERY TOOL AND MATERIAL. Begin each string with exactly one tag:\n"
+        "  [Confirmed]      the observations / visual evidence clearly show this is needed.\n"
+        "  [Likely]         the standard fix for THIS exact damage in THIS trade. The PRIMARY\n"
+        "                   repair material (the filler, the replacement part, the sealant that\n"
+        "                   actually does the fix) belongs here at minimum, never lower.\n"
+        "  [Verify First]   depends on a check the user must do first (size, thread/fitting type,\n"
+        "                   panel material, screw head) before buying.\n"
+        "  [Do Not Buy Yet] only needed in a contingency IF a specific hypothesis turns out true.\n"
+        "                   This is a CONTINGENCY tier, NEVER use it for the primary repair item.\n"
+        "Pick the tier from the context's 'Diagnosis confidence', 'Visually confirmed' and 'NOT\n"
+        "confirmed/uncertain'. Lower confidence means fewer [Confirmed] items and more [Verify\n"
+        "First], it never demotes the primary fix to [Do Not Buy Yet].\n"
+        "CRITICAL: the single most important material to FIX the problem (e.g. two-part stone/marble\n"
+        "epoxy for a marble crack, two-part wood filler for a wood gouge, the replacement panel for\n"
+        "a damaged door) MUST be tagged [Confirmed] or [Likely]. If you find yourself tagging the\n"
+        "main repair material as [Verify First] or [Do Not Buy Yet], your tiers are inverted, fix\n"
+        "them before returning.\n\n"
+        "EVIDENCE RULE: every item must follow from a specific observation or visual-evidence\n"
+        "entry. If you cannot point to what makes it necessary, drop it or mark it [Do Not Buy\n"
+        "Yet]. Do NOT add items just because they are common for the trade (no ladders for\n"
+        "floor-level work, no filler/paint on a plumbing job, no 'spare screws just in case').\n\n"
+        "ONE METHOD ONLY: choose the single most likely repair method from the evidence. NEVER\n"
+        "list mutually exclusive methods together (e.g. PTFE tape AND push-fit AND solvent-weld\n"
+        "AND compression; or fill AND replace). Recommend the one the evidence supports, and put\n"
+        "any alternative as a SINGLE [Verify First] line ('if the fitting is actually push-fit you\n"
+        "will need ... instead').\n\n"
+        "REPAIR vs REPLACE: decide this before listing materials. If the damage is likely beyond a\n"
+        "sensible repair, lead with the REPLACEMENT item ([Confirmed]/[Likely]) and list any\n"
+        "patch/filler materials only as [Verify First] with the exact condition that would make a\n"
+        "repair viable. If a simple repair is clearly right, do the reverse. State the deciding\n"
+        "factor in the item's note.\n\n"
+        "BRANDS: describe items by GENERIC type and spec first ('two-part wood filler', '15mm\n"
+        "compression coupler'). You may add ONE brand in parentheses as an example ONLY when the\n"
+        "material/trade is confirmed. Never lead with a brand and never attach a brand to an\n"
+        "unconfirmed item.\n\n"
+        f"{_trade_block}\n\n"
+        "Format each entry as: '[Tier] generic item (spec/size if evidence supports it), short\n"
+        "purpose'. Add a verification note where the size/type is not confirmed. Separate\n"
+        "ESSENTIAL items from OPTIONAL ones. estimated_time_minutes must include drying/curing.\n\n"
+        "Return a single JSON object with exactly these fields:\n"
+        "  tools                  : array of strings, ESSENTIAL tools, each tier-tagged\n"
+        "  optional_tools         : array of strings, OPTIONAL tools, each tier-tagged\n"
+        "  materials              : array of strings, ESSENTIAL materials, each tier-tagged\n"
+        "  optional_materials     : array of strings, OPTIONAL materials, each tier-tagged\n"
+        "  protective_gear        : array of strings, safety gear, each with a one-line reason\n"
+        "  estimated_time_minutes : integer, realistic total including any drying/curing\n\n"
+        "Return ONLY the JSON object. No explanation, no markdown, no extra text."
     )
 
     user_prompt = (
@@ -949,8 +2281,111 @@ async def _stage_2_resources(stage_1: Stage1Output) -> Stage2Output:
         extra_options={
             "num_ctx":     STAGE_2_NUM_CTX,
             "num_predict": STAGE_2_NUM_PREDICT,
+            "temperature": 0.0,   # deterministic recommendations
         },
     )
+
+
+# ── Stage 3 per-trade profiles ──────────────────────────────────────────────
+# Injected into the Stage 3 prompt based on trade_category so the repair steps
+# and hazards are category-specific. This replaces the old hardcoded plaster-wall
+# guidance (mist coat / feathering / "pink to white") that used to leak into every
+# job. Each block gives the correct step shape for the trade plus its REAL hazards
+# so the risk reasoning is grounded, not generic.
+_STAGE_3_TRADE_PROFILES = {
+    "carpentry/joinery": (
+        "TRADE FOCUS, carpentry/joinery:\n"
+        "- If a replacement door/panel is the confirmed approach, the steps are: remove the\n"
+        "  damaged door, measure and obtain the matching door/panel, then fit and align it -\n"
+        "  do NOT write fill-and-paint steps for a missing panel section.\n"
+        "- Wood finishing is sand -> prime -> paint/finish to match. Do NOT use plaster-wall\n"
+        "  language (skim, mist coat, feathering, 'pink to white', 'no proud edges').\n"
+        "- Real hazards: sharp broken MDF/timber edges and splinters; a heavy door coming free\n"
+        "  unexpectedly; trapped fingers at the hinge; fine MDF/filler dust."
+    ),
+    "plumbing": (
+        "TRADE FOCUS, plumbing:\n"
+        "- First step is ALWAYS isolate the water at the correct valve and release the pressure;\n"
+        "  the last step is a slow re-pressurise and leak check. For an outdoor/buried supply the\n"
+        "  stopcock is usually at the boundary/meter, NOT under the kitchen sink.\n"
+        "- Commit to the ONE fitting method in the resource list. For any [Verify First] fitting,\n"
+        "  add a step to identify the pipe material/size and fitting type before buying or cutting.\n"
+        "- Real hazards: water under pressure; water near electrics; buried/unmarked services;\n"
+        "  contamination of drinking water; hidden rot/damp from a long-running leak."
+    ),
+    "electrical": (
+        "TRADE FOCUS, electrical:\n"
+        "- For 230V work the workflow is: isolate at the consumer unit, prove dead, and STOP -\n"
+        "  most socket/wiring repairs are notifiable and belong to a registered electrician.\n"
+        "- Real hazards: electric shock/electrocution; arc flash burns; fire from loose or burnt\n"
+        "  terminals. Treat exposed conductors as live until proven dead."
+    ),
+    "plastering/decorating": (
+        "TRADE FOCUS, plastering/decorating:\n"
+        "- Plaster/filler language IS correct here: fill in thin coats, leave each to dry, sand\n"
+        "  between coats, feather the edges, and mist-coat before the topcoat.\n"
+        "- Real hazards: fine dust (mask + ventilation); working at height if above head height;\n"
+        "  skin/eye irritation from filler, bonding agent, or primer."
+    ),
+    "glazing": (
+        "TRADE FOCUS, glazing:\n"
+        "- Broken glass / failed sealed units are measured and replaced (often by a glazier).\n"
+        "  Steps centre on safe removal of broken glass and fitting the measured replacement.\n"
+        "- Real hazards: deep glass lacerations; falling glass shards; cuts from old beads/points."
+    ),
+    "sealing/weatherproofing": (
+        "TRADE FOCUS, sealing/weatherproofing:\n"
+        "- Steps: strip the old sealant fully, clean and dry the surface, apply ONE correct\n"
+        "  sealant in a continuous bead, tool it, then allow a full cure before exposure.\n"
+        "- Real hazards: knife cuts stripping old sealant; working at height; solvent fumes."
+    ),
+    "stone/masonry": (
+        "TRADE FOCUS, stone/masonry (natural stone like marble/granite/slate/limestone, and tile):\n"
+        "- The repair is STABILISE-AND-FILL, never demolish. Do NOT write hammer/chisel steps for a\n"
+        "  crack repair, and do NOT mention removing 'loose or damaged marble', that is wrong; the\n"
+        "  crack stays in place, the epoxy bridges it.\n"
+        "- Correct sequence: 1) dust the crack out (vacuum + soft brush, no water yet). 2) Degrease\n"
+        "  with acetone or IPA on a lint-free cloth, leave fully dry. 3) Mask each side of the\n"
+        "  crack with low-tack tape, leaving a 1-2 mm gap along the crack line, this stops epoxy\n"
+        "  staining the surrounding polish. 4) Mix knife-grade two-part stone/marble epoxy on a\n"
+        "  scrap, tint with stone-dust/pigment to match. 5) Press epoxy firmly into the crack with\n"
+        "  a small palette knife or razor blade, leaving it slightly PROUD of the surface. 6) Let\n"
+        "  cure to the manufacturer's full cure time (typically 30-60 min hands-off, 24 h hard\n"
+        "  cure). 7) Trim flush with a razor blade held flat to the stone. 8) Wet-sand polished\n"
+        "  stone only, 400 -> 800 -> 1500 -> 3000 grit, rinsing between grits; SKIP sanding on\n"
+        "  honed/matte stone or you will create a shiny patch. 9) Polish back to original sheen\n"
+        "  with tin-oxide marble polish or a diamond polishing pad on a damp cloth.\n"
+        "- NEVER use plaster-wall language (skim, mist coat, feathering, 'pink to white').\n"
+        "- For acidic CLEANING products, warn explicitly: no vinegar, lemon juice, bleach or\n"
+        "  general bathroom cleaner on marble/limestone, they etch the polish permanently.\n"
+        "- Real hazards: epoxy resin skin/eye irritation (gloves + ventilation); solvent fumes\n"
+        "  from acetone (open a window, no naked flames); sharp razor blade; if the stone is a\n"
+        "  worktop or hearth used near heat, mention the epoxy's heat tolerance limit.\n"
+        "- For cracked GROUT between tiles (not the tile itself): rake the old grout out with a\n"
+        "  grout saw, vacuum, then apply matching grout, smooth with a finger or grout float, wipe\n"
+        "  haze off after the initial set."
+    ),
+    "structural": (
+        "TRADE FOCUS, structural:\n"
+        "- Do NOT write a DIY repair sequence. The workflow is: make the area safe, avoid loading\n"
+        "  it, and get a structural engineer/builder to assess before any work.\n"
+        "- Real hazards: collapse; concealed load paths; falling debris."
+    ),
+}
+
+_STAGE_3_TRADE_GENERIC = (
+    "TRADE FOCUS, {tc}:\n"
+    "- Keep steps specific to what was actually observed; do not borrow language or methods from\n"
+    "  other trades. Add a verification step wherever the resource list says [Verify First].\n"
+    "- Real hazards: identify the genuine hazards for THIS specific repair (mechanical, electrical,\n"
+    "  water, height, dust, sharp edges), no generic platitudes."
+)
+
+
+def _stage_3_trade_profile(trade_category: str) -> str:
+    """Return the per-trade step/hazard guidance block for the Stage 3 prompt."""
+    tc = (trade_category or "general/other").strip().lower()
+    return _STAGE_3_TRADE_PROFILES.get(tc, _STAGE_3_TRADE_GENERIC.format(tc=tc))
 
 
 async def _stage_3_steps(
@@ -960,7 +2395,7 @@ async def _stage_3_steps(
     """
     Stage 3: step-by-step repair instructions using Llama 3.1 (text model).
 
-    REAL — receives the full context from both Stage 1 (diagnosis) and Stage 2
+    REAL, receives the full context from both Stage 1 (diagnosis) and Stage 2
     (resources) and generates a complete, ordered repair procedure.
 
     Context passed forward:
@@ -970,75 +2405,127 @@ async def _stage_3_steps(
         - what protective gear the user will be wearing
       This allows the steps to reference specific tools and materials by name.
 
-    Stage 3 is the most generative stage — it produces a list of RepairStep
+    Stage 3 is the most generative stage, it produces a list of RepairStep
     objects, each with a step number, title, description, and an optional
     per-step safety warning.  Llama 3.1 handles this structured generation
     task well with explicit field descriptions in the prompt.
     """
-    # Build a rich context block from both previous stages
+    # Build a rich context block from both previous stages. Confidence, visual
+    # evidence and uncertainty are now carried through from Stage 1 so Stage 3 can
+    # hedge / add verification when the diagnosis is not certain. Tool/material
+    # lists keep their [tier] tags so Stage 3 can tell confirmed from verify-first.
+    _vis = "; ".join(stage_1.visual_evidence[:8]) if stage_1.visual_evidence else "none recorded"
+    _unc = stage_1.uncertainty_notes.strip() if stage_1.uncertainty_notes else "none recorded"
+    _reason = stage_1.confidence_reason.strip() if stage_1.confidence_reason else "not given"
+    _opt_tools = ", ".join(stage_2.optional_tools) if stage_2.optional_tools else "none"
+    _opt_mats = ", ".join(stage_2.optional_materials) if stage_2.optional_materials else "none"
+    _concerns = "; ".join(stage_1.safety_concerns) if stage_1.safety_concerns else "none named"
     context = (
-        f"Problem       : {stage_1.problem_type}\n"
-        f"Trade         : {stage_1.trade_category}\n"
-        f"Severity      : {stage_1.severity}\n"
-        f"Observations  :\n"
+        f"Problem                : {stage_1.problem_type}\n"
+        f"Trade                  : {stage_1.trade_category}\n"
+        f"Severity               : {stage_1.severity}\n"
+        f"Diagnosis confidence   : {stage_1.confidence}% ({_reason})\n"
+        f"Risk level (model)     : {stage_1.risk_level}\n"
+        f"Hidden-damage risk     : {stage_1.hidden_damage_risk}\n"
+        f"DIY suitability (model): {stage_1.diy_suitability}\n"
+        f"Pro assessment advised : {stage_1.professional_assessment_recommended}\n"
+        f"Safety concerns (model): {_concerns}\n"
+        f"Visually confirmed     : {_vis}\n"
+        f"NOT confirmed/uncertain: {_unc}\n"
+        f"Observations           :\n"
         + "\n".join(f"  - {obs}" for obs in stage_1.observations)
-        + f"\n\nTools available    : {', '.join(stage_2.tools)}\n"
-        f"Materials           : {', '.join(stage_2.materials)}\n"
-        f"Protective gear     : {', '.join(stage_2.protective_gear)}\n"
-        f"Estimated time      : {stage_2.estimated_time_minutes} minutes"
+        + f"\n\nTools (tier-tagged)     : {', '.join(stage_2.tools)}\n"
+        f"Optional tools          : {_opt_tools}\n"
+        f"Materials (tier-tagged) : {', '.join(stage_2.materials)}\n"
+        f"Optional materials      : {_opt_mats}\n"
+        f"Protective gear         : {', '.join(stage_2.protective_gear)}\n"
+        f"Estimated time          : {stage_2.estimated_time_minutes} minutes"
     )
 
+    _trade_block = _stage_3_trade_profile(stage_1.trade_category)
     system_prompt = (
-        "You are an experienced UK DIY advisor writing repair instructions for a homeowner.\n"
-        "Write like a knowledgeable tradesperson giving practical, honest advice — not like a textbook.\n"
-        "Be direct, specific, and realistic. UK context throughout.\n\n"
-        "STEP WRITING RULES — read every rule before writing:\n"
-        "1. ONE action per step. Never combine two actions (e.g. 'remove the screw AND clean the area')\n"
-        "   into one step. Split them into two separate steps.\n"
-        "2. Always begin with a clear PREP step (e.g. 'Lay dust sheets', 'Turn off the water supply',\n"
-        "   'Turn off the circuit breaker') before any work step.\n"
-        "3. Where a material must DRY or CURE, make that a separate step with a realistic wait time.\n"
-        "   Example: 'Leave the first coat of Polyfilla to dry fully — this takes 2 to 4 hours\n"
-        "   depending on depth and room temperature. The filler changes from pink to white when dry.'\n"
-        "4. Reference the tools and materials from the provided list by their exact names.\n"
-        "5. Each step description must say: (a) which tool or material, (b) the exact action,\n"
-        "   (c) what done correctly looks or feels like, (d) one warning sign that something is wrong.\n"
-        "6. For plaster/filler work: always mention feathering the edges, sanding between coats,\n"
-        "   and applying mist coat before painting. Mention primer where needed.\n"
-        "7. For any wet-area work (bathroom, kitchen): mention CT1 or silicone over standard filler,\n"
-        "   and allow 24 hours cure before exposing to water.\n"
-        "8. Use realistic language: 'press firmly', 'sand with light circular strokes', 'the surface\n"
-        "   should feel smooth under your fingertip', 'no ridges or proud edges'. Avoid 'ensure' and\n"
-        "   'make sure' — use direct imperatives instead ('press', 'sand', 'wipe').\n"
-        "9. Step titles must be short action phrases: 'Lay dust sheets', 'Apply first filler coat',\n"
-        "   'Sand the dried filler'. Never use step titles longer than 8 words.\n"
-        "10. Include 6 to 10 steps for typical repairs. Do not pad with unnecessary steps.\n\n"
-        "SAFETY NOTES RULES:\n"
-        "safety_notes must be an array of plain strings. Each string is one complete sentence.\n"
-        "Do NOT return objects or dicts inside safety_notes. CORRECT: [\"Wear safety glasses when sanding.\"]\n"
-        "WRONG: [{\"note\": \"Wear safety glasses when sanding.\"}]\n"
-        "Each note must be specific to the trade category and this problem — no generic platitudes.\n\n"
-        "RISK ASSESSMENT:\n"
-        "Set diy_recommended to false if the repair involves:\n"
-        "  - mains electrical wiring (230V), consumer units, or fuse boxes\n"
-        "  - gas pipes, boilers, or gas appliances (Gas Safe registration required by law)\n"
-        "  - structural load-bearing walls, beams, or foundations\n"
-        "  - significant water damage with risk of electrical exposure\n"
-        "  - asbestos (pre-2000 buildings, textured coatings, floor tiles, pipe lagging)\n"
-        "If diy_recommended is false, set professional_type to the exact trade: 'Gas Safe engineer',\n"
-        "'NICEIC-registered electrician', 'structural engineer', 'CIPHE-registered plumber', etc.\n"
-        "If diy_recommended is true, set professional_type to null.\n\n"
-        "You must return a single JSON object with exactly these fields:\n"
+        "You are an experienced UK tradesperson writing repair instructions for a homeowner.\n"
+        "Be direct, specific, practical and honest. UK context throughout.\n\n"
+        "USE THE EVIDENCE YOU ARE GIVEN:\n"
+        "- The resource list is TIER-TAGGED. Treat [Confirmed] items as part of the plan. Treat\n"
+        "  [Likely] items as probable but say 'likely'. Treat [Verify First] and [Do Not Buy Yet]\n"
+        "  as CONDITIONAL, do NOT write steps that assume them as fact; instead add a step to\n"
+        "  check/measure first, then say what to do depending on the result.\n"
+        "- Follow the repair-vs-replace decision implied by the tiers: if a REPLACEMENT part is\n"
+        "  [Confirmed]/[Likely], the steps are remove -> obtain the matching part -> fit and align,\n"
+        "  NOT patch-and-fill a missing section. Only describe filling/patching when a patch\n"
+        "  material is the confirmed approach.\n"
+        "- Read 'Diagnosis confidence' and 'NOT confirmed/uncertain'. When confidence is lower or\n"
+        "  key facts are unconfirmed, add explicit verify/expose/measure steps BEFORE any cutting,\n"
+        "  drilling or removal, prefer reversible actions first, and hedge the wording.\n\n"
+        "STEP WRITING RULES:\n"
+        "1. ONE action per step, never combine two actions into one step.\n"
+        "2. Begin with a clear PREP / make-safe step suited to the trade (isolate the water,\n"
+        "   isolate the circuit, lay dust sheets, clear and protect the area).\n"
+        "3. Where a material must DRY or CURE, make that a separate step with a realistic wait.\n"
+        "4. Reference tools/materials from the resource list by their PLAIN NAME. The tier on each\n"
+        "   resource item guides YOUR decision about whether and how firmly to include it, but you\n"
+        "   MUST NEVER write the literal tier prefix ('[Confirmed]', '[Likely]', '[Verify First]',\n"
+        "   '[Do Not Buy Yet]') inside any step title, description or warning. Those tags belong\n"
+        "   only in the tools/materials list, where the UI styles them as chips, never in prose.\n"
+        "   Wrong: 'Use a [Likely] chisel to remove debris.'\n"
+        "   Right: 'Use the chisel to remove debris.'\n"
+        "   For a [Verify First] item, write the verification as part of the step itself ('check\n"
+        "   the pipe diameter, then use the matching coupler') rather than copying the tag.\n"
+        "5. Each step says: which tool/material, the exact action, what 'done right' looks or feels\n"
+        "   like, and one sign that something is wrong. Avoid vague verbs like 'examine', 'assess',\n"
+        "   'evaluate' on their own, always pair them with the SPECIFIC check (e.g. 'check crack\n"
+        "   depth by drawing a fingernail across it, anything that catches is deeper than hairline').\n"
+        "6. Step titles are short action phrases, max 8 words.\n"
+        "7. 6 to 10 steps. Do not pad.\n"
+        "8. Use direct imperatives ('press', 'sand', 'wipe'). Do NOT borrow language or methods from\n"
+        "   other trades, only use plaster/skim/mist-coat wording for an actual decorating job.\n"
+        "9. STAY ON THE DAMAGED SUBJECT. Every step must move the user closer to fixing the problem\n"
+        "   named in 'Problem'. Do NOT write steps about other objects the vision model happened to\n"
+        "   see in the scene (furniture, the floor, surrounding chairs, an adjacent wall) unless\n"
+        "   they DIRECTLY affect this repair. A crack-in-marble job has no 'inspect the wooden\n"
+        "   frame' step; a cabinet-door job has no 'check the hinges' step unless hinges are\n"
+        "   damaged.\n\n"
+        f"{_trade_block}\n\n"
+        "RISK & SAFETY (most important, be specific, never generic):\n"
+        "safety_notes must be an array of 3 to 5 PLAIN STRINGS (never objects/dicts). Each note must\n"
+        "reason about a REAL hazard of THIS repair in one sentence using this shape:\n"
+        "  what is dangerous -> why -> the likely consequence -> the precaution.\n"
+        "Example: 'The broken MDF edges are razor-sharp, so snap off loose pieces and wear gloves\n"
+        "before handling the panel, bare hands risk a deep cut.' No generic platitudes.\n"
+        "Each per-step 'warning' covers a step-specific hazard or quality check, or is null.\n\n"
+        "DIY SUITABILITY:\n"
+        "FIRST honour the diagnosis's own risk assessment in the context above: if 'DIY suitability\n"
+        "(model)' is not_recommended, or 'Pro assessment advised' is True, or 'Risk level (model)' is\n"
+        "high/critical, then diy_recommended MUST be false, set professional_type accordingly, and\n"
+        "frame the steps as make-safe-and-get-assessed rather than a full DIY repair. If 'Hidden-\n"
+        "damage risk' is high, add explicit expose/verify steps before anything irreversible.\n"
+        "Set diy_recommended=false (and professional_type to the exact trade) if the repair involves:\n"
+        "  - mains electrical (230V), consumer units, or fuse boxes -> 'NICEIC-registered electrician'\n"
+        "  - gas pipes, boilers or gas appliances -> 'Gas Safe engineer'\n"
+        "  - structural load-bearing walls, beams or foundations -> 'structural engineer'\n"
+        "  - significant water near electrics, or buried mains supply work -> 'CIPHE-registered plumber'\n"
+        "  - asbestos (pre-2000 textured coatings, tiles, pipe lagging) -> licensed asbestos removal\n"
+        "ALSO lean towards 'get it assessed' when severity is HIGH and diagnosis confidence is LOW,\n"
+        "even outside those categories, say so honestly. If diy_recommended is true, professional_type\n"
+        "is null.\n"
+        "when_to_call_professional is ALWAYS required: give the specific stop/escalate signs FOR THIS\n"
+        "repair and trade, the dangers that mean the user should down tools and call a pro (for\n"
+        "example: the underlying structure/carcass is cracked, the damage is bigger than it first\n"
+        "looked, or a hazard specific to this trade appears). Do NOT copy signs from other trades\n"
+        "(e.g. do not mention water/gas/electrics unless THIS repair actually involves them). If\n"
+        "diy_recommended is false, explain why.\n\n"
+        "Return a single JSON object with exactly these fields:\n"
         "  steps                      : array of step objects, each containing:\n"
         "    step_number              : integer starting at 1\n"
         "    title                    : short action phrase, max 8 words\n"
-        "    description              : practical instruction paragraph following the rules above\n"
+        "    description              : practical instruction following the rules above\n"
         "    warning                  : specific safety or quality warning string, or null\n"
-        "  safety_notes               : array of 3 to 5 plain strings — NOT objects, plain strings only\n"
+        "  safety_notes               : array of 3 to 5 plain reasoned strings (hazard->why->\n"
+        "                               consequence->precaution), NOT objects\n"
         "  difficulty_level           : exactly one of: beginner, intermediate, advanced\n"
-        "  when_to_call_professional  : string — ALWAYS required, never null. If diy_recommended is true,\n"
-        "                              write the specific warning signs that mean the user should stop\n"
-        "                              and call a professional. If diy_recommended is false, explain why.\n"
+        "  when_to_call_professional  : string, ALWAYS required, never null (stop/escalate signs,\n"
+        "                               or why a professional is needed)\n"
         "  diy_recommended            : boolean\n"
         "  professional_type          : string or null\n\n"
         "Return ONLY the JSON object.  No explanation, no markdown, no extra text."
@@ -1062,5 +2549,6 @@ async def _stage_3_steps(
         extra_options={
             "num_ctx":     STAGE_3_NUM_CTX,
             "num_predict": STAGE_3_NUM_PREDICT,
+            "temperature": 0.0,   # deterministic steps + risk
         },
     )

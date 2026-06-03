@@ -1,5 +1,5 @@
 """
-Chat service — per-case AI conversation.
+Chat service, per-case AI conversation.
 
 Each case has a persistent chat thread stored in the Message table.
 The AI model receives:
@@ -8,19 +8,19 @@ The AI model receives:
   - The full message history for the case (user + assistant turns)
   - The new user message
 
-This means the user never has to re-explain the problem — the model starts
+This means the user never has to re-explain the problem, the model starts
 with full repair context and can answer follow-up questions like
 "what if I don't have a pipe wrench?" or "is this safe to do at night?".
 
 Message storage:
   All messages (both user turns and assistant replies) are persisted to the
   Message table.  The full history is loaded on every call so the model
-  maintains multi-turn context — the same way a training sequence uses all
+  maintains multi-turn context, the same way a training sequence uses all
   previous tokens to predict the next one.
 
 Model:
   Uses CHAT_MODEL from environment (default: llama3.1:8b).
-  Not a structured-output call — we want a conversational reply,
+  Not a structured-output call, we want a conversational reply,
   so format="json" is NOT used here.
 
 Graceful degradation:
@@ -29,8 +29,11 @@ Graceful degradation:
   it just won't have specific context about this case's images.
 """
 
+import asyncio
+import json
 import logging
 import os
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +41,8 @@ import ollama
 from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import AsyncSessionLocal
 
 from app.models import Analysis, Message, Session as RepairSession, Upload
 
@@ -54,20 +59,77 @@ OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE",  "5m")
 STAGE_1_MODEL    = os.getenv("STAGE_1_MODEL",     "qwen2.5vl:7b")
 STAGE_1_NUM_CTX  = int(os.getenv("STAGE_1_NUM_CTX",  "4096"))
 
-# Upload directory — must match analysis_service.py so storage paths resolve.
+# Upload directory, must match analysis_service.py so storage paths resolve.
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
 
-# The scope instruction appended to every system prompt — keeps the assistant
+# The scope instruction appended to every system prompt, keeps the assistant
 # from drifting into general-purpose chat unrelated to the repair case.
 _REPAIR_SCOPE = (
     "Your role is strictly limited to helping with this repair/maintenance case. "
     "You may discuss: diagnosis, repair steps, tools, materials, costs, safety, "
     "difficulty, and when to call a professional. "
     "If the user asks something unrelated to repair or maintenance, politely "
-    "acknowledge it and redirect them back to their repair question."
+    "acknowledge it and redirect them back to their repair question. "
+    "Write naturally with plain punctuation (commas, full stops, colons, "
+    "parentheses). Do not use dash characters."
 )
 
 _ollama = ollama.AsyncClient(host=OLLAMA_BASE_URL)
+
+
+# Em / en dashes read as "AI-generated"; replace them with plain punctuation in
+# every Ask Knitra reply. chr() keeps the literal characters out of this source.
+_DASHES = (chr(0x2014), chr(0x2013), chr(0x2015))
+
+
+def _strip_em_dashes(s: str) -> str:
+    """' X ' -> ', ', bare X -> '-' for em/en/horizontal-bar dashes."""
+    if not isinstance(s, str) or not s:
+        return s
+    for d in _DASHES:
+        s = s.replace(" " + d + " ", ", ").replace(d, "-")
+    return s
+
+
+# Trade keyword sets for the lightweight follow-up relatedness verdict.
+_TRADE_KEYWORDS = {
+    "plumbing": ("plumb", "pipe", "leak", "tap", "faucet", "drain", "radiator", "valve",
+                 "cistern", "waste", "water"),
+    "carpentry/joinery": ("cabinet", "door", "wood", "timber", "joinery", "carpentry",
+                          "hinge", "panel", "mdf", "chipboard", "drawer", "skirting",
+                          "worktop", "furniture", "frame"),
+    "electrical": ("electric", "wiring", "wire", "socket", "switch", "consumer unit",
+                   "fuse", "plug", "cable"),
+    "plastering/decorating": ("plaster", "paint", "crack", "filler", "render", "decorat",
+                              "skim", "wallpaper"),
+    "glazing": ("glass", "glazing", "pane", "double glaz", "window seal"),
+    "roofing": ("roof", "tile", "gutter", "flashing", "soffit", "fascia"),
+    "sealing/weatherproofing": ("sealant", "silicone", "mastic", "weatherproof", "draught"),
+}
+
+
+def _classify_followup(description: str, case_trade: str):
+    """Return (verdict, apparent_trade): verdict is 'same' | 'different' | 'not_repair'.
+
+    Deterministic and conservative: when unsure it returns 'same', so we never
+    aggressively push the user to a new case. Drives the chat follow-up action button.
+    """
+    d = (description or "").strip().lower()
+    if not d:
+        return ("same", "")
+    if d.startswith("not a repair") or "not a repair image" in d[:80]:
+        return ("not_repair", "")
+    case = (case_trade or "").strip().lower()
+    best, best_score = None, 0
+    for trade, kws in _TRADE_KEYWORDS.items():
+        score = sum(1 for k in kws if k in d)
+        if score > best_score:
+            best, best_score = trade, score
+    if best is None or best_score == 0:
+        return ("same", "")
+    if best == case or best in case or case in best:
+        return ("same", best)
+    return ("different", best)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,45 +141,143 @@ async def get_messages(
     case_id: int,
     user_id: int,
 ) -> list[Message]:
-    """Return all messages for a case, oldest first."""
+    """Return all messages for a case, oldest first.
+
+    Side-effect: if the case's latest analysis is in clarification mode and no
+    opener message exists yet, one is posted before returning.  This is
+    idempotent — calling it multiple times (page refreshes) never duplicates.
+    """
     await _require_owned_case(db, case_id, user_id)
+    await _ensure_clarification_opener(db, case_id)
 
     result = await db.execute(
         select(Message)
-        .where(Message.session_id == case_id)
+        .where(
+            Message.session_id == case_id,
+            Message.message_type != "clarification_reanalysis_triggered",
+        )
         .order_by(Message.created_at.asc())
     )
     return list(result.scalars().all())
 
 
-async def send_message(
+async def _ensure_clarification_opener(db: AsyncSession, case_id: int) -> None:
+    """Post the clarifying questions as the first assistant message when the case
+    is in clarification mode and no opener exists yet.
+
+    Idempotent — safe to call on every page load.  Detected by message_type
+    'clarification_opener' which is never written elsewhere.
+    """
+    # 1. Latest complete analysis must be in clarification output mode
+    r = await db.execute(
+        select(Analysis)
+        .where(Analysis.session_id == case_id, Analysis.status == "complete")
+        .order_by(Analysis.created_at.desc())
+        .limit(1)
+    )
+    analysis = r.scalar_one_or_none()
+    if analysis is None:
+        return
+    sr = analysis.structured_result or {}
+    if sr.get("output_mode") != "clarification":
+        return
+
+    # 2. Check if opener already posted FOR THIS ANALYSIS ROUND.
+    # Scope the check to messages created after the analysis itself so that
+    # a new clarification round (re-analysis producing different questions)
+    # always gets its own fresh opener. Without this, Round 1's opener would
+    # permanently block Round 2+ from ever showing new questions in the chat.
+    existing = await db.execute(
+        select(Message)
+        .where(
+            Message.session_id == case_id,
+            Message.message_type == "clarification_opener",
+            Message.created_at >= analysis.created_at,
+        )
+        .limit(1)
+    )
+    if existing.scalar_one_or_none() is not None:
+        return
+
+    # 3. Build opener HTML from ClarificationOutput.
+    # Uses <br> tags because the frontend renders message content as innerHTML —
+    # plain \n is collapsed by the browser.
+    cl = sr.get("clarification") or {}
+    questions: list[str] = cl.get("clarifying_questions") or []
+    optional: list[str]  = cl.get("optional_questions") or []
+    what_known: str       = (cl.get("what_is_known") or "").strip()
+
+    if not questions:
+        return  # nothing to post
+
+    parts: list[str] = []
+    if what_known:
+        first = what_known[0].lower() + what_known[1:] if len(what_known) > 1 else what_known.lower()
+        parts.append(f"I can see {first.rstrip('.')}.")
+        parts.append("")
+
+    q_word = "question" if len(questions) == 1 else "questions"
+    parts.append(
+        f"Before I can give you the right advice, I have {len(questions)} "
+        f"required {q_word}:"
+    )
+    parts.append("")
+    for i, q in enumerate(questions, 1):
+        parts.append(f"{i}. {q}")
+    parts.append("")
+
+    if optional:
+        parts.append(
+            "Once you've answered the above, Knitra will automatically re-analyse "
+            "your case. The following is optional and won't delay re-analysis:"
+        )
+        parts.append("")
+        for q in optional:
+            parts.append(f"&#8226; {q}")
+    else:
+        parts.append(
+            "Once you've answered these, Knitra will automatically re-analyse your case."
+        )
+
+    db.add(Message(
+        session_id=case_id,
+        role="assistant",
+        content="<br>".join(parts),
+        message_type="clarification_opener",
+        msg_metadata={"opener": True, "clarification": True},
+    ))
+    await db.commit()
+    log.info("clarification_opener_posted", extra={"case_id": case_id})
+
+
+async def _prepare_chat(
     db: AsyncSession,
     case_id: int,
     user_id: int,
     content: str,
     image_ids: list[int] | None = None,
-) -> Message:
-    """
-    Persist the user's message, call the AI, persist the reply, return the reply.
+):
+    """Shared chat preamble: build the case-aware prompt + history, run the
+    follow-up vision pass, persist the user's message, and return
+    (ollama_messages, followup_verdict, apparent_trade).
 
-    Steps:
-      1. Verify case ownership.
-      2. Load the latest complete analysis (for system prompt context).
-      3. Load the full message history.
-      4. Persist the user's new message.
-      5. Build the Ollama messages list (system + history + new user message).
-      6. Call CHAT_MODEL.
-      7. Persist and return the assistant reply.
+    Used by both the blocking send_message and the streaming stream_message.
     """
     await _require_owned_case(db, case_id, user_id)
 
-    # Guard: chat requires at least one completed analysis.
-    # This ensures the assistant always has repair context to work from,
-    # and prevents the chat from being used as a general-purpose assistant
-    # before the case has been properly diagnosed.
+    # Guard: chat requires at least one analysis that has either completed
+    # successfully or stopped for clarification.  Both states give the
+    # assistant enough context to have a useful conversation:
+    #   "complete"            → full structured repair plan available
+    #   "needs_clarification" → Stage 1 ran but confidence was too low;
+    #                           the system prompt explains why and asks for
+    #                           a better photo or text description.
     analysis_exists = await db.execute(
         select(Analysis)
-        .where(Analysis.session_id == case_id, Analysis.status == "complete")
+        .where(
+            Analysis.session_id == case_id,
+            Analysis.status.in_(["complete", "needs_clarification"]),
+        )
         .limit(1)
     )
     if analysis_exists.scalar_one_or_none() is None:
@@ -132,15 +292,60 @@ async def send_message(
     # 1b. If the user attached follow-up images, run a quick vision pass and
     #     append the description to the system prompt so Knitra can refer to them.
     image_context = ""
+    image_paths: list[str] = []
+    followup_verdict = ""
+    apparent_trade = ""
     if image_ids:
+        # Storage paths for the attached images (for persisting + thumbnail rendering).
+        _rows = await db.execute(
+            select(Upload.storage_path).where(
+                Upload.id.in_(image_ids),
+                Upload.session_id == case_id,
+            )
+        )
+        image_paths = [p for (p,) in _rows.all()]
         image_context = await _describe_chat_images(db, case_id, image_ids)
         if image_context:
+            # Structured relatedness verdict (drives the chat follow-up action button).
+            _ct = await db.execute(
+                select(Analysis).where(
+                    Analysis.session_id == case_id, Analysis.status == "complete"
+                ).order_by(Analysis.created_at.desc()).limit(1)
+            )
+            _ca = _ct.scalar_one_or_none()
+            _case_trade = (
+                ((_ca.structured_result or {}).get("stage_1") or {}).get("trade_category", "")
+                if _ca else ""
+            )
+            followup_verdict, apparent_trade = _classify_followup(image_context, _case_trade)
+            n = len(image_ids)
+            noun = "photo" if n == 1 else "photos"
             system_prompt = (
                 system_prompt
-                + f"\n\nThe user has attached {len(image_ids)} follow-up photo(s) to this message. "
-                "Vision analysis of those photos:\n"
+                + f"\n\n--- NEW FOLLOW-UP {noun.upper()} ATTACHED TO THIS MESSAGE ---\n"
+                f"A vision model examined the user's newly attached {noun} and reported:\n\n"
                 + image_context
-                + "\nReference these observations when answering the user's question."
+                + f"\n\nTreat the report above as your own reliable observation of the attached "
+                f"{noun} (never claim you cannot see images). Decide how the new {noun} relates "
+                f"to THIS repair case (its problem type and trade are described above) and "
+                f"respond accordingly:\n"
+                "- SAME or clearly related repair: continue the case and explain what is now "
+                "clearer or what it changes. You may suggest next steps or tools "
+                "conversationally, but tell the user the official plan only updates when they "
+                "press Re-analyse.\n"
+                "- DIFFERENT repair issue (different object or trade): say so plainly, then ask "
+                "whether they want to open a NEW case for it or keep discussing the current one, "
+                "and wait for their choice.\n"
+                "- NOT a repair or maintenance subject at all (the vision report starts with "
+                "'NOT A REPAIR IMAGE', e.g. a document, screenshot, maths problem, person, food): "
+                "politely explain that Knitra only helps with repair and maintenance issues and "
+                "ask for a relevant repair photo. Do NOT try to solve, read, or answer the "
+                "unrelated content.\n"
+                "- HIGHER-RISK hazard visible (water near electrics, exposed wiring, gas, "
+                "structural damage, unstable or heavy parts, an active leak, sharp edges): flag "
+                "it clearly and give the right precaution or advise a qualified professional.\n"
+                "Do not invent a new official confidence percentage; that only updates on "
+                "Re-analyse."
             )
 
     # 2. Load message history
@@ -151,12 +356,39 @@ async def send_message(
     )
     history = list(history_result.scalars().all())
 
-    # 3. Persist user message before calling the model
+    # 3. Persist user message before calling the model.
+    # Tag as a clarification answer when the case is currently in clarification mode
+    # so the ledger can be reconstructed from message history later.
+    _clarif_r = await db.execute(
+        select(Analysis)
+        .where(Analysis.session_id == case_id, Analysis.status == "complete")
+        .order_by(Analysis.created_at.desc())
+        .limit(1)
+    )
+    _clarif_a = _clarif_r.scalar_one_or_none()
+    _is_clarif = (
+        ((_clarif_a.structured_result or {}).get("output_mode") == "clarification")
+        if _clarif_a else False
+    )
+
+    user_meta: dict | None = None
+    if image_ids:
+        user_meta = {
+            "image_ids": image_ids,
+            "image_paths": image_paths,
+            "vision_summary": image_context or "",
+        }
+        if _is_clarif:
+            user_meta["clarification_answer"] = True
+    elif _is_clarif:
+        user_meta = {"clarification_answer": True}
+
     user_msg = Message(
         session_id=case_id,
         role="user",
         content=content,
         message_type="chat",
+        msg_metadata=user_meta,
     )
     db.add(user_msg)
     await db.commit()
@@ -168,7 +400,21 @@ async def send_message(
         ollama_messages.append({"role": msg.role, "content": msg.content})
     ollama_messages.append({"role": "user", "content": content})
 
-    # 5. Call the chat model
+    return ollama_messages, followup_verdict, apparent_trade
+
+
+async def send_message(
+    db: AsyncSession,
+    case_id: int,
+    user_id: int,
+    content: str,
+    image_ids: list[int] | None = None,
+) -> Message:
+    """Persist the user message, call the chat model, persist + return the reply."""
+    ollama_messages, followup_verdict, apparent_trade = await _prepare_chat(
+        db, case_id, user_id, content, image_ids
+    )
+
     try:
         response = await _ollama.chat(
             model=CHAT_MODEL,
@@ -180,7 +426,7 @@ async def send_message(
             },
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
-        reply_content = response.message.content.strip()
+        reply_content = _strip_em_dashes(response.message.content.strip())
     except Exception as exc:
         log.error("Chat model call failed for case %d: %s", case_id, exc, exc_info=True)
         raise HTTPException(
@@ -188,18 +434,291 @@ async def send_message(
             detail=f"AI model unavailable: {type(exc).__name__}: {exc}",
         )
 
-    # 6. Persist assistant reply
     assistant_msg = Message(
         session_id=case_id,
         role="assistant",
         content=reply_content,
         message_type="chat",
+        msg_metadata=(
+            {"followup_verdict": followup_verdict, "apparent_trade": apparent_trade,
+             "image_ids": image_ids}
+            if (image_ids and followup_verdict) else None
+        ),
     )
     db.add(assistant_msg)
     await db.commit()
     await db.refresh(assistant_msg)
-
     return assistant_msg
+
+
+async def stream_message(
+    case_id: int,
+    user_id: int,
+    content: str,
+    image_ids: list[int] | None = None,
+):
+    """Streaming variant: yields reply text chunks live for a 'typing' effect,
+    persists the full reply at the end, then yields a final '\\x1e<json>' sentinel
+    carrying the follow-up verdict metadata. Uses its OWN DB session so it stays
+    valid for the whole stream (the request session would already be closed).
+    """
+    async with AsyncSessionLocal() as db:
+        ollama_messages, followup_verdict, apparent_trade = await _prepare_chat(
+            db, case_id, user_id, content, image_ids
+        )
+
+        buf: list[str] = []
+        try:
+            async for part in await _ollama.chat(
+                model=CHAT_MODEL,
+                messages=ollama_messages,
+                options={
+                    "temperature":  0.6,
+                    "num_predict":  CHAT_NUM_PREDICT,
+                    "num_ctx":      CHAT_NUM_CTX,
+                },
+                keep_alive=OLLAMA_KEEP_ALIVE,
+                stream=True,
+            ):
+                try:
+                    tok = part.message.content or ""
+                except Exception:
+                    tok = (part.get("message", {}) or {}).get("content", "") if isinstance(part, dict) else ""
+                if tok:
+                    buf.append(tok)
+                    yield tok
+        except Exception as exc:
+            log.error("Chat stream failed for case %d: %s", case_id, exc, exc_info=True)
+            yield "\n(AI model unavailable, please try again.)"
+
+        reply_content = _strip_em_dashes("".join(buf).strip()) or "(no response)"
+        msg_meta = (
+            {"followup_verdict": followup_verdict, "apparent_trade": apparent_trade,
+             "image_ids": image_ids}
+            if (image_ids and followup_verdict) else None
+        )
+        db.add(Message(
+            session_id=case_id, role="assistant", content=reply_content,
+            message_type="chat", msg_metadata=msg_meta,
+        ))
+        await db.commit()
+
+        # After commit, check if all clarification questions are now answered.
+        # If yes, write a dedup sentinel to the DB (so a second message in the
+        # same session doesn't re-trigger) and include the flag in the stream
+        # sentinel for the frontend.
+        sentinel: dict = dict(msg_meta or {})
+        auto_ok, auto_ctx = await _check_auto_reanalyse(db, case_id)
+        if auto_ok:
+            db.add(Message(
+                session_id=case_id,
+                role="assistant",
+                content="",
+                message_type="clarification_reanalysis_triggered",
+                msg_metadata={"auto_triggered": True},
+            ))
+            await db.commit()
+            sentinel["auto_reanalyse"] = True
+            sentinel["auto_reanalysis_context"] = auto_ctx
+
+        yield "\x1e" + json.dumps(sentinel)
+
+
+async def _check_auto_reanalyse(db: AsyncSession, case_id: int) -> tuple[bool, str]:
+    """Return (should_trigger, text_context) for clarification auto-reanalysis.
+
+    Triggers ONLY when ALL of the following are true:
+      1. Latest complete analysis is in clarification output_mode.
+      2. Most-recent clarification_opener exists for this round.
+      3. No sentinel (clarification_reanalysis_triggered) exists after the opener
+         (prevents duplicate triggers).
+      4. The user's answers from the FIRST EXCHANGE after the opener (i.e. messages
+         committed before the first assistant chat reply) satisfy the required count.
+
+    Condition 4 is the key safety rule: once the chat model has replied to the
+    user, we are in a conversational back-and-forth.  Any further user messages
+    are answering the assistant's follow-up questions, NOT the structured opener
+    questions.  Counting those would cause premature auto-reanalysis when the user
+    is still chatting.  Requiring the manual Re-analyse button for subsequent
+    exchanges is the correct and safe behaviour.
+    """
+    # 1. Must be in clarification mode
+    r = await db.execute(
+        select(Analysis)
+        .where(Analysis.session_id == case_id, Analysis.status == "complete")
+        .order_by(Analysis.created_at.desc())
+        .limit(1)
+    )
+    analysis = r.scalar_one_or_none()
+    if analysis is None:
+        return (False, "")
+    sr = analysis.structured_result or {}
+    if sr.get("output_mode") != "clarification":
+        return (False, "")
+
+    questions: list[str] = (sr.get("clarification") or {}).get("clarifying_questions") or []
+    if not questions:
+        return (False, "")
+
+    # 2. Find the MOST RECENT clarification opener as the time anchor for this round.
+    # Using the most recent opener ensures each clarification round has its own
+    # anchor: Round 1 answers are counted from Round 1's opener, Round 2 answers
+    # from Round 2's opener, and so on.
+    opener_r = await db.execute(
+        select(Message)
+        .where(
+            Message.session_id == case_id,
+            Message.message_type == "clarification_opener",
+        )
+        .order_by(Message.created_at.desc())
+        .limit(1)
+    )
+    opener = opener_r.scalar_one_or_none()
+    if opener is None:
+        return (False, "")
+
+    # 3. Dedup: check for a sentinel written the first time we triggered FOR THIS
+    # ROUND.  The sentinel must be AFTER this round's opener so that Round 1's
+    # sentinel does not permanently block Round 2's auto-reanalysis.
+    sentinel_r = await db.execute(
+        select(Message)
+        .where(
+            Message.session_id == case_id,
+            Message.message_type == "clarification_reanalysis_triggered",
+            Message.created_at > opener.created_at,
+        )
+        .limit(1)
+    )
+    if sentinel_r.scalar_one_or_none() is not None:
+        return (False, "")
+
+    # 4. Find the FIRST assistant chat reply after the opener.
+    # This marks the end of the "answering window" — the window in which the user
+    # is directly responding to the structured opener questions.  Once the chat
+    # model has replied, the conversation has become a back-and-forth: the user's
+    # subsequent messages answer the AI's follow-up questions, not the opener.
+    # Counting those would fire auto-reanalysis prematurely.
+    window_end_r = await db.execute(
+        select(Message)
+        .where(
+            Message.session_id == case_id,
+            Message.role == "assistant",
+            Message.message_type == "chat",
+            Message.created_at > opener.created_at,
+        )
+        .order_by(Message.created_at.asc())
+        .limit(1)
+    )
+    window_end = window_end_r.scalar_one_or_none()
+
+    # Count user clarification answers within the first-exchange window only.
+    # If an assistant chat reply exists, only messages before it count.
+    # If no reply exists yet (shouldn't happen since this runs after a stream
+    # commit, but defensive), count all messages after the opener.
+    if window_end is not None:
+        ans_r = await db.execute(
+            select(Message)
+            .where(
+                Message.session_id == case_id,
+                Message.role == "user",
+                Message.created_at > opener.created_at,
+                Message.created_at < window_end.created_at,
+            )
+            .order_by(Message.created_at.asc())
+        )
+    else:
+        ans_r = await db.execute(
+            select(Message)
+            .where(
+                Message.session_id == case_id,
+                Message.role == "user",
+                Message.created_at > opener.created_at,
+            )
+            .order_by(Message.created_at.asc())
+        )
+    user_msgs = list(ans_r.scalars().all())
+    answer_msgs = [m for m in user_msgs if (m.msg_metadata or {}).get("clarification_answer")]
+
+    if len(answer_msgs) < len(questions):
+        return (False, "")
+
+    # Build text_context: pair each question with its answer where possible
+    parts: list[str] = ["User answers to clarification questions:"]
+    for i, msg in enumerate(answer_msgs, 1):
+        q = questions[i - 1] if i <= len(questions) else ""
+        if q:
+            parts.append(f"Q{i}: {q}")
+        parts.append(f"A{i}: {msg.content.strip()}")
+    text_context = "\n".join(parts)
+
+    log.info(
+        "auto_reanalyse_ready case=%d questions=%d answers=%d",
+        case_id, len(questions), len(answer_msgs),
+    )
+    return (True, text_context)
+
+
+async def spawn_case_from_image(
+    db: AsyncSession,
+    source_case_id: int,
+    user_id: int,
+    image_ids: list[int],
+    apparent_trade: str = "",
+) -> int:
+    """Create a NEW case from a photo attached in chat, copy the photo onto it,
+    kick off analysis, and return the new case id.
+
+    Used when Knitra decides a follow-up photo is a DIFFERENT repair. The image is
+    COPIED (not moved) so the original chat bubble/thumbnail stays valid.
+    """
+    from app.services.cases_service import create_case
+    from app.services.analysis_service import create_analysis
+
+    await _require_owned_case(db, source_case_id, user_id)
+    if not image_ids:
+        raise HTTPException(status_code=422, detail="No photo to start a new case from.")
+
+    row = await db.execute(
+        select(Upload).where(
+            Upload.id.in_(image_ids),
+            Upload.session_id == source_case_id,
+        )
+    )
+    src = row.scalars().first()
+    if src is None:
+        raise HTTPException(status_code=404, detail="Photo not found on this case.")
+
+    trade = (apparent_trade or "").strip() or "general/other"
+    title = "New " + (trade.split("/")[0] or "repair") + " repair"
+    new_case = await create_case(db, user_id, title=title, category=trade)
+
+    # Copy the file on disk and create a fresh Upload row on the new case.
+    suffix = Path(src.storage_path).suffix or ".jpg"
+    new_name = f"{uuid.uuid4()}{suffix}"
+    try:
+        (UPLOAD_DIR / new_name).write_bytes((UPLOAD_DIR / src.storage_path).read_bytes())
+    except Exception as exc:
+        log.error("Failed to copy image for spawned case: %s", exc)
+        raise HTTPException(status_code=500, detail="Could not copy the photo to the new case.")
+
+    db.add(Upload(
+        session_id=new_case.id,
+        original_filename=src.original_filename,
+        mime_type=src.mime_type,
+        file_size_bytes=src.file_size_bytes,
+        storage_path=new_name,
+        width=src.width,
+        height=src.height,
+    ))
+    await db.commit()
+
+    # Kick off analysis on the new case so it is ready when the user lands there.
+    try:
+        await create_analysis(db, new_case.id, user_id)
+    except Exception as exc:
+        log.warning("Auto-analysis on spawned case %d failed: %s", new_case.id, exc)
+
+    return new_case.id
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -237,7 +756,7 @@ async def _describe_chat_images(
     This is intentionally simpler than the full Stage 1 pipeline:
       - No Pydantic schema validation (we just want natural-language description)
       - No retries (if the model fails, Knitra still has the rest of the context)
-      - Low num_predict (200 tokens — just enough for 2-3 descriptive sentences)
+      - Low num_predict (200 tokens, just enough for 2-3 descriptive sentences)
 
     Returns an empty string if no images could be loaded or the model fails.
     """
@@ -288,31 +807,39 @@ async def _describe_chat_images(
     if not encoded_images:
         return ""
 
-    try:
-        resp = await _ollama.chat(
-            model=STAGE_1_MODEL,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "You are a home repair assistant. "
-                    "Look at the attached photo(s) and describe in 2-4 sentences: "
-                    "what you see, any visible damage or wear, the approximate severity, "
-                    "and any detail that would help a repair diagnosis. "
-                    "Be specific and practical."
-                ),
-                "images": encoded_images,
-            }],
-            options={
-                "temperature": 0.2,
-                "num_predict": 200,
-                "num_ctx": STAGE_1_NUM_CTX,
-            },
-            keep_alive=OLLAMA_KEEP_ALIVE,
-        )
-        return resp.message.content.strip()
-    except Exception as exc:
-        log.warning("Chat follow-up image vision failed: %s", exc)
-        return ""
+    prompt = (
+        "You are a repair assistant analysing a follow-up photo. In 2 to 4 sentences, state:\n"
+        "1. What object or item is shown, and which trade it relates to (plumbing, "
+        "carpentry/joinery, electrical, plastering/decorating, glazing, roofing, or general).\n"
+        "2. Any visible damage, wear or fault, and its approximate severity.\n"
+        "3. Any safety hazard visible (water near electrics, exposed wiring, gas, structural "
+        "cracks, unstable or heavy parts, an active leak, sharp edges).\n"
+        "If the photo is clearly NOT a repair or maintenance subject (for example a document, "
+        "screenshot, maths problem, person, food or landscape), begin your reply with exactly "
+        "'NOT A REPAIR IMAGE' and then a few words on what it actually shows. "
+        "Be specific and practical."
+    )
+    last_exc = None
+    for attempt in range(2):   # one retry for the transient 7B runner crash
+        try:
+            resp = await _ollama.chat(
+                model=STAGE_1_MODEL,
+                messages=[{"role": "user", "content": prompt, "images": encoded_images}],
+                options={
+                    "temperature": 0.2,
+                    "num_predict": 220,
+                    "num_ctx": STAGE_1_NUM_CTX,
+                },
+                keep_alive=OLLAMA_KEEP_ALIVE,
+            )
+            return resp.message.content.strip()
+        except Exception as exc:
+            last_exc = exc
+            log.warning("Chat follow-up image vision failed (attempt %d): %s", attempt + 1, exc)
+            if attempt == 0:
+                await asyncio.sleep(3.0)   # let Ollama respawn the runner / free VRAM
+    log.warning("Chat follow-up image vision gave up: %s", last_exc)
+    return ""
 
 
 async def _build_system_prompt(db: AsyncSession, case_id: int) -> str:
@@ -381,15 +908,17 @@ async def _build_system_prompt(db: AsyncSession, case_id: int) -> str:
                 f"  Could not confirm: {unsure_str}\n"
                 f"  Clarification needed: {clarif_str}\n\n"
                 "Your job in this chat:\n"
-                "1. Explain clearly WHY the AI confidence was low — reference the specific reason above.\n"
+                "1. Explain clearly WHY the AI confidence was low, reference the specific reason above.\n"
                 "2. Tell the user EXACTLY what photo or information would help (use the clarification text above).\n"
                 "3. If the user describes what they see in text, try to give a provisional diagnosis and basic repair guidance.\n"
                 "4. Suggest whether a closer photo, wider photo, brighter photo, or written description would help most.\n"
                 "5. If the issue is described clearly enough in text, say so and offer to help plan the repair anyway.\n"
-                "Keep answers helpful and practical. UK context — UK brands, UK regulations, UK retailers."
+                "Do not invent a new numeric confidence percentage, the official score only updates when "
+                "the user adds a clearer photo and presses Re-analyse.\n"
+                "Keep answers helpful and practical. UK context, UK brands, UK regulations, UK retailers."
             )
 
-        # Generic fallback — no analysis at all
+        # Generic fallback, no analysis at all
         return (
             "You are Knitra, a repair assistant. "
             + _REPAIR_SCOPE + " "
@@ -401,16 +930,62 @@ async def _build_system_prompt(db: AsyncSession, case_id: int) -> str:
         )
 
     sr = analysis.structured_result
-    s1 = sr.get("stage_1", {})
-    s2 = sr.get("stage_2", {})
-    s3 = sr.get("stage_3", {})
+    output_mode = sr.get("output_mode", "diy")
+
+    # ── Clarification mode: give Knitra the clarification context, not Stage 2/3 ──
+    if output_mode == "clarification":
+        s1 = sr.get("stage_1") or {}
+        cl = sr.get("clarification") or {}
+        questions = cl.get("clarifying_questions") or []
+        what_known = (cl.get("what_is_known") or "").strip()
+        what_unclear = cl.get("what_is_unclear") or []
+        why_matters = (cl.get("why_it_matters") or "").strip()
+        problem = s1.get("problem_type", "")
+        trade = s1.get("trade_category", "")
+        optional = cl.get("optional_questions") or []
+        return (
+            "You are Knitra, the repair assistant for this case.\n"
+            + _REPAIR_SCOPE + "\n\n"
+            "The initial analysis identified the problem but could not confirm key details "
+            "needed to give safe, specific repair advice.\n\n"
+            f"What was identified : {what_known or problem}\n"
+            f"Trade               : {trade}\n"
+            + (f"What is unclear     : {'; '.join(what_unclear)}\n" if what_unclear else "")
+            + (f"Why it matters      : {why_matters}\n" if why_matters else "")
+            + "\nRequired questions you asked the user:\n"
+            + "\n".join(f"  {i}. {q}" for i, q in enumerate(questions, 1))
+            + (
+                "\n\nOptional question (does not block re-analysis):\n"
+                + "\n".join(f"  - {q}" for q in optional)
+                if optional else ""
+            )
+            + "\n\nYour job in this conversation:\n"
+            "1. MULTI-ANSWER EXTRACTION: If the user answers multiple questions in one "
+            "message, extract each answer and acknowledge all of them. For example: "
+            "'it was a candle, about 5cm wide' resolves both cause and size — acknowledge "
+            "both, do not ask them again.\n"
+            "2. When the user answers a question, acknowledge it warmly and explain what "
+            "you now know and how it changes the advice.\n"
+            "3. NEVER repeat or rephrase a question already answered earlier in the chat, "
+            "even if worded differently. Before asking anything, check the full history.\n"
+            "4. If answers are sufficient, give practical, specific guidance based on what "
+            "you now know.\n"
+            "5. You may ask ONE follow-up if a genuinely NEW uncertainty arises from the "
+            "user's answer — but only if it would materially change the repair method.\n"
+            "Do not invent a new confidence percentage in chat. "
+            "Keep answers practical. UK context, UK brands, UK regulations throughout."
+        )
+
+    s1 = sr.get("stage_1") or {}
+    s2 = sr.get("stage_2") or {}
+    s3 = sr.get("stage_3") or {}
 
     # Summarise the structured result into a readable context block
     steps_summary = ""
     for step in s3.get("steps", []):
         steps_summary += f"\n  Step {step.get('step_number')}: {step.get('title')}"
 
-    # Build tools line — include optional tools if present
+    # Build tools line, include optional tools if present
     tools_parts = s2.get("tools", [])
     optional_tools = s2.get("optional_tools", [])
     tools_line = ", ".join(tools_parts)
@@ -430,7 +1005,7 @@ async def _build_system_prompt(db: AsyncSession, case_id: int) -> str:
         if original_question else ""
     )
 
-    # Confidence / uncertainty block — from Stage 1 vision analysis
+    # Confidence / uncertainty block, from Stage 1 vision analysis
     confidence_pct    = s1.get("confidence", "?")
     confidence_reason = (s1.get("confidence_reason") or "").strip()
     visual_evidence   = s1.get("visual_evidence") or []
@@ -438,7 +1013,7 @@ async def _build_system_prompt(db: AsyncSession, case_id: int) -> str:
 
     confidence_block = f"AI confidence: {confidence_pct}%"
     if confidence_reason:
-        confidence_block += f" — {confidence_reason}"
+        confidence_block += f", {confidence_reason}"
     if visual_evidence:
         confidence_block += (
             "\nVisually confirmed: " + "; ".join(visual_evidence[:6])
@@ -474,7 +1049,7 @@ async def _build_system_prompt(db: AsyncSession, case_id: int) -> str:
     high_risk_note = ""
     if severity == "high":
         high_risk_note = (
-            "\nThis case has HIGH severity. Prioritise safety — "
+            "\nThis case has HIGH severity. Prioritise safety, "
             "if there is any doubt about whether the repair is safe for a DIYer, "
             "clearly recommend calling a qualified professional.\n"
         )
@@ -490,11 +1065,22 @@ async def _build_system_prompt(db: AsyncSession, case_id: int) -> str:
         "If the user had an original question (shown above), address it directly.\n"
         "Reference specific steps, tools, and materials from the repair plan by name.\n"
         "If the case context includes uncertainty notes or unconfirmed details, "
-        "acknowledge these honestly when relevant — do not overstate what the image analysis "
+        "acknowledge these honestly when relevant, do not overstate what the image analysis "
         "could confirm. For example, if crack depth was uncertain, say so rather than guessing.\n"
         "If the user describes new or worsening symptoms, acknowledge this and adjust your "
-        "guidance — do not ignore signs that the situation has changed.\n"
-        "Keep answers practical and concise. UK context throughout — reference UK brands, "
+        "guidance, do not ignore signs that the situation has changed.\n"
+        "Do not invent a new numeric confidence percentage in chat, the official score comes from "
+        "the analysis. If the user wants an updated confidence score, tell them to add a clearer "
+        "photo above and press Re-analyse.\n"
+        "If the user asks how confidence is calculated or why it is high or low, explain it simply: "
+        "it reflects how clearly the photo shows the problem, namely image clarity, whether the "
+        "damaged area and the relevant part or material are visible, whether the cause is visible, "
+        "whether there are several possible causes, and whether more evidence is still needed. "
+        "Refer to the score already shown rather than giving a new number.\n"
+        "If the user asks whether it is safe, explain in plain terms what could be dangerous, why, "
+        "the possible consequence, the precaution to take, when to stop, and when to call a "
+        "professional, using this case's severity, safety notes and when-to-call-a-pro guidance.\n"
+        "Keep answers practical and concise. UK context throughout, reference UK brands, "
         "UK trade regulations (Part P, Gas Safe, Building Regs), and UK retailers (Screwfix, "
         "Toolstation, B&Q, Wickes) where relevant.\n"
         "If a repair involves electrical mains, gas, structural load, or significant water "

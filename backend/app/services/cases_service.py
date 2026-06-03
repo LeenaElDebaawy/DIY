@@ -73,7 +73,7 @@ async def patch_case(
     status: str | None = None,
 ) -> RepairSession | None:
     """
-    Partial update — only fields that are not None are written.
+    Partial update, only fields that are not None are written.
 
     Used by:
       - the pipeline (auto-title from Stage 1 problem_type)
@@ -99,9 +99,9 @@ async def delete_case(
     Permanently delete a case and all related data.
 
     Steps:
-      1. Load the case and its uploads (selectinload — avoids lazy SQL in async context).
+      1. Load the case and its uploads (selectinload, avoids lazy SQL in async context).
       2. Delete each upload's physical file from disk.
-      3. Delete the ORM object — SQLAlchemy's cascade="all, delete-orphan" on
+      3. Delete the ORM object, SQLAlchemy's cascade="all, delete-orphan" on
          Session.uploads / .messages / .analyses removes the child DB rows automatically.
 
     Returns True if the case was found and deleted, False if it was not found
@@ -119,7 +119,7 @@ async def delete_case(
     if case is None:
         return False
 
-    # backend/uploads/ — resolved relative to this file so it is correct
+    # backend/uploads/, resolved relative to this file so it is correct
     # regardless of where uvicorn is launched from.
     upload_dir = Path(__file__).resolve().parent.parent.parent / "uploads"
 

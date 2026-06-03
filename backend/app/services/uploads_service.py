@@ -3,7 +3,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import HTTPException, UploadFile, status
-from PIL import Image as PILImage   # Pillow — reads image headers, not full pixel data
+from PIL import Image as PILImage   # Pillow, reads image headers, not full pixel data
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,7 +24,7 @@ def _extract_dimensions(content: bytes) -> tuple[int | None, int | None]:
     """
     Return (width, height) by reading only the image file header.
 
-    PIL's Image.open() is lazy — for JPEG and PNG it reads just enough bytes
+    PIL's Image.open() is lazy, for JPEG and PNG it reads just enough bytes
     to determine the dimensions without decompressing the full image.
     Returns (None, None) if the format is unrecognised or the header is corrupt.
 

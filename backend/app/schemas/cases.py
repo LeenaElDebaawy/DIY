@@ -18,7 +18,7 @@ class CaseCreate(BaseModel):
 
 
 class CasePatch(BaseModel):
-    """Partial update — only fields that are not None are written."""
+    """Partial update, only fields that are not None are written."""
 
     title: Optional[str] = None
     category: Optional[str] = None
@@ -36,6 +36,6 @@ class CaseResponse(BaseModel):
     status: str
     created_at: datetime.datetime
     updated_at: datetime.datetime
-    # Derived from the latest completed Analysis.structured_result — None for
+    # Derived from the latest completed Analysis.structured_result, None for
     # cases that have no completed analysis (still running, failed, or new).
     confidence: Optional[int] = None

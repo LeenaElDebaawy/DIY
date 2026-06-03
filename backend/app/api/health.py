@@ -20,7 +20,7 @@ def health_check():
 @router.get("/health/db")
 async def db_check(db: AsyncSession = Depends(get_db)):
     # Actually await the query so we know the DB connection is real.
-    # The previous version was sync and dropped the coroutine silently —
+    # The previous version was sync and dropped the coroutine silently -
     # it always returned "ok" even when the database was unreachable.
     await db.execute(text("SELECT 1"))
     return {

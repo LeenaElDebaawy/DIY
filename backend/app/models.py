@@ -86,7 +86,7 @@ class Session(Base):
 
     # Tracks where the session is in the flow.
     # "open" is the canonical starting state used everywhere in the app.
-    # The old default "created" is retired — kept consistent with the service layer.
+    # The old default "created" is retired, kept consistent with the service layer.
     status: Mapped[str] = mapped_column(
         String(50), default="open", nullable=False
     )

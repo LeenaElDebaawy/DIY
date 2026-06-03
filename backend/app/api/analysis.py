@@ -13,12 +13,12 @@ GET  /api/v1/cases/{case_id}/analysis
     can show granular progress labels.
 
 HTTP status choices:
-    202 Accepted  — used for the trigger because the work is not done yet.
+    202 Accepted , used for the trigger because the work is not done yet.
                     This is the correct REST status for "started, go poll".
-    200 OK        — used for the GET because it returns the current state.
-    404           — no analysis exists yet for this case.
-    409 Conflict  — a pipeline is already running (duplicate trigger attempt).
-    422           — no photos uploaded yet.
+    200 OK       , used for the GET because it returns the current state.
+    404          , no analysis exists yet for this case.
+    409 Conflict , a pipeline is already running (duplicate trigger attempt).
+    422          , no photos uploaded yet.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -50,7 +50,7 @@ async def trigger_analysis(
     """
     Start the analysis pipeline for this case.
 
-    The optional body may contain `text_context` — a free-text note from the
+    The optional body may contain `text_context`, a free-text note from the
     user (e.g. "The pipe makes a dripping sound and the joint is wet").
     This is injected into the Stage 1 vision prompt so the model has two
     evidence streams: the images and the user's own description.

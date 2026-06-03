@@ -10,7 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from app.models import User, UserToken
 
-# The hashing context — bcrypt is the only scheme in use
+# The hashing context, bcrypt is the only scheme in use
 _pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
@@ -23,7 +23,7 @@ async def _hash_password(plain: str) -> str:
 
 
 async def _verify_password(plain: str, hashed: str) -> bool:
-    # Same reason as _hash_password — verify is equally slow.
+    # Same reason as _hash_password, verify is equally slow.
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, partial(_pwd.verify, plain, hashed))
 
@@ -53,7 +53,7 @@ async def register_user(
     db.add(user)
 
     # flush() writes the user row so user.id is available,
-    # but does not commit yet — both rows commit together below.
+    # but does not commit yet, both rows commit together below.
     await db.flush()
 
     token_value = _new_token()
@@ -78,7 +78,7 @@ async def login_user(
     )
     user = result.scalar_one_or_none()
 
-    # Same message for wrong email AND wrong password on purpose —
+    # Same message for wrong email AND wrong password on purpose -
     # different messages would let an attacker enumerate registered emails.
     # The try/except ensures a corrupted hash in the DB still returns 401,
     # never an unhandled 500.
@@ -98,7 +98,7 @@ async def login_user(
     token_value = _new_token()
     db.add(UserToken(user_id=user.id, token=token_value))
     await db.commit()
-    await db.refresh(user)   # mirror register_user — keeps ORM state clean
+    await db.refresh(user)   # mirror register_user, keeps ORM state clean
     return user, token_value
 
 

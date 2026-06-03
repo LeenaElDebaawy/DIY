@@ -5,7 +5,7 @@ POST /api/v1/transcribe
   Accepts a multipart audio file (webm/ogg/wav from MediaRecorder).
   Returns {"text": "..."} using faster-whisper tiny model.
   The av (PyAV) library bundled with faster-whisper decodes any format
-  that libavcodec supports — no separate system ffmpeg required.
+  that libavcodec supports, no separate system ffmpeg required.
 
 The WhisperModel is loaded once and cached as a module-level singleton.
 First call downloads ~75 MB of model weights from HuggingFace.
@@ -39,7 +39,7 @@ async def _get_model():
             return _model
         try:
             from faster_whisper import WhisperModel
-            log.info("Loading Whisper tiny model (first use — downloading if needed)…")
+            log.info("Loading Whisper tiny model (first use, downloading if needed)…")
             # int8 quantisation: fast, low memory, good accuracy for short clips
             _model = WhisperModel("tiny", device="cpu", compute_type="int8")
             log.info("Whisper model ready.")
@@ -89,7 +89,7 @@ async def transcribe_audio(
 
         model = await _get_model()
 
-        # Transcription is CPU-bound — run in thread pool so the async loop stays free
+        # Transcription is CPU-bound, run in thread pool so the async loop stays free
         loop = asyncio.get_running_loop()
 
         def _transcribe():

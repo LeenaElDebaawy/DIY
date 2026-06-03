@@ -19,7 +19,7 @@ DATABASE_URL = os.getenv(
 )
 
 # Create the async database engine.
-# echo=True prints every SQL statement — useful during initial development
+# echo=True prints every SQL statement, useful during initial development
 # but very noisy once the AI pipeline starts making dozens of queries per run.
 # Set DATABASE_ECHO=true in .env to re-enable for debugging.
 engine = create_async_engine(

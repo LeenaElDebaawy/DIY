@@ -1,16 +1,16 @@
 """
 Pydantic schemas for the 3-stage analysis pipeline.
 
-Design note — structured prediction over free-text generation
+Design note, structured prediction over free-text generation
 ─────────────────────────────────────────────────────────────
 Each stage schema acts as the output contract for one AI call.
 The model is instructed to return JSON that must satisfy this schema
 (the same way a classification head must output a valid probability
-distribution — the output space is constrained, not free).
+distribution, the output space is constrained, not free).
 
 If the model returns JSON that fails Pydantic validation, the pipeline
 retries that stage (up to retry_count) rather than propagating bad data
-to the next stage.  This mirrors loss-function feedback in training —
+to the next stage.  This mirrors loss-function feedback in training -
 the system self-corrects before advancing.
 
 Stage chain:
@@ -44,7 +44,7 @@ class AnalyseRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STAGE 1  — Image / Problem Analysis
+# STAGE 1 , Image / Problem Analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Stage1Output(BaseModel):
@@ -74,7 +74,7 @@ class Stage1Output(BaseModel):
     instead of generating potentially wrong repair steps.
     """
     problem_type: str           # short human-readable description, e.g. "Leaking pipe joint"
-    trade_category: str         # normalised trade label — see docstring
+    trade_category: str         # normalised trade label, see docstring
     severity: str               # "low" | "medium" | "high"
     observations: list[str]     # bullet-point list of what was visually identified
     confidence: int = 75        # 0-100; below LOW_CONFIDENCE_THRESHOLD → clarification gate
@@ -83,6 +83,99 @@ class Stage1Output(BaseModel):
     confidence_reason: str = ""        # one-two sentence explanation of why this score was given
     visual_evidence: list[str] = []    # every distinct object/feature clearly seen in the image
     uncertainty_notes: str = ""        # what could not be confirmed; empty string if everything is clear
+
+    # ── Model-reasoned risk signals (AI-led design) ──────────────────────────
+    # These are the PRIMARY drivers of how cautious the pipeline becomes. The
+    # model, not a category lookup, decides them by reasoning about what it sees.
+    # The pipeline reacts to THESE signals (ask / assessment-first / verify-first),
+    # so the behaviour generalises to any subject, including ones with no matching
+    # trade_category (e.g. a crash-damaged vehicle). Category is only a thin
+    # one-way safety net layered on top, it may raise these but never lower them.
+    # Defaults are deliberately cautious-neutral (medium / conditional) so a model
+    # that omits a field never reads as "definitely safe".
+    risk_level: str = "medium"                 # low | medium | high | critical, danger if mishandled or acted on from a photo alone
+    hidden_damage_risk: str = "medium"         # low | medium | high, chance important damage is NOT visible in the photo
+    diy_suitability: str = "conditional"       # suitable | conditional | not_recommended, for a competent DIY user (not a pro)
+    professional_assessment_recommended: bool = False  # true, an in-person professional should assess before action
+    safety_concerns: list[str] = []            # specific hazards seen (e.g. "electrocution", "structural collapse", "airbag/fuel")
+    clarifying_questions: list[str] = []       # REQUIRED questions — answers block auto-reanalysis
+    optional_questions:   list[str] = []       # helpful extras — do not block auto-reanalysis (max 1)
+
+    @field_validator("risk_level", mode="before")
+    @classmethod
+    def _normalise_risk_level(cls, v: object) -> str:
+        """Map to low/medium/high/critical; unknown/empty -> cautious 'medium'."""
+        raw = str(v).strip().lower() if v is not None else ""
+        if raw in ("low", "medium", "high", "critical"):
+            return raw
+        # tolerate a few synonyms the model may emit
+        if raw in ("severe", "very high", "extreme", "danger", "dangerous"):
+            return "critical"
+        if raw in ("moderate", "med", "mid"):
+            return "medium"
+        if raw in ("none", "minimal", "very low"):
+            return "low"
+        return "medium"
+
+    @field_validator("hidden_damage_risk", mode="before")
+    @classmethod
+    def _normalise_hidden_damage_risk(cls, v: object) -> str:
+        """Map to low/medium/high; unknown/empty -> cautious 'medium'."""
+        raw = str(v).strip().lower() if v is not None else ""
+        if raw in ("low", "medium", "high"):
+            return raw
+        if raw in ("critical", "severe", "very high", "extreme"):
+            return "high"
+        if raw in ("moderate", "med", "mid"):
+            return "medium"
+        if raw in ("none", "minimal", "very low"):
+            return "low"
+        return "medium"
+
+    @field_validator("diy_suitability", mode="before")
+    @classmethod
+    def _normalise_diy_suitability(cls, v: object) -> str:
+        """Map to suitable/conditional/not_recommended; unknown -> cautious 'conditional'."""
+        raw = str(v).strip().lower().replace("-", "_").replace(" ", "_") if v is not None else ""
+        if raw in ("suitable", "conditional", "not_recommended"):
+            return raw
+        if raw in ("yes", "diy", "diy_suitable", "easy", "recommended"):
+            return "suitable"
+        if raw in ("no", "not_diy", "not_suitable", "unsuitable", "professional", "pro_only"):
+            return "not_recommended"
+        return "conditional"
+
+    @field_validator("professional_assessment_recommended", mode="before")
+    @classmethod
+    def _coerce_professional_assessment(cls, v: object) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "1", "yes", "y", "recommended")
+        return bool(v)
+
+    @field_validator("safety_concerns", "clarifying_questions", mode="before")
+    @classmethod
+    def _coerce_str_list(cls, v: object) -> list[str]:
+        """Accept a list of strings, a list of dicts (extract a string value), or a
+        single string; always return list[str]. Empty/None -> []."""
+        if v is None:
+            return []
+        if isinstance(v, str):
+            s = v.strip()
+            return [s] if s else []
+        if not isinstance(v, list):
+            return []
+        result: list[str] = []
+        for item in v:
+            if isinstance(item, str) and item.strip():
+                result.append(item.strip())
+            elif isinstance(item, dict):
+                for val in item.values():
+                    if isinstance(val, str) and val.strip():
+                        result.append(val.strip())
+                        break
+        return result
 
     @field_validator("confidence", mode="before")
     @classmethod
@@ -124,9 +217,21 @@ class Stage1Output(BaseModel):
             "glazing":                  "glazing",
             "sealing/weatherproofing":  "sealing/weatherproofing",
             "plastering/decorating":    "plastering/decorating",
+            "stone/masonry":            "stone/masonry",
             "structural":               "structural",
             "hvac":                     "hvac",
             "general/other":            "general/other",
+            # stone/masonry synonyms (so a model that says just "marble" or "tile"
+            # still routes to the correct trade profile)
+            "stone":                    "stone/masonry",
+            "masonry":                  "stone/masonry",
+            "marble":                   "stone/masonry",
+            "granite":                  "stone/masonry",
+            "tile":                     "stone/masonry",
+            "tiling":                   "stone/masonry",
+            "tiles":                    "stone/masonry",
+            "stonework":                "stone/masonry",
+            "brickwork":                "stone/masonry",
             # Legacy labels from the old 8-category prompt
             "carpentry":                "carpentry/joinery",
             "joinery":                  "carpentry/joinery",
@@ -188,7 +293,7 @@ class Stage1Output(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STAGE 2  — Tools, Materials, Protective Gear
+# STAGE 2 , Tools, Materials, Protective Gear
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Stage2Output(BaseModel):
@@ -201,16 +306,16 @@ class Stage2Output(BaseModel):
     designed so _stage_2_resources() can be swapped for a DB/rules query
     without changing the Stage 1 or Stage 3 functions.
     """
-    tools: list[str]                # ESSENTIAL tools — must-have to complete the repair
-    optional_tools: list[str] = [] # OPTIONAL tools — helpful but not required
-    materials: list[str]            # ESSENTIAL consumables — must-have
-    optional_materials: list[str] = []  # OPTIONAL materials — improve the result but not required
+    tools: list[str]                # ESSENTIAL tools, must-have to complete the repair
+    optional_tools: list[str] = [] # OPTIONAL tools, helpful but not required
+    materials: list[str]            # ESSENTIAL consumables, must-have
+    optional_materials: list[str] = []  # OPTIONAL materials, improve the result but not required
     protective_gear: list[str]      # safety equipment, e.g. "Rubber gloves"
     estimated_time_minutes: int     # realistic estimate for a competent DIYer
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STAGE 3  — Repair Steps
+# STAGE 3 , Repair Steps
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RepairStep(BaseModel):
@@ -282,15 +387,115 @@ class Stage3Output(BaseModel):
 # COMBINED RESULT
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ASSESSMENT-FIRST OUTPUT  (produced instead of Stage 2 + Stage 3 when the
+# model determines that professional in-person assessment is needed before any
+# repair work.  No tools, no materials, no repair steps — only stabilisation,
+# safety, escalation, and information gathering.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AssessmentOutput(BaseModel):
+    """
+    Produced by Stage A (_stage_A_assessment) when output_mode == 'assessment_first'.
+
+    Contains ONLY what a careful assessor communicates when a professional
+    must inspect before any repair is attempted:
+      - what the user should do RIGHT NOW to make the situation safe
+      - what they must NOT do (actions that could worsen danger or damage)
+      - why professional assessment is required (plain English, specific)
+      - what information/evidence to gather before the professional arrives
+      - who to call and how urgently
+
+    Never contains repair steps, tool lists, material lists, or DIY guidance.
+    Defaults ensure old analyses that pre-date this field still load cleanly.
+    """
+    immediate_actions: list[str] = []   # e.g. "Isolate the water at the stopcock"
+    do_not_do: list[str] = []           # e.g. "Do not attempt to remove ceiling panels"
+    why_assessment_needed: str = ""     # specific risk explanation for this scene
+    information_needed: list[str] = []  # e.g. "Photograph the leak source from above"
+    professional_type: str = ""         # e.g. "CIPHE-registered plumber"
+    professional_urgency: str = ""      # "immediately" | "within 24 hours" | "when convenient"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CARE OUTPUT  (produced instead of Stage 2 + Stage 3 when the model determines
+# this is a low-risk maintenance/care task rather than a repair execution task.
+# Examples: worn leather shoe, tarnished jewellery, stained fabric, dull wood
+# finish. No safety notes, no professional guidance, no repair steps — only
+# practical, material-specific care advice.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLARIFICATION OUTPUT  (produced instead of Stage 2 + Stage 3 when Stage 1
+# identifies meaningful unknowns that would materially change the diagnosis,
+# DIY suitability, or repair method. Surfaces targeted questions to the user
+# rather than guessing at an answer with insufficient evidence.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ClarificationOutput(BaseModel):
+    """
+    Produced when output_mode == 'clarification'.
+
+    Derived DETERMINISTICALLY from Stage 1 data — no extra model call.
+    Contains what the model knows, what is unclear, the questions to resolve
+    the uncertainty, and why the answers change the advice.
+
+    Defaults ensure old analyses that pre-date this field still load cleanly.
+    """
+    what_is_known: str = ""              # plain summary of what was diagnosed
+    what_is_unclear: list[str] = []      # specific unknowns that change the advice
+    clarifying_questions: list[str] = [] # REQUIRED questions — block auto-reanalysis until answered
+    optional_questions:   list[str] = [] # helpful extras — shown separately, do not block auto-reanalysis
+    why_it_matters: str = ""             # why the answers change the recommendation
+
+
+class CareOutput(BaseModel):
+    """
+    Produced by Stage C (_stage_C_care) when output_mode == 'care'.
+
+    Contains practical, material-specific care and maintenance advice for the
+    object shown. Structured as:
+      - condition_summary: plain-English assessment of what was seen
+      - recommendations: ordered list of specific care actions (2-6 items)
+      - what_to_avoid: things that would damage or worsen the item (0-3 items)
+      - expected_outcome: what the item should look/feel like after following advice
+
+    Never contains repair steps, tool lists, protective gear requirements,
+    safety warnings, or professional guidance — those imply risk that is absent
+    from care-mode subjects.
+    Defaults ensure old analyses that pre-date this field still load cleanly.
+    """
+    condition_summary: str = ""         # e.g. "Light surface discolouration on worn leather upper"
+    recommendations: list[str] = []     # specific ordered care actions
+    what_to_avoid: list[str] = []       # material-specific pitfalls
+    expected_outcome: str = ""          # what good looks like after following the advice
+
+
 class AnalysisResult(BaseModel):
     """
-    The union of all three stage outputs.
-    Stored in Analysis.structured_result as a JSONB dict when the pipeline completes.
-    The frontend reads this one field to render the full diagnosis.
+    The output of the analysis pipeline.
+
+    output_mode drives both what was generated and how the frontend renders it:
+      diy            - full Stage 1 + Stage 2 + Stage 3 DIY plan
+      verify_first   - full plan but verification steps are first
+      clarification  - Stage 1 only + clarifying questions (Step 4)
+      assessment_first - Stage 1 + AssessmentOutput, NO Stage 2/Stage 3
+      care           - Stage 1 + care recommendations (Step 3)
+
+    stage_2 and stage_3 are None for assessment_first and clarification modes.
+    assessment is None unless output_mode == 'assessment_first'.
+
+    Backward compatibility: old analyses stored in JSONB have no output_mode
+    field. The frontend defaults to 'diy' rendering when the field is absent,
+    which matches the behaviour before this field was introduced.
     """
+    output_mode: str = "diy"           # see docstring above
     stage_1: Stage1Output
-    stage_2: Stage2Output
-    stage_3: Stage3Output
+    stage_2: Optional[Stage2Output] = None
+    stage_3: Optional[Stage3Output] = None
+    assessment: Optional[AssessmentOutput] = None
+    care: Optional[CareOutput] = None
+    clarification: Optional[ClarificationOutput] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -315,8 +520,8 @@ class AnalysisResponse(BaseModel):
     pipeline_stage: Optional[str]       # "stage_1_running" | "stage_1_complete" | ...
 
     # Results
-    structured_result: Optional[dict]   # AnalysisResult as dict — populated on "complete"
-    stage_outputs: Optional[dict]       # intermediate per-stage outputs — for debugging
+    structured_result: Optional[dict]   # AnalysisResult as dict, populated on "complete"
+    stage_outputs: Optional[dict]       # intermediate per-stage outputs, for debugging
 
     # Diagnostics
     validation_issues: Optional[str]    # populated on "failed"

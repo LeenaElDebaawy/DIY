@@ -15,7 +15,8 @@ STATUS = {
     "closed":             {"stripe": "#94a3b8", "bg": "#f1f5f9", "fg": "#475569", "label": "Closed"},
     "complete":           {"stripe": "#22c55e", "bg": "#dcfce7", "fg": "#14532d", "label": "Complete"},
     "failed":             {"stripe": "#ef4444", "bg": "#fee2e2", "fg": "#991b1b", "label": "Failed"},
-    "needs_clarification":{"stripe": "#f59e0b", "bg": "#fef3c7", "fg": "#78350f", "label": "Needs info"},
+    "needs_clarification":{"stripe": "#f59e0b", "bg": "#fef3c7", "fg": "#78350f", "label": "Needs better photo"},
+    "needs_info":         {"stripe": "#f59e0b", "bg": "#fff7ed", "fg": "#92400e", "label": "Needs answers"},
     "running":            {"stripe": "#6366f1", "bg": "#ede9fe", "fg": "#4c1d95", "label": "Analysing"},
 }
 
@@ -73,7 +74,7 @@ def inject_styles():
 
       /*
         CRITICAL FIX: the * rule above breaks Quasar's icon rendering
-        because Material Icons is a font-face — each character IS an icon.
+        because Material Icons is a font-face, each character IS an icon.
         We restore it here so .q-icon / .material-icons work correctly.
       */
       .material-icons,
@@ -186,7 +187,7 @@ def inject_styles():
         box-shadow: 0 4px 18px rgba(99,102,241,0.3);
       }
 
-      /* ── Hero (homepage) — must fill the full viewport width ── */
+      /* ── Hero (homepage), must fill the full viewport width ── */
       .hero {
         width: 100%;
         background: linear-gradient(140deg, #0f172a 0%, #1e293b 55%, #1b3158 100%);
@@ -196,7 +197,7 @@ def inject_styles():
          UPLOAD WIDGET OVERRIDES (Quasar q-uploader)
 
          Problems we fix:
-           1. "0.0B / 0.00%" subtitle — hidden
+           1. "0.0B / 0.00%" subtitle, hidden
            2. "add_box" icon now renders correctly (Material Icons fix above)
            3. Header gets our brand indigo gradient instead of Quasar blue
            4. Internal file list hidden (we render our own photo grid)
@@ -220,7 +221,7 @@ def inject_styles():
       }
       /* ← this is the "0.0B / 0.00%" line */
       .q-uploader__subtitle { display: none !important; }
-      /* Hide the internal file list — we manage our own photo grid */
+      /* Hide the internal file list, we manage our own photo grid */
       .q-uploader__list { display: none !important; }
 
       /* ── Analysis progress dot pulse ── */
@@ -232,8 +233,10 @@ def inject_styles():
 
       /* ── Analysis result sections ── */
       .analysis-section-label {
-        font-size: 0.68rem; font-weight: 700; letter-spacing: 0.09em;
-        text-transform: uppercase; color: #94a3b8; margin-bottom: 6px;
+        font-size: 0.8rem; font-weight: 800; letter-spacing: 0.06em;
+        text-transform: uppercase; color: #334155;
+        border-left: 3px solid #6366f1; padding-left: 9px;
+        margin: 4px 0 10px;
       }
       .analysis-card {
         background: #f8fafc; border: 1px solid #f1f5f9;
@@ -287,6 +290,66 @@ def inject_styles():
       }
       .fixly-icon-btn:hover  { background:#ede9fe; color:#6366f1; border-color:#c4b5fd; }
       .fixly-icon-btn.active { background:#fee2e2; color:#dc2626; border-color:#fca5a5; }
+
+      /* ── Mic recording state: solid red + pulsing halo so it is impossible
+            to miss that the mic is live and tapping again will stop it ── */
+      @keyframes knitra-rec-pulse {
+        0%   { box-shadow:0 0 0 0 rgba(220,38,38,0.55); }
+        70%  { box-shadow:0 0 0 8px rgba(220,38,38,0); }
+        100% { box-shadow:0 0 0 0 rgba(220,38,38,0); }
+      }
+      .fixly-icon-btn.recording {
+        background:#dc2626 !important; color:#ffffff !important;
+        border-color:#dc2626 !important;
+        animation:knitra-rec-pulse 1.25s ease-out infinite;
+      }
+
+      /* ── Chat composer status pill (recording / transcribing / done) ── */
+      .knitra-status-pill {
+        display:inline-flex; align-items:center; gap:6px;
+        font-size:0.78rem; font-weight:600; line-height:1;
+        padding:5px 11px; border-radius:100px; white-space:nowrap;
+      }
+
+      /* ── Pending-attachment chips above the textarea ── */
+      .knitra-attach-wrap {
+        display:flex; flex-direction:column; gap:6px; margin-bottom:8px;
+      }
+      .knitra-attach-head {
+        font-size:0.72rem; font-weight:700; color:#1e40af;
+        display:flex; align-items:center; gap:5px;
+      }
+      .knitra-attach-strip { display:flex; flex-wrap:wrap; gap:8px; }
+      .knitra-attach-chip {
+        position:relative; display:flex; align-items:center; gap:8px;
+        background:#eff6ff; border:1px solid #bfdbfe; border-radius:10px;
+        padding:6px 30px 6px 6px; max-width:230px;
+      }
+      .knitra-attach-chip img {
+        width:40px; height:40px; object-fit:cover; border-radius:7px;
+        flex-shrink:0; background:#dbeafe;
+      }
+      .knitra-attach-meta { display:flex; flex-direction:column; gap:1px; min-width:0; }
+      .knitra-attach-name {
+        font-size:0.76rem; font-weight:600; color:#1e3a8a;
+        white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:130px;
+      }
+      .knitra-attach-state { font-size:0.68rem; font-weight:600; }
+      .knitra-attach-x {
+        position:absolute; top:4px; right:5px; width:18px; height:18px;
+        border:none; border-radius:50%; background:#dbeafe; color:#1e40af;
+        cursor:pointer; font-size:12px; line-height:1; padding:0;
+        display:flex; align-items:center; justify-content:center;
+      }
+      .knitra-attach-x:hover { background:#bfdbfe; }
+
+      /* ── Brief highlight when a voice transcript is inserted ── */
+      @keyframes knitra-flash {
+        0%   { background:#dcfce7; }
+        100% { background:#ffffff; }
+      }
+      .knitra-text-flash textarea { animation:knitra-flash 1.4s ease-out; }
+
       .fixly-icon-btn-soon {
         display:inline-flex; align-items:center; justify-content:center;
         width:36px; height:36px; border-radius:10px;
@@ -308,7 +371,9 @@ def inject_styles():
         max-height: 420px; overflow-y: auto;
         padding: 16px 20px;
         scroll-behavior: smooth;
+        transition: max-height 0.2s ease;
       }
+      .chat-wrap.expanded { max-height: 760px; }
       .chat-bubble-user {
         background: #6366f1; color: white;
         border-radius: 16px 16px 4px 16px;
@@ -493,7 +558,7 @@ def sidebar(active_path: str = "/cases"):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOP NAV  (landing / auth pages — no sidebar)
+# TOP NAV  (landing / auth pages, no sidebar)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def top_nav():
@@ -564,7 +629,7 @@ async def homepage():
     inject_styles()
     top_nav()
 
-    # width:100% is required — without it NiceGUI's flex container
+    # width:100% is required, without it NiceGUI's flex container
     # does not stretch the hero div to fill the viewport.
     with ui.element("div").classes("hero").style(
         "width:100%;min-height:520px;"
@@ -585,7 +650,7 @@ async def homepage():
                 '<p style="color:#94a3b8;font-size:1.1rem;max-width:440px;'
                 'margin:0;line-height:1.65;">'
                 'Describe the problem, upload a photo, and get clear AI-guided '
-                'instructions &#8212; from plumbing to electronics.</p>'
+                'instructions, from plumbing to electronics.</p>'
             )
             if app.storage.user.get("token"):
                 name = app.storage.user.get("name", "")
@@ -903,7 +968,8 @@ async def cases_page():
                     "running":             "Analysing",
                     "complete":            "Complete",
                     "failed":              "Failed",
-                    "needs_clarification": "Needs info",
+                    "needs_clarification": "Needs better photo",
+                    "needs_info":          "Needs answers",
                 }
                 _conf_opts    = {
                     "":     "All confidence",
@@ -931,7 +997,7 @@ async def cases_page():
                 "display:flex;flex-direction:column;gap:14px;"
             )
 
-            # All fetched cases — stored so filters can re-render without a new fetch
+            # All fetched cases, stored so filters can re-render without a new fetch
             _all_cases: list[dict] = []
 
             async def render_card(case: dict):
@@ -1146,8 +1212,110 @@ async def cases_page():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Stage 2 recommendation tiers
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2 prefixes each tool/material with a tier tag, e.g. "[Confirmed] screwdriver".
+# _tier_split() turns that leading tag into a coloured chip. Strings without a
+# recognised tag (older analyses) render unchanged, so this is fully backward-compatible.
+# tier: (label, background, text colour, icon, tooltip). Icons + tooltips make the
+# meaning clear without a legend; "Don't buy yet" uses a neutral slate (not alarming
+# red) so it reads as "hold off", not "error".
+_TIER_CHIPS = {
+    "confirmed":      ("Confirmed",     "#dcfce7", "#15803d", "✓",
+                       "The photo clearly shows this is needed."),
+    "likely":         ("Likely",        "#dbeafe", "#1d4ed8", "≈",
+                       "Standard for this fault, but not confirmed from the photo."),
+    "verify first":   ("Verify first",  "#fef3c7", "#b45309", "?",
+                       "Check the size, type or material before buying this."),
+    "do not buy yet": ("Don't buy yet", "#f1f5f9", "#475569", "⏳",
+                       "Only buy this if a later check confirms it is needed."),
+}
+
+
+def _tier_split(item: str):
+    """Split '[Confirmed] screwdriver' -> (chip_html, 'screwdriver').
+
+    Returns ('', original) when there is no recognised leading [tier] tag.
+    """
+    s = (item or "").strip()
+    if s.startswith("[") and "]" in s:
+        tag = s[1:s.index("]")].strip().lower()
+        meta = _TIER_CHIPS.get(tag)
+        if meta:
+            label, bg, fg, icon, tip = meta
+            rest = s[s.index("]") + 1:].strip()
+            chip = (
+                f'<span title="{tip}" style="display:inline-block;flex-shrink:0;background:{bg};'
+                f'color:{fg};font-size:0.64rem;font-weight:700;letter-spacing:0.02em;'
+                f'text-transform:uppercase;border-radius:5px;padding:1px 7px;'
+                f'margin-right:6px;white-space:nowrap;cursor:help;">{icon}&nbsp;{label}</span>'
+            )
+            return chip, rest
+    return "", s
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CASE DETAIL  (/cases/{case_id})
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _clean_chat(s: str) -> str:
+    """Convert streamed LLM reply to safe display HTML.
+
+    Order matters:
+      1. Normalise em/en dashes (plain text still, no HTML yet)
+      2. HTML-escape & < > (makes the string safe)
+      3. Convert markdown inline syntax to HTML tags
+      4. Convert line breaks to <br>
+    """
+    import re as _re
+    if not s:
+        return s
+    # 1. Normalise dashes
+    for d in (chr(0x2014), chr(0x2013), chr(0x2015)):
+        s = s.replace(" " + d + " ", ", ").replace(d, "-")
+    # 2. HTML-escape (must happen before any HTML is injected)
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # 3. Markdown inline: bold then italic (bold first avoids ** / * overlap)
+    s = _re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', s, flags=_re.DOTALL)
+    s = _re.sub(r'\*([^*\n]+?)\*', r'<em>\1</em>', s)
+    # 4. Line-by-line: bullets and headings
+    lines = s.split('\n')
+    out: list[str] = []
+    for ln in lines:
+        stripped = ln.strip()
+        if stripped.startswith('- ') or stripped.startswith('* '):
+            out.append('&bull;&nbsp;' + stripped[2:])
+        elif stripped.startswith('# '):
+            out.append('<strong>' + stripped[2:] + '</strong>')
+        elif stripped.startswith('## ') or stripped.startswith('### '):
+            out.append('<strong>' + stripped.lstrip('#').strip() + '</strong>')
+        else:
+            out.append(ln)
+    s = '<br>'.join(out)
+    # Collapse 3+ consecutive <br> to a double break
+    s = _re.sub(r'(<br>){3,}', '<br><br>', s)
+    return s
+
+
+def _chat_user_html(text: str, img_srcs: list | None = None) -> str:
+    """User chat bubble HTML, with optional image thumbnails above the text.
+
+    img_srcs may be data: URLs (live send) or /static/uploads URLs (reload).
+    """
+    thumbs = ""
+    if img_srcs:
+        thumbs = (
+            '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px;">'
+            + "".join(
+                f'<img src="{s}" alt="attached photo" '
+                'style="width:88px;height:88px;object-fit:cover;border-radius:8px;'
+                'display:block;border:1px solid rgba(255,255,255,0.35);" />'
+                for s in img_srcs
+            )
+            + "</div>"
+        )
+    return f'<div class="chat-bubble-user">{thumbs}{text}</div>'
+
 
 @ui.page("/cases/{case_id}")
 async def case_detail_page(case_id: int):
@@ -1327,8 +1495,8 @@ async def case_detail_page(case_id: int):
                                     f'<span style="color:#cbd5e1;font-size:12px;">'
                                     f'Opened {case["created_at"][:10]}</span>'
                                 )
-                        ui.button("&#128465; Delete case", on_click=del_dlg.open) \
-                            .props("flat color=negative") \
+                        ui.button("Delete case", on_click=del_dlg.open) \
+                            .props("flat color=negative icon=delete") \
                             .style("font-size:0.8rem;font-weight:600;flex-shrink:0;")
 
             # ── Photos card ───────────────────────────────────────────────────
@@ -1351,7 +1519,7 @@ async def case_detail_page(case_id: int):
                             'Click any image to view it full size.</p>'
                         )
 
-                # Photo grid — 120 px thumbnails, CSS background-image for cover crop
+                # Photo grid, 120 px thumbnails, CSS background-image for cover crop
                 photo_grid = ui.element("div").style(
                     "display:flex;flex-wrap:wrap;gap:12px;margin-bottom:20px;"
                 )
@@ -1367,7 +1535,7 @@ async def case_detail_page(case_id: int):
                                 'gap:8px;color:#cbd5e1;">'
                                 '<div style="font-size:2rem;opacity:0.4;">&#128247;</div>'
                                 '<div style="font-size:0.8rem;font-style:italic;">'
-                                'No photos yet &#8212; upload the first one below.</div>'
+                                'No photos yet, upload the first one below.</div>'
                                 '</div>'
                             )
                         else:
@@ -1429,7 +1597,7 @@ async def case_detail_page(case_id: int):
                     except Exception:
                         upload_err.set_text("Cannot reach the backend.")
 
-                # The upload widget — CSS in inject_styles() removes the "0.0B / 0.00%"
+                # The upload widget, CSS in inject_styles() removes the "0.0B / 0.00%"
                 # subtitle and gives the header our brand indigo gradient.
                 ui.upload(
                     label="Add a photo",
@@ -1441,10 +1609,10 @@ async def case_detail_page(case_id: int):
             # ── AI Analysis ───────────────────────────────────────────────────
             #
             # This section is a small state machine with four views:
-            #   _draw_no_analysis()  — no analysis exists yet (404)
-            #   _draw_running(data)  — pipeline is pending or running
-            #   _draw_complete(data) — all three stages finished successfully
-            #   _draw_failed(data)   — pipeline raised an exception
+            #   _draw_no_analysis() , no analysis exists yet (404)
+            #   _draw_running(data) , pipeline is pending or running
+            #   _draw_complete(data), all three stages finished successfully
+            #   _draw_failed(data)  , pipeline raised an exception
             #
             # A NiceGUI timer polls the backend every 3.5 s while the pipeline
             # is in flight, updating pipeline_stage after each stage so the UI
@@ -1466,6 +1634,10 @@ async def case_detail_page(case_id: int):
                 "stage_2_complete":       "Resources listed",
                 "stage_3_running":        "Preparing your repair steps&#8230;",
                 "stage_3_complete":       "Steps ready",
+                "stage_a_running":        "Preparing safety assessment&#8230;",
+                "stage_a_complete":       "Assessment ready",
+                "stage_c_running":        "Preparing care advice&#8230;",
+                "stage_c_complete":       "Care advice ready",
                 "complete":               "Analysis complete",
                 "needs_clarification":    "Clarification needed",
             }
@@ -1478,13 +1650,17 @@ async def case_detail_page(case_id: int):
                 "stage_2_complete":  68,
                 "stage_3_running":   82,
                 "stage_3_complete":  95,
+                "stage_a_running":   60,
+                "stage_a_complete":  95,
+                "stage_c_running":   60,
+                "stage_c_complete":  95,
                 "complete":          100,
             }
 
             # ── Backend helpers ───────────────────────────────────────────────
 
             async def _get_analysis():
-                """GET /analysis — returns dict or None (404 / error)."""
+                """GET /analysis, returns dict or None (404 / error)."""
                 try:
                     async with httpx.AsyncClient() as c:
                         r = await c.get(
@@ -1497,7 +1673,7 @@ async def case_detail_page(case_id: int):
                     return None
 
             async def _get_case():
-                """GET /cases/{case_id} — returns dict or None."""
+                """GET /cases/{case_id}, returns dict or None."""
                 try:
                     async with httpx.AsyncClient() as c:
                         r = await c.get(
@@ -1510,7 +1686,7 @@ async def case_detail_page(case_id: int):
                     return None
 
             async def _post_analyse(text_context: str | None = None):
-                """POST /analyse — returns (ok: bool, err_msg: str | None).
+                """POST /analyse, returns (ok: bool, err_msg: str | None).
 
                 text_context is forwarded to the Stage 1 vision model so the user
                 can describe the issue when the photo alone was not clear enough.
@@ -1563,13 +1739,13 @@ async def case_detail_page(case_id: int):
                     # _redraw() clears and refills this area on each state change.
                     btn_area = ui.element("div")
 
-                # ── Content area — cleared + redrawn by _redraw() ─────────────
+                # ── Content area, cleared + redrawn by _redraw() ─────────────
                 analysis_box = ui.element("div")
 
             # ── Rendering helpers ─────────────────────────────────────────────
 
             def _draw_no_analysis():
-                """Empty state — no analysis has been triggered yet."""
+                """Empty state, no analysis has been triggered yet."""
                 with ui.element("div").style(
                     "padding:44px 24px;display:flex;flex-direction:column;"
                     "align-items:center;text-align:center;gap:14px;"
@@ -1597,39 +1773,158 @@ async def case_detail_page(case_id: int):
                     )
 
             def _draw_running(data: dict):
-                """Progress view — customer-friendly 5-step breakdown."""
+                """Progress view — adapts step labels to the pipeline branch being taken.
+
+                output_mode is written to stage_outputs after Stage 1 completes and sets
+                the mode. Before that it is absent, so we fall back to the DIY step set
+                (reasonable assumption; it flips immediately after Stage 1 if the mode
+                differs). All four modes produce a visually consistent card.
+                """
                 stage = data.get("pipeline_stage")
-                pct   = _STAGE_PCT.get(stage, 8)
 
-                # Customer-friendly headline mapped to pipeline stage
-                _TOP = {
-                    None:                "Warming up&#8230;",
-                    "stage_1_running":   "Reviewing your photos&#8230;",
-                    "stage_1_complete":  "Issue identified &#8212; checking what you&#8217;ll need&#8230;",
-                    "stage_2_running":   "Checking tools &amp; materials&#8230;",
-                    "stage_2_complete":  "Resources ready &#8212; writing your guide&#8230;",
-                    "stage_3_running":   "Writing your step-by-step repair guide&#8230;",
-                    "stage_3_complete":  "Almost done&#8230;",
-                }
-                headline = _TOP.get(stage, "Analysing&#8230;")
+                # output_mode is available in stage_outputs once Stage 1 completes.
+                output_mode = (data.get("stage_outputs") or {}).get("output_mode", "")
 
-                # Stage index for step state calculation
-                _IDX = {
-                    None: 0,
-                    "stage_1_running": 1, "stage_1_complete": 2,
-                    "stage_2_running": 3, "stage_2_complete": 4,
-                    "stage_3_running": 5, "stage_3_complete": 6, "complete": 7,
-                }
-                cur = _IDX.get(stage, 0)
+                # ── Mode-specific step definitions ────────────────────────────────
+                # Each step tuple: (label, emoji, active_from_idx, done_from_idx)
+                # _IDX maps pipeline_stage → current progress index for this mode.
+                # _PCT maps pipeline_stage → progress bar percentage for this mode.
 
-                # 5 steps: (label, emoji, active_from, done_from)
-                _STEPS5 = [
-                    ("Reviewing your photos",         "🔍", 1, 2),
-                    ("Identifying the problem",       "🧠", 2, 3),
-                    ("Checking tools &amp; materials","🔧", 3, 5),
-                    ("Writing your repair guide",     "📋", 5, 7),
-                    ("Finalising your guide",         "✅", 7, 8),
-                ]
+                if output_mode == "assessment_first":
+                    _TOP = {
+                        None:               "Warming up&#8230;",
+                        "stage_1_running":  "Reviewing your photos&#8230;",
+                        "stage_1_complete": "Safety concerns identified&#8230;",
+                        "stage_a_running":  "Preparing safety assessment&#8230;",
+                        "stage_a_complete": "Assessment ready, finalising&#8230;",
+                    }
+                    _STEPS5 = [
+                        ("Reviewing your photos",          "🔍", 1, 2),
+                        ("Identifying safety concerns",    "⚠️", 2, 3),
+                        ("Preparing safety assessment",    "🛑", 3, 5),
+                        ("Finalising assessment",          "✅", 5, 6),
+                    ]
+                    _IDX = {
+                        None: 0,
+                        "stage_1_running": 1, "stage_1_complete": 2,
+                        "stage_a_running": 3, "stage_a_complete": 4,
+                        "complete": 5,
+                    }
+                    _PCT = {
+                        None: 6, "stage_1_running": 20, "stage_1_complete": 42,
+                        "stage_a_running": 64, "stage_a_complete": 92, "complete": 100,
+                    }
+
+                elif output_mode == "care":
+                    _TOP = {
+                        None:               "Warming up&#8230;",
+                        "stage_1_running":  "Reviewing your photos&#8230;",
+                        "stage_1_complete": "Condition identified&#8230;",
+                        "stage_c_running":  "Preparing care advice&#8230;",
+                        "stage_c_complete": "Care advice ready, finalising&#8230;",
+                    }
+                    _STEPS5 = [
+                        ("Reviewing your photos",        "🔍", 1, 2),
+                        ("Identifying the condition",    "🧐", 2, 3),
+                        ("Preparing care advice",        "🌿", 3, 5),
+                        ("Finalising recommendations",   "✅", 5, 6),
+                    ]
+                    _IDX = {
+                        None: 0,
+                        "stage_1_running": 1, "stage_1_complete": 2,
+                        "stage_c_running": 3, "stage_c_complete": 4,
+                        "complete": 5,
+                    }
+                    _PCT = {
+                        None: 6, "stage_1_running": 20, "stage_1_complete": 42,
+                        "stage_c_running": 64, "stage_c_complete": 92, "complete": 100,
+                    }
+
+                elif output_mode == "clarification":
+                    _TOP = {
+                        None:               "Warming up&#8230;",
+                        "stage_1_running":  "Reviewing your photos&#8230;",
+                        "stage_1_complete": "Identifying what&#8217;s unclear&#8230;",
+                    }
+                    _STEPS5 = [
+                        ("Reviewing your photos",              "🔍", 1, 2),
+                        ("Identifying what&#8217;s unclear",   "🔎", 2, 3),
+                        ("Preparing clarification questions",  "❓", 3, 4),
+                    ]
+                    _IDX = {
+                        None: 0,
+                        "stage_1_running": 1, "stage_1_complete": 2,
+                        "complete": 3,
+                    }
+                    _PCT = {
+                        None: 6, "stage_1_running": 28, "stage_1_complete": 82,
+                        "complete": 100,
+                    }
+
+                elif output_mode in ("diy", "verify_first"):
+                    # Confirmed DIY / verify_first path: show all 5 repair-oriented steps.
+                    _TOP = {
+                        None:               "Warming up&#8230;",
+                        "stage_1_running":  "Reviewing your photos&#8230;",
+                        "stage_1_complete": "Issue identified, checking what you&#8217;ll need&#8230;",
+                        "stage_2_running":  "Checking tools &amp; materials&#8230;",
+                        "stage_2_complete": "Resources ready, writing your guide&#8230;",
+                        "stage_3_running":  "Writing your step-by-step repair guide&#8230;",
+                        "stage_3_complete": "Almost done&#8230;",
+                    }
+                    _STEPS5 = [
+                        ("Reviewing your photos",         "🔍", 1, 2),
+                        ("Identifying the problem",       "🧠", 2, 3),
+                        ("Checking tools &amp; materials","🔧", 3, 5),
+                        ("Writing your repair guide",     "📋", 5, 7),
+                        ("Finalising your guide",         "✅", 7, 8),
+                    ]
+                    _IDX = {
+                        None: 0,
+                        "stage_1_running": 1, "stage_1_complete": 2,
+                        "stage_2_running": 3, "stage_2_complete": 4,
+                        "stage_3_running": 5, "stage_3_complete": 6,
+                        "complete": 7,
+                    }
+                    _PCT = {
+                        None: 6, "stage_1_running": 18, "stage_1_complete": 36,
+                        "stage_2_running": 52, "stage_2_complete": 68,
+                        "stage_3_running": 82, "stage_3_complete": 95,
+                        "complete": 100,
+                    }
+
+                else:
+                    # output_mode not yet known (Stage 1 still running).
+                    # Four neutral steps that reflect actual AI reasoning without
+                    # committing to any particular output path (DIY / assessment /
+                    # care / clarification). All four are active-then-done in the
+                    # single stage_1_running → stage_1_complete window so the user
+                    # sees meaningful progression even before mode is decided.
+                    _TOP = {
+                        None:               "Warming up&#8230;",
+                        "stage_1_running":  "Reviewing your photos&#8230;",
+                        "stage_1_complete": "Assessing the situation&#8230;",
+                    }
+                    _STEPS5 = [
+                        ("Reviewing your photos",            "🔍", 1, 2),
+                        ("Understanding the issue",          "🧠", 1, 2),
+                        ("Assessing risk and uncertainty",   "⚖️", 1, 2),
+                        ("Determining the safest next step", "🧭", 2, 3),
+                    ]
+                    _IDX = {
+                        None: 0,
+                        "stage_1_running": 1, "stage_1_complete": 2,
+                        "complete": 3,
+                    }
+                    _PCT = {
+                        None: 6, "stage_1_running": 22, "stage_1_complete": 55,
+                        "complete": 100,
+                    }
+
+                headline  = _TOP.get(stage, "Analysing&#8230;")
+                cur       = _IDX.get(stage, 0)
+                pct       = _PCT.get(stage, 8)
+                run_id    = data.get("id", 0)  # analysis row id — resets timer on new run
 
                 with ui.element("div").style("padding:24px 24px 20px;"):
                     # Headline + pulse dot
@@ -1644,9 +1939,38 @@ async def case_detail_page(case_id: int):
                     )
                     ui.html(
                         '<div style="color:#94a3b8;font-size:0.775rem;'
-                        'margin-bottom:18px;padding-left:19px;">'
-                        'This takes 1&#8211;2 minutes the first time while AI models load'
+                        'margin-bottom:4px;padding-left:19px;">'
+                        'This takes 1-2 minutes the first time while AI models load'
                         '</div>'
+                    )
+                    # Live elapsed timer — resets when analysis id changes
+                    ui.html(
+                        f'<div id="knitra-elapsed" '
+                        f'data-runid="{run_id}" '
+                        f'style="color:#a78bfa;font-size:0.72rem;font-weight:500;'
+                        f'padding-left:19px;margin-bottom:14px;">'
+                        f'Analysing for 0s&#8230;'
+                        f'</div>'
+                    )
+                    ui.run_javascript(
+                        f"(function(){{"
+                        f"  var el=document.getElementById('knitra-elapsed');"
+                        f"  if(!el)return;"
+                        f"  var rid={run_id};"
+                        f"  if(window._knitraRunId!==rid){{"
+                        f"    window._knitraRunId=rid;"
+                        f"    window._knitraRunStart=Date.now();"
+                        f"  }}"
+                        f"  if(window._knitraElapsedInt)clearInterval(window._knitraElapsedInt);"
+                        f"  function tick(){{"
+                        f"    var e=document.getElementById('knitra-elapsed');"
+                        f"    if(!e){{clearInterval(window._knitraElapsedInt);return;}}"
+                        f"    var sec=Math.floor((Date.now()-window._knitraRunStart)/1000);"
+                        f"    e.textContent='Analysing for '+sec+'s…';"
+                        f"  }}"
+                        f"  tick();"
+                        f"  window._knitraElapsedInt=setInterval(tick,1000);"
+                        f"}})()"
                     )
 
                     # Progress bar
@@ -1680,10 +2004,355 @@ async def case_detail_page(case_id: int):
                             f'</div>'
                         )
 
-            def _draw_complete(data: dict):
-                """Full result view — renders all three stage outputs."""
-                sr = data.get("structured_result") or {}
+            def _draw_assessment_first(sr: dict):
+                """Render the assessment-first output mode.
+
+                Only shows: diagnosis header + professional assessment banner,
+                immediate actions, what not to do, why assessment is needed,
+                information to gather, professional guidance.
+
+                Deliberately omits: tools, materials, repair steps, difficulty,
+                estimated time. The model's role in this mode is stabilisation
+                and escalation, not repair execution.
+                """
                 s1 = sr.get("stage_1") or {}
+                sa = sr.get("assessment") or {}
+
+                sev = s1.get("severity", "")
+                _sev = {
+                    "low":    ("background:#dcfce7;color:#15803d;", "Low severity"),
+                    "medium": ("background:#fef3c7;color:#92400e;", "Medium severity"),
+                    "high":   ("background:#fee2e2;color:#991b1b;", "High severity"),
+                    "critical": ("background:#fee2e2;color:#7f1d1d;", "Critical severity"),
+                }
+                sev_s, sev_l = _sev.get(sev, ("background:#f1f5f9;color:#475569;",
+                                               sev.capitalize() + " severity"))
+
+                def _section_list(items: list, icon: str = "&#8226;", icon_col: str = "#ef4444"):
+                    for item in items:
+                        ui.html(
+                            f'<div style="display:flex;align-items:flex-start;gap:8px;'
+                            f'margin-bottom:6px;font-size:0.845rem;color:#334155;">'
+                            f'<span style="color:{icon_col};flex-shrink:0;margin-top:2px;">'
+                            f'{icon}</span>'
+                            f'<span>{item}</span></div>'
+                        )
+
+                with ui.element("div").style(
+                    "padding:22px 24px;display:flex;flex-direction:column;gap:18px;"
+                ):
+                    # ── Diagnosis header ──────────────────────────────────────
+                    ui.html('<div class="analysis-section-label">Diagnosis</div>')
+                    with ui.element("div").classes("analysis-card"):
+                        ui.html(
+                            f'<div style="display:flex;align-items:center;gap:8px;'
+                            f'flex-wrap:wrap;margin-bottom:10px;">'
+                            f'<span style="font-weight:800;color:#0f172a;font-size:1.28rem;'
+                            f'letter-spacing:-0.01em;line-height:1.25;">'
+                            f'{s1.get("problem_type", "Unknown issue")}</span>'
+                            f'<span style="background:#ede9fe;color:#4c1d95;padding:2px 10px;'
+                            f'border-radius:100px;font-size:11px;font-weight:600;">'
+                            f'{_cat_label(s1.get("trade_category",""))}</span>'
+                            f'<span style="{sev_s}padding:2px 10px;'
+                            f'border-radius:100px;font-size:11px;font-weight:600;">'
+                            f'{sev_l}</span>'
+                            f'</div>'
+                        )
+                        for obs in s1.get("observations", []):
+                            ui.html(
+                                f'<div style="display:flex;align-items:flex-start;gap:8px;'
+                                f'margin-bottom:5px;font-size:0.845rem;color:#334155;">'
+                                f'<span style="color:#6366f1;flex-shrink:0;margin-top:2px;">'
+                                f'&#8226;</span><span>{obs}</span></div>'
+                            )
+
+                    # ── Professional assessment required banner ────────────────
+                    pro_type    = sa.get("professional_type") or s1.get("safety_concerns", [""])[0] or "a qualified professional"
+                    urgency     = sa.get("professional_urgency") or "as soon as possible"
+                    urgency_col = "#7f1d1d" if urgency == "immediately" else "#92400e"
+                    ui.html(
+                        f'<div style="display:flex;align-items:center;gap:12px;'
+                        f'background:#fef2f2;border:1.5px solid #fecaca;'
+                        f'border-radius:12px;padding:14px 16px;">'
+                        f'<span style="font-size:1.4rem;flex-shrink:0;">&#128680;</span>'
+                        f'<div>'
+                        f'<div style="font-weight:700;color:#991b1b;font-size:0.92rem;'
+                        f'margin-bottom:3px;">Professional Assessment Required</div>'
+                        f'<div style="font-size:0.815rem;color:#64748b;">'
+                        f'Contact a <strong>{pro_type}</strong> '
+                        f'<span style="color:{urgency_col};font-weight:600;">{urgency}</span>.'
+                        f'</div></div></div>'
+                    )
+
+                    # ── Immediate Actions ─────────────────────────────────────
+                    immediate = sa.get("immediate_actions") or []
+                    if immediate:
+                        ui.html('<div class="analysis-section-label">Immediate Actions</div>')
+                        with ui.element("div").classes("analysis-card"):
+                            ui.html(
+                                '<div style="font-size:0.78rem;color:#64748b;margin-bottom:10px;">'
+                                'Do these now, before any professional arrives.</div>'
+                            )
+                            _section_list(immediate, icon="&#10003;", icon_col="#15803d")
+
+                    # ── What NOT to do ────────────────────────────────────────
+                    do_not = sa.get("do_not_do") or []
+                    if do_not:
+                        ui.html('<div class="analysis-section-label">What NOT to Do</div>')
+                        with ui.element("div").classes("analysis-card").style(
+                            "border-left:3px solid #ef4444;"
+                        ):
+                            _section_list(do_not, icon="&#10007;", icon_col="#ef4444")
+
+                    # ── Why assessment is needed ──────────────────────────────
+                    why = sa.get("why_assessment_needed") or ""
+                    if why:
+                        ui.html('<div class="analysis-section-label">Why Assessment Is Needed</div>')
+                        with ui.element("div").classes("analysis-card"):
+                            ui.html(
+                                f'<div style="font-size:0.845rem;color:#334155;line-height:1.65;">'
+                                f'{why}</div>'
+                            )
+
+                    # ── Information to gather ─────────────────────────────────
+                    info = sa.get("information_needed") or []
+                    if info:
+                        ui.html('<div class="analysis-section-label">Information to Prepare</div>')
+                        with ui.element("div").classes("analysis-card"):
+                            ui.html(
+                                '<div style="font-size:0.78rem;color:#64748b;margin-bottom:10px;">'
+                                'Have this ready for the professional.</div>'
+                            )
+                            _section_list(info, icon="&#8594;", icon_col="#6366f1")
+
+                    # ── Uncertainty note (if present) ─────────────────────────
+                    unc = (s1.get("uncertainty_notes") or "").strip()
+                    if unc:
+                        ui.html(
+                            f'<div style="background:#f8fafc;border:1px solid #e2e8f0;'
+                            f'border-radius:8px;padding:10px 14px;font-size:0.78rem;'
+                            f'color:#64748b;line-height:1.55;">'
+                            f'<strong>What the photo cannot confirm:</strong> {unc}</div>'
+                        )
+
+            def _draw_clarification(sr: dict):
+                """Render the clarification-mode output.
+
+                Shows: compact diagnosis header, what is known, the clarifying
+                questions as interactive cards, and a note on why the answers
+                matter. No tools, materials, steps, or professional guidance.
+                """
+                s1 = sr.get("stage_1") or {}
+                cl = sr.get("clarification") or {}
+
+                sev = s1.get("severity", "")
+                sev_labels = {
+                    "low":    ("background:#dcfce7;color:#15803d;", "Low severity"),
+                    "medium": ("background:#fef3c7;color:#92400e;", "Medium severity"),
+                    "high":   ("background:#fee2e2;color:#991b1b;", "High severity"),
+                }
+                sev_s, sev_l = sev_labels.get(sev, ("background:#f1f5f9;color:#475569;",
+                                                      sev.capitalize()))
+
+                with ui.element("div").style(
+                    "padding:22px 24px;display:flex;flex-direction:column;gap:18px;"
+                ):
+                    # ── Diagnosis header (compact) ─────────────────────────────
+                    ui.html('<div class="analysis-section-label">Diagnosis</div>')
+                    with ui.element("div").classes("analysis-card"):
+                        ui.html(
+                            f'<div style="display:flex;align-items:center;gap:8px;'
+                            f'flex-wrap:wrap;margin-bottom:8px;">'
+                            f'<span style="font-weight:800;color:#0f172a;font-size:1.18rem;">'
+                            f'{s1.get("problem_type","Unknown issue")}</span>'
+                            f'<span style="background:#ede9fe;color:#4c1d95;padding:2px 10px;'
+                            f'border-radius:100px;font-size:11px;font-weight:600;">'
+                            f'{_cat_label(s1.get("trade_category",""))}</span>'
+                            f'<span style="{sev_s}padding:2px 10px;'
+                            f'border-radius:100px;font-size:11px;font-weight:600;">'
+                            f'{sev_l}</span>'
+                            f'</div>'
+                        )
+                        what_known = cl.get("what_is_known") or ""
+                        if what_known:
+                            ui.html(
+                                f'<div style="font-size:0.845rem;color:#334155;'
+                                f'line-height:1.6;">{what_known}</div>'
+                            )
+
+                    # ── Clarifying questions ───────────────────────────────────
+                    questions = (
+                        cl.get("clarifying_questions")
+                        or s1.get("clarifying_questions")
+                        or []
+                    )
+                    if questions:
+                        ui.html('<div class="analysis-section-label">Before I can advise</div>')
+                        with ui.element("div").style(
+                            "background:#eef2ff;border:1px solid #c7d2fe;"
+                            "border-radius:12px;padding:16px;"
+                            "display:flex;flex-direction:column;gap:10px;"
+                        ):
+                            ui.html(
+                                '<div style="font-size:0.78rem;color:#3730a3;font-weight:600;'
+                                'margin-bottom:4px;">I need a little more information to give '
+                                'you the right advice:</div>'
+                            )
+                            for i, q in enumerate(questions, 1):
+                                ui.html(
+                                    f'<div style="display:flex;align-items:flex-start;gap:10px;">'
+                                    f'<span style="background:#4f46e5;color:#fff;font-weight:700;'
+                                    f'font-size:0.75rem;border-radius:100px;padding:2px 7px;'
+                                    f'flex-shrink:0;margin-top:1px;">{i}</span>'
+                                    f'<span style="font-size:0.845rem;color:#1e1b4b;'
+                                    f'font-weight:500;line-height:1.55;">{q}</span>'
+                                    f'</div>'
+                                )
+                        ui.html(
+                            '<div style="font-size:0.78rem;color:#64748b;line-height:1.55;">'
+                            'Answer in <strong>Ask Knitra</strong> below, or upload a '
+                            'closer photo, then press <strong>Re-analyse</strong> for an '
+                            'updated diagnosis.</div>'
+                        )
+
+                    # ── What is unclear ────────────────────────────────────────
+                    unclear = cl.get("what_is_unclear") or []
+                    if unclear:
+                        ui.html('<div class="analysis-section-label">What the photo cannot confirm</div>')
+                        with ui.element("div").classes("analysis-card"):
+                            for item in unclear:
+                                ui.html(
+                                    f'<div style="display:flex;align-items:flex-start;gap:8px;'
+                                    f'margin-bottom:6px;font-size:0.845rem;color:#475569;">'
+                                    f'<span style="color:#94a3b8;flex-shrink:0;margin-top:2px;">'
+                                    f'&#8226;</span><span>{item}</span></div>'
+                                )
+
+            def _draw_care(sr: dict):
+                """Render the care-mode output.
+
+                Shows: compact diagnosis header, condition summary, ordered care
+                recommendations, what to avoid, and expected outcome.
+
+                Deliberately omits: tools, materials, protective gear, repair
+                steps, safety warnings, professional guidance, difficulty level.
+                The tone is friendly and practical, not trade-formal.
+                """
+                s1 = sr.get("stage_1") or {}
+                sc = sr.get("care") or {}
+
+                sev = s1.get("severity", "")
+                sev_labels = {
+                    "low":    ("background:#dcfce7;color:#15803d;", "Low severity"),
+                    "medium": ("background:#fef3c7;color:#92400e;", "Medium severity"),
+                    "high":   ("background:#fee2e2;color:#991b1b;", "High severity"),
+                }
+                sev_s, sev_l = sev_labels.get(sev, ("background:#f1f5f9;color:#475569;",
+                                                      sev.capitalize()))
+
+                with ui.element("div").style(
+                    "padding:22px 24px;display:flex;flex-direction:column;gap:18px;"
+                ):
+                    # ── Compact diagnosis header ──────────────────────────────
+                    ui.html('<div class="analysis-section-label">What I Can See</div>')
+                    with ui.element("div").classes("analysis-card"):
+                        ui.html(
+                            f'<div style="display:flex;align-items:center;gap:8px;'
+                            f'flex-wrap:wrap;margin-bottom:8px;">'
+                            f'<span style="font-weight:800;color:#0f172a;font-size:1.18rem;">'
+                            f'{s1.get("problem_type","Unknown")}</span>'
+                            f'<span style="background:#ede9fe;color:#4c1d95;padding:2px 10px;'
+                            f'border-radius:100px;font-size:11px;font-weight:600;">'
+                            f'{_cat_label(s1.get("trade_category",""))}</span>'
+                            f'</div>'
+                        )
+                        summary = sc.get("condition_summary") or ""
+                        if summary:
+                            ui.html(
+                                f'<div style="font-size:0.845rem;color:#475569;'
+                                f'line-height:1.6;">{summary}</div>'
+                            )
+
+                    # ── Care Recommendations ──────────────────────────────────
+                    recs = sc.get("recommendations") or []
+                    if recs:
+                        ui.html('<div class="analysis-section-label">Care Recommendations</div>')
+                        with ui.element("div").classes("analysis-card"):
+                            for i, rec in enumerate(recs, 1):
+                                ui.html(
+                                    f'<div style="display:flex;align-items:flex-start;gap:10px;'
+                                    f'margin-bottom:10px;">'
+                                    f'<span style="background:#ede9fe;color:#4c1d95;font-weight:700;'
+                                    f'font-size:0.75rem;border-radius:100px;padding:2px 7px;'
+                                    f'flex-shrink:0;margin-top:1px;">{i}</span>'
+                                    f'<span style="font-size:0.845rem;color:#334155;'
+                                    f'line-height:1.6;">{rec}</span>'
+                                    f'</div>'
+                                )
+
+                    # ── What to Avoid ─────────────────────────────────────────
+                    avoid = sc.get("what_to_avoid") or []
+                    if avoid:
+                        ui.html('<div class="analysis-section-label">What to Avoid</div>')
+                        with ui.element("div").classes("analysis-card"):
+                            for item in avoid:
+                                ui.html(
+                                    f'<div style="display:flex;align-items:flex-start;gap:8px;'
+                                    f'margin-bottom:7px;font-size:0.845rem;color:#334155;">'
+                                    f'<span style="color:#f59e0b;flex-shrink:0;margin-top:2px;">'
+                                    f'&#9888;</span><span>{item}</span></div>'
+                                )
+
+                    # ── Expected Outcome ──────────────────────────────────────
+                    outcome = sc.get("expected_outcome") or ""
+                    if outcome:
+                        ui.html(
+                            f'<div style="background:#f0fdf4;border:1px solid #bbf7d0;'
+                            f'border-radius:8px;padding:12px 16px;font-size:0.845rem;'
+                            f'color:#15803d;line-height:1.6;">'
+                            f'<strong>Expected result:</strong> {outcome}</div>'
+                        )
+
+            def _draw_time_footer(ms: int):
+                """Subtle 'Completed in Xs' line shown below every completed result.
+                Hidden when processing_time_ms is missing or zero."""
+                if not ms:
+                    return
+                secs = ms // 1000
+                t_str = f"{secs}s" if secs > 0 else f"{ms}ms"
+                ui.html(
+                    f'<div style="color:#cbd5e1;font-size:0.7rem;'
+                    f'padding:6px 24px 14px;text-align:right;">'
+                    f'Completed in {t_str}'
+                    f'</div>'
+                )
+
+            def _draw_complete(data: dict):
+                """Full result view. Routes to the correct render function based
+                on output_mode stored in structured_result. Old analyses without
+                output_mode fall through to the legacy DIY renderer."""
+                sr = data.get("structured_result") or {}
+                mode = sr.get("output_mode", "diy")
+                s1   = sr.get("stage_1") or {}
+                ms   = data.get("processing_time_ms") or 0
+
+                # Route to mode-specific renderer
+                if mode == "assessment_first":
+                    _draw_assessment_first(sr)
+                    _draw_time_footer(ms)
+                    return
+
+                if mode == "care":
+                    _draw_care(sr)
+                    _draw_time_footer(ms)
+                    return
+
+                if mode == "clarification":
+                    _draw_clarification(sr)
+                    _draw_time_footer(ms)
+                    return
+
+                # Legacy / DIY / verify_first path — full Stage 2 + Stage 3 render
                 s2 = sr.get("stage_2") or {}
                 s3 = sr.get("stage_3") or {}
 
@@ -1696,7 +2365,7 @@ async def case_detail_page(case_id: int):
                 sev_s, sev_l = _sev.get(sev, ("background:#f1f5f9;color:#475569;",
                                                sev.capitalize() + " severity"))
 
-                # Risk assessment values — default to DIY safe for old analyses
+                # Risk assessment values, default to DIY safe for old analyses
                 # that pre-date Block 3 and do not have these fields stored
                 diy_ok   = s3.get("diy_recommended", True)
                 pro_type = s3.get("professional_type") or ""
@@ -1721,7 +2390,8 @@ async def case_detail_page(case_id: int):
                         ui.html(
                             f'<div style="display:flex;align-items:center;gap:8px;'
                             f'flex-wrap:wrap;margin-bottom:10px;">'
-                            f'<span style="font-weight:700;color:#0f172a;font-size:1rem;">'
+                            f'<span style="font-weight:800;color:#0f172a;font-size:1.28rem;'
+                            f'letter-spacing:-0.01em;line-height:1.25;">'
                             f'{s1.get("problem_type","Unknown")}</span>'
                             f'<span style="background:#ede9fe;color:#4c1d95;padding:2px 10px;'
                             f'border-radius:100px;font-size:11px;font-weight:600;">'
@@ -1746,6 +2416,7 @@ async def case_detail_page(case_id: int):
                     conf_reason  = (s1.get("confidence_reason") or "").strip()
                     vis_evidence = s1.get("visual_evidence") or []
                     unc_notes    = (s1.get("uncertainty_notes") or "").strip()
+                    clarif_req   = (s1.get("clarification_request") or "").strip()
 
                     if conf >= 90:
                         conf_color, conf_bg, conf_label = "#15803d", "#dcfce7", "High"
@@ -1780,13 +2451,13 @@ async def case_detail_page(case_id: int):
                             f'</div>'
                             f'</div>'
                         )
-                        # Visual evidence bullets
+                        # Visual evidence bullets, what INCREASED confidence
                         if vis_evidence:
                             ui.html(
                                 '<div style="font-size:0.72rem;font-weight:700;'
-                                'color:#94a3b8;letter-spacing:0.05em;'
+                                'color:#15803d;letter-spacing:0.05em;'
                                 'text-transform:uppercase;margin-top:4px;">'
-                                'What the AI saw</div>'
+                                'What increased confidence</div>'
                             )
                             with ui.element("div").style(
                                 "display:flex;flex-wrap:wrap;gap:5px;margin-top:2px;"
@@ -1798,7 +2469,7 @@ async def case_detail_page(case_id: int):
                                         f'font-size:0.76rem;color:#475569;">'
                                         f'{ev}</span>'
                                     )
-                        # Uncertainty notes
+                        # Uncertainty notes, what REDUCED confidence / still uncertain
                         if unc_notes:
                             ui.html(
                                 f'<div style="display:flex;align-items:flex-start;gap:6px;'
@@ -1807,9 +2478,37 @@ async def case_detail_page(case_id: int):
                                 f'<span style="font-size:0.85rem;flex-shrink:0;">&#9888;&#65039;</span>'
                                 f'<div>'
                                 f'<div style="font-size:0.73rem;font-weight:700;'
-                                f'color:#92400e;margin-bottom:2px;">Unconfirmed</div>'
+                                f'color:#92400e;margin-bottom:2px;">What reduced confidence / still uncertain</div>'
                                 f'<div style="font-size:0.78rem;color:#78350f;'
                                 f'line-height:1.5;">{unc_notes}</div>'
+                                f'</div></div>'
+                            )
+
+                        # How to improve confidence, shown for sub-90% complete cases.
+                        # Uses the AI's own clarification request when present, else a
+                        # sensible generic photo-guidance fallback. Medium-confidence
+                        # complete cases get this too, not only clarification cases.
+                        if conf < 90:
+                            improve_msg = clarif_req or (
+                                "A sharper, well-lit close-up of the affected area, plus one "
+                                "wider shot for context, would let the AI confirm the details "
+                                "marked uncertain above. Include a tape measure or a coin for scale "
+                                "where size matters."
+                            )
+                            ui.html(
+                                f'<div style="display:flex;align-items:flex-start;gap:6px;'
+                                f'background:#eff6ff;border:1px solid #bfdbfe;'
+                                f'border-radius:7px;padding:8px 10px;margin-top:2px;">'
+                                f'<span style="font-size:0.85rem;flex-shrink:0;">&#128247;</span>'
+                                f'<div>'
+                                f'<div style="font-size:0.73rem;font-weight:700;'
+                                f'color:#1e40af;margin-bottom:2px;">'
+                                f'What would improve confidence</div>'
+                                f'<div style="font-size:0.78rem;color:#1e3a8a;'
+                                f'line-height:1.5;">{improve_msg}</div>'
+                                f'<div style="font-size:0.72rem;color:#64748b;'
+                                f'margin-top:4px;">Add a clearer photo above, then press '
+                                f'<b>Re-analyse</b> for an updated confidence score.</div>'
                                 f'</div></div>'
                             )
 
@@ -1882,13 +2581,16 @@ async def case_detail_page(case_id: int):
                                     f'{icon}&nbsp;{section_title}</div>'
                                 )
                                 for item in items:
+                                    chip, text = _tier_split(item)
                                     ui.html(
                                         f'<div style="display:flex;align-items:flex-start;'
-                                        f'gap:6px;margin-bottom:4px;'
+                                        f'gap:6px;margin-bottom:6px;'
                                         f'font-size:0.82rem;color:#334155;">'
                                         f'<span style="color:#6366f1;flex-shrink:0;'
                                         f'margin-top:2px;">&#8226;</span>'
-                                        f'<span>{item}</span></div>'
+                                        f'<span style="display:flex;flex-wrap:wrap;'
+                                        f'align-items:center;">{chip}'
+                                        f'<span>{text}</span></span></div>'
                                     )
                                 if opt_items:
                                     ui.html(
@@ -1898,14 +2600,17 @@ async def case_detail_page(case_id: int):
                                         'Nice to have</div>'
                                     )
                                     for item in opt_items:
+                                        chip, text = _tier_split(item)
                                         ui.html(
                                             f'<div style="display:flex;'
                                             f'align-items:flex-start;gap:6px;'
-                                            f'margin-bottom:4px;font-size:0.82rem;'
+                                            f'margin-bottom:6px;font-size:0.82rem;'
                                             f'color:#94a3b8;">'
                                             f'<span style="color:#c7d2fe;flex-shrink:0;'
                                             f'margin-top:2px;">&#8226;</span>'
-                                            f'<span>{item}</span></div>'
+                                            f'<span style="display:flex;flex-wrap:wrap;'
+                                            f'align-items:center;">{chip}'
+                                            f'<span>{text}</span></span></div>'
                                         )
 
                     # ── 3. Repair steps ───────────────────────────────────────
@@ -2009,25 +2714,12 @@ async def case_detail_page(case_id: int):
                                     f'</div>'
                                 )
 
-                    # ── Metadata footer ───────────────────────────────────────
-                    ms      = data.get("processing_time_ms") or 0
-                    t_str   = f"{ms // 1000}s" if ms >= 1000 else f"{ms}ms"
-                    model   = data.get("model", "")
-                    prov    = data.get("provider", "")
-                    ui.html(
-                        f'<div style="color:#cbd5e1;font-size:11px;'
-                        f'display:flex;gap:14px;flex-wrap:wrap;'
-                        f'margin-top:4px;padding-top:8px;'
-                        f'border-top:1px solid #f1f5f9;">'
-                        f'<span>Provider: {prov}</span>'
-                        f'<span>Model: {model}</span>'
-                        f'<span>Processing time: {t_str}</span>'
-                        f'</div>'
-                    )
+                    # ── Completed time footer (shared helper, hidden if ms=0) ──
+                    _draw_time_footer(data.get("processing_time_ms") or 0)
 
             def _draw_needs_clarification(data: dict):
                 """
-                Clarification gate — Stage 1 was not confident enough to diagnose.
+                Clarification gate, Stage 1 was not confident enough to diagnose.
 
                 Shows a detailed breakdown of WHY confidence was low, WHAT the model
                 saw vs. could not confirm, and exactly what photo or information is
@@ -2064,14 +2756,14 @@ async def case_detail_page(case_id: int):
                 if any(w in _combined_hints for w in ["close", "closer", "close-up", "detail", "clearer"]):
                     _photo_tips.append(("🔍", "Upload a closer, more detailed photo of the damaged area"))
                 if any(w in _combined_hints for w in ["wider", "wide", "context", "surround", "full"]):
-                    _photo_tips.append(("📐", "Include more surroundings — a wider shot shows the full extent"))
+                    _photo_tips.append(("📐", "Include more surroundings, a wider shot shows the full extent"))
                 if any(w in _combined_hints for w in ["light", "bright", "dark", "lit", "illumin", "blurr"]):
                     _photo_tips.append(("💡", "Take the photo in better light or move to a brighter area"))
                 if any(w in _combined_hints for w in ["describe", "written", "description", "explain", "unclear", "not sure", "cannot determine"]):
                     _photo_tips.append(("✏️", "Add a written description of what you see and what the problem is"))
                 if not _photo_tips:
                     _photo_tips = [
-                        ("📷", "Upload a new photo — closer, well-lit, and in focus"),
+                        ("📷", "Upload a new photo, closer, well-lit, and in focus"),
                         ("✏️", "Add a written description to give the AI a second evidence stream"),
                     ]
 
@@ -2217,7 +2909,7 @@ async def case_detail_page(case_id: int):
                         )
 
             def _draw_failed(data: dict):
-                """Error state — shows validation_issues and a retry button."""
+                """Error state, shows validation_issues and a retry button."""
                 issue = data.get("validation_issues") or "Unknown error."
                 with ui.element("div").style("padding:24px;"):
                     with ui.element("div").style(
@@ -2234,20 +2926,24 @@ async def case_detail_page(case_id: int):
                             f'{issue}</div>'
                         )
 
-            # ── Master redraw — called on every state transition ──────────────
+            # ── Master redraw, called on every state transition ──────────────
             def _redraw(data):
                 """
                 Redraw btn_area + analysis_box from data.
                 data is the full analysis dict, or None if 404.
                 """
                 status = (data or {}).get("status")
+                # Track whether the current analysis is in clarification output mode
+                _clarif_mode_ref["v"] = (
+                    ((data or {}).get("structured_result") or {}).get("output_mode") == "clarification"
+                )
 
                 # Button area
                 btn_area.clear()
                 with btn_area:
                     if status in ("running", "needs_clarification"):
-                        # running     — no button, pipeline can't be cancelled mid-flight
-                        # needs_clarification — button lives inside the card so the user
+                        # running    , no button, pipeline can't be cancelled mid-flight
+                        # needs_clarification, button lives inside the card so the user
                         #   can type a description and submit in one place
                         pass
                     else:
@@ -2297,6 +2993,10 @@ async def case_detail_page(case_id: int):
             _was_running   = False   # tracks whether we started in a running state
             _title_updated = False   # ensures we only re-fetch the case title once
 
+            # Mutable cell: True when the latest complete analysis has output_mode=clarification.
+            # Updated by _redraw; read by _render_chat_section.
+            _clarif_mode_ref = {"v": False}
+
             async def _do_poll():
                 nonlocal _was_running, _title_updated
                 data  = await _get_analysis()
@@ -2308,9 +3008,14 @@ async def case_detail_page(case_id: int):
                 # Stage 1 completes before Stage 2 starts, so the title is available
                 # at stage_1_complete. Re-fetching the case object is the only way to
                 # get the updated title without a page reload.
-                if not _title_updated and stage in ("stage_1_complete", "stage_2_running",
-                                                     "stage_2_complete", "stage_3_running",
-                                                     "stage_3_complete", "complete"):
+                if not _title_updated and stage in (
+                    "stage_1_complete",
+                    "stage_2_running", "stage_2_complete",
+                    "stage_3_running", "stage_3_complete",
+                    "stage_a_running", "stage_a_complete",
+                    "stage_c_running", "stage_c_complete",
+                    "complete",
+                ):
                     fresh_case = await _get_case()
                     if fresh_case:
                         new_title = fresh_case.get("title") or ""
@@ -2327,10 +3032,10 @@ async def case_detail_page(case_id: int):
                     # If the pipeline just finished while the user was watching,
                     # rebuild the chat section in-place so it unlocks immediately.
                     # (_render_chat_section is defined below; closures resolve at call time)
-                    if _was_running and st == "complete":
+                    if _was_running and st in ("complete", "needs_clarification"):
                         _was_running = False
-                        await _render_chat_section(True)
-                    elif _was_running and st in ("failed", "needs_clarification"):
+                        await _render_chat_section(st)
+                    elif _was_running and st == "failed":
                         _was_running = False
 
             poll_timer = ui.timer(3.5, _do_poll, active=False)
@@ -2340,24 +3045,43 @@ async def case_detail_page(case_id: int):
             # complete, or failed) and render it immediately without waiting for
             # the first timer tick.
             _initial = await _get_analysis()
+            # Seed clarif mode ref BEFORE _redraw so _render_chat_section reads it correctly.
+            _clarif_mode_ref["v"] = (
+                ((_initial or {}).get("structured_result") or {}).get("output_mode") == "clarification"
+            )
             _redraw(_initial)
             if (_initial or {}).get("status") in ("pending", "running"):
                 _was_running = True
                 poll_timer.active = True
 
-            # ── Chat section — dynamic container ──────────────────────────────
+            # ── Chat section, dynamic container ──────────────────────────────
             # Uses a plain div that can be cleared and rebuilt when analysis
             # completes while the user is watching (poll timer calls
             # _render_chat_section(True) instead of navigating away).
-            _analysis_complete = (_initial or {}).get("status") == "complete"
+            _initial_status    = (_initial or {}).get("status", "")
+            _analysis_complete = _initial_status in ("complete", "needs_clarification")
             chat_section = ui.element("div")
 
-            async def _render_chat_section(is_complete: bool):
+            async def _render_chat_section(analysis_status):
                 """
                 Rebuild the chat section in-place.
-                Safe to call multiple times — clears and recreates all child elements.
-                Called at page load and by _do_poll when analysis transitions to complete.
+                Safe to call multiple times, clears and recreates all child elements.
+                Called at page load and by _do_poll when analysis transitions to
+                'complete' or 'needs_clarification'.
+
+                analysis_status: the current analysis status string, or a bool
+                (True = complete) for backwards compatibility.
                 """
+                # Accept bare True/False for legacy call sites
+                if analysis_status is True:
+                    analysis_status = "complete"
+                elif analysis_status is False:
+                    analysis_status = "pending"
+                is_complete      = analysis_status in ("complete", "needs_clarification")
+                is_clarification = analysis_status == "needs_clarification"
+                # Also treat output_mode=clarification (status=complete) as clarification
+                is_clarif_mode   = _clarif_mode_ref["v"] or is_clarification
+
                 chat_section.clear()
                 with chat_section:
                     if not is_complete:
@@ -2403,21 +3127,136 @@ async def case_detail_page(case_id: int):
                                     '<div style="font-size:1rem;font-weight:700;'
                                     'color:#0f172a;">Ask Knitra</div>'
                                 )
-                                ui.html(
-                                    '<div style="font-size:0.75rem;color:#94a3b8;'
-                                    'margin-top:1px;">AI assistant with full knowledge '
-                                    'of your repair case</div>'
+                                _chat_subtitle = (
+                                    "Answer the questions below, then press Re-analyse "
+                                    "for an updated plan"
+                                    if is_clarif_mode else
+                                    "Knows your full case. Chat answers are conversational, "
+                                    "press Re-analyse above for an official updated diagnosis."
                                 )
+                                ui.html(
+                                    f'<div style="font-size:0.75rem;color:#94a3b8;'
+                                    f'margin-top:1px;">{_chat_subtitle}</div>'
+                                )
+                            # Expand / collapse the message area for more room.
+                            ui.html(
+                                '<button title="Give the chat more space" '
+                                'onclick="var w=document.querySelector(&#39;.chat-wrap&#39;);'
+                                'if(w){var ex=w.classList.toggle(&#39;expanded&#39;);'
+                                'this.textContent=ex?&#39;Collapse&#39;:&#39;Expand&#39;;}" '
+                                'style="margin-left:auto;flex-shrink:0;background:#f1f5f9;'
+                                'border:1px solid #e2e8f0;border-radius:8px;padding:5px 11px;'
+                                'font-size:0.72rem;font-weight:600;color:#475569;cursor:pointer;">'
+                                'Expand</button>'
+                            )
 
                         # Message list
                         chat_messages = ui.element("div").classes("chat-wrap")
 
-                        _SUGGESTIONS = [
-                            "What tools do I need?",
-                            "Is this safe to DIY?",
-                            "How long will this take?",
-                            "What could go wrong?",
-                        ]
+                        _SUGGESTIONS = (
+                            [
+                                "It's a plastic push-fit fitting",
+                                "The wall is plasterboard",
+                                "There's no sign of damp",
+                                "The pipe is copper",
+                                "Can I describe this instead?",
+                            ]
+                            if is_clarif_mode else
+                            [
+                                "What tools do I need?",
+                                "Is this safe to DIY?",
+                                "How long will this take?",
+                                "What could go wrong?",
+                                "How is confidence calculated?",
+                            ]
+                        )
+
+                        async def _reanalyse_from_chat(text_context: str = ""):
+                            """Trigger the official Re-analyse then reload into the running/polling flow.
+
+                            text_context is passed to the analysis endpoint so Stage 1 can
+                            incorporate clarification answers.  The manual button calls this
+                            with no args (empty string); auto-reanalysis passes the joined answers.
+                            """
+                            try:
+                                body = {"text_context": text_context} if text_context else {}
+                                async with httpx.AsyncClient() as c:
+                                    r = await c.post(
+                                        f"{API}/cases/{case_id}/analyse",
+                                        json=body,
+                                        headers={"Authorization": f"Bearer {token}"},
+                                        timeout=30.0,
+                                    )
+                                if r.status_code in (200, 202):
+                                    ui.run_javascript("window.location.reload()")
+                                else:
+                                    ui.notify(f"Could not start re-analysis ({r.status_code}).",
+                                              type="negative", position="top-right")
+                            except Exception:
+                                ui.notify("Could not reach the backend.",
+                                          type="negative", position="top-right")
+
+                        async def _new_case_from_photo(image_ids, trade):
+                            """Spawn a new case from a chat photo (different repair) and go to it."""
+                            try:
+                                async with httpx.AsyncClient() as c:
+                                    r = await c.post(
+                                        f"{API}/cases/{case_id}/chat/spawn-case",
+                                        json={"image_ids": image_ids, "apparent_trade": trade},
+                                        headers={"Authorization": f"Bearer {token}"},
+                                        timeout=30.0,
+                                    )
+                                if r.status_code == 200:
+                                    ui.navigate.to(f"/cases/{r.json().get('case_id')}")
+                                else:
+                                    ui.notify(f"Could not create a new case ({r.status_code}).",
+                                              type="negative", position="top-right")
+                            except Exception:
+                                ui.notify("Could not reach the backend.",
+                                          type="negative", position="top-right")
+
+                        def _render_followup_action(meta):
+                            """Contextual action under an assistant reply about an attached photo."""
+                            if not isinstance(meta, dict):
+                                return
+                            verdict = meta.get("followup_verdict")
+                            if verdict == "same":
+                                ui.button("Re-analyse with this photo",
+                                          on_click=lambda: _reanalyse_from_chat()) \
+                                    .props("outline color=primary size=sm icon=autorenew") \
+                                    .style("margin:0 0 6px;font-size:0.74rem;font-weight:600;")
+                            elif verdict == "different":
+                                _ids = meta.get("image_ids") or []
+                                _trade = meta.get("apparent_trade") or ""
+                                ui.button("Start a new case with this photo",
+                                          on_click=lambda i=_ids, t=_trade: _new_case_from_photo(i, t)) \
+                                    .props("outline color=primary size=sm icon=add_circle") \
+                                    .style("margin:0 0 6px;font-size:0.74rem;font-weight:600;")
+                            elif verdict == "not_repair":
+                                # The attached photo is not a DIY / repair subject (e.g. a document,
+                                # screenshot, person, food, landscape). The backend already detected
+                                # this and the assistant's reply explains it; the UI adds an explicit
+                                # amber notice + a one-click way to choose a different photo, so the
+                                # user always has a clear next step instead of just prose.
+                                ui.html(
+                                    '<div style="display:flex;align-items:center;gap:8px;'
+                                    'background:#fef3c7;border:1px solid #fcd34d;color:#92400e;'
+                                    'border-radius:8px;padding:8px 12px;margin:2px 0 8px;'
+                                    'font-size:0.78rem;font-weight:600;line-height:1.4;">'
+                                    '<span style="font-size:0.95rem;flex-shrink:0;">&#9888;</span>'
+                                    '<span>This does not look like a DIY repair photo. '
+                                    'Knitra can only help with repair and maintenance issues.</span>'
+                                    '</div>'
+                                )
+                                ui.button("Upload a different photo",
+                                          on_click=lambda: ui.run_javascript(
+                                              "(function(){"
+                                              "var el=document.getElementById('knitra-chat-file');"
+                                              "if(el){el.click();}"
+                                              "})()"
+                                          )) \
+                                    .props("outline color=primary size=sm icon=image") \
+                                    .style("margin:0 0 6px;font-size:0.74rem;font-weight:600;")
 
                         def _render_messages(msgs: list):
                             chat_messages.clear()
@@ -2442,9 +3281,59 @@ async def case_detail_page(case_id: int):
                                             )
                                 else:
                                     for msg in msgs:
-                                        cls = ("chat-bubble-user" if msg["role"] == "user"
-                                               else "chat-bubble-assistant")
-                                        ui.html(f'<div class="{cls}">{msg["content"]}</div>')
+                                        if msg["role"] == "user":
+                                            md = msg.get("msg_metadata") or {}
+                                            paths = md.get("image_paths") or []
+                                            srcs = [f"{BACKEND}/static/uploads/{p}" for p in paths]
+                                            ui.html(_chat_user_html(msg["content"], srcs))
+                                        else:
+                                            ui.html(
+                                                f'<div class="chat-bubble-assistant">'
+                                                f'{msg["content"]}</div>'
+                                            )
+                                            _render_followup_action(msg.get("msg_metadata"))
+
+                                    # Refresh recovery: if the last message is a user bubble
+                                    # with no following assistant reply, the previous send was
+                                    # cut short (page reload, navigation, network hiccup).
+                                    # The user message + photo are persisted server-side and
+                                    # already visible above; surface a clear notice + retry
+                                    # button so the user has an actionable next step instead
+                                    # of silent uncertainty.
+                                    last = msgs[-1]
+                                    if last.get("role") == "user":
+                                        _had_photo = bool(
+                                            (last.get("msg_metadata") or {}).get("image_paths")
+                                        )
+                                        _label = ("Your last message and photo were saved, but "
+                                                  "Knitra did not finish replying (the page "
+                                                  "refreshed mid-thought). Tap to ask again."
+                                                  if _had_photo else
+                                                  "Your last message was saved, but Knitra did "
+                                                  "not finish replying (the page refreshed mid"
+                                                  "-thought). Tap to ask again.")
+                                        ui.html(
+                                            '<div style="display:flex;align-items:center;gap:8px;'
+                                            'background:#eef2ff;border:1px solid #c7d2fe;'
+                                            'color:#3730a3;border-radius:8px;padding:8px 12px;'
+                                            'margin:2px 0 8px;font-size:0.78rem;font-weight:500;'
+                                            'line-height:1.45;">'
+                                            '<span style="font-size:0.95rem;flex-shrink:0;">'
+                                            '&#128172;</span>'
+                                            f'<span>{_label}</span></div>'
+                                        )
+                                        _last_content = last.get("content") or ""
+                                        _last_img_ids = (last.get("msg_metadata") or {}).get(
+                                            "image_ids"
+                                        ) or []
+                                        ui.button(
+                                            "Ask Knitra again",
+                                            on_click=lambda t=_last_content,
+                                                          i=list(_last_img_ids):
+                                                _resume_after_refresh(t, i),
+                                        ).props("outline color=primary size=sm icon=replay") \
+                                          .style("margin:0 0 6px;font-size:0.74rem;"
+                                                 "font-weight:600;")
 
                         async def _load_chat():
                             try:
@@ -2478,11 +3367,11 @@ async def case_detail_page(case_id: int):
                                 "display:flex;align-items:center;gap:6px;"
                                 "margin-bottom:8px;"
                             ):
-                                # Mic button — SVG microphone icon, class gives hover + active styles
+                                # Mic button, SVG microphone icon, class gives hover + active styles
                                 ui.html(
                                     '<button id="knitra-chat-mic" '
                                     'onclick="knitraChatToggleVoice()" '
-                                    'title="Voice input — tap and speak" '
+                                    'title="Voice input, tap and speak" '
                                     'class="fixly-icon-btn">'
                                     '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"'
                                     ' viewBox="0 0 24 24" fill="none" stroke="currentColor"'
@@ -2493,7 +3382,7 @@ async def case_detail_page(case_id: int):
                                     '</svg>'
                                     '</button>'
                                 )
-                                # Attach button — paperclip SVG icon, triggers hidden file input
+                                # Attach button, paperclip SVG icon, triggers hidden file input
                                 ui.html(
                                     '<button onclick="document.getElementById(\'knitra-chat-file\').click()" '
                                     'title="Attach a photo to this case" '
@@ -2509,12 +3398,22 @@ async def case_detail_page(case_id: int):
                                     'accept="image/*,video/*" multiple style="display:none" '
                                     'onchange="knitraChatUpload(this)">'
                                 )
-                                # Status line (voice recording / upload feedback)
+                                # Status line (voice recording / upload feedback) -
+                                # JS turns this into a coloured pill per state.
                                 ui.html(
                                     '<span id="knitra-chat-status" '
-                                    'style="font-size:0.78rem;color:#94a3b8;'
-                                    'margin-left:4px;"></span>'
+                                    'class="knitra-status-pill" '
+                                    'style="display:none;margin-left:4px;"></span>'
                                 )
+
+                            # Persistent attachment area, lives ABOVE the textarea and
+                            # survives chat re-renders. JS (_chatRenderAttachments) repaints
+                            # it from window._knitraPendingAttachments after every render,
+                            # so queued photos never silently vanish.
+                            ui.html(
+                                '<div id="knitra-chat-attachments" '
+                                'class="knitra-attach-wrap" style="display:none;"></div>'
+                            )
 
                             # Textarea + Send row
                             with ui.element("div").style(
@@ -2526,10 +3425,31 @@ async def case_detail_page(case_id: int):
                                  .style("flex:1;font-size:0.875rem;") \
                                  .classes("knitra-chat-textarea")
 
-                                send_btn = ui.button("Send", on_click=lambda: asyncio.create_task(_send_chat())) \
+                                send_btn = ui.button("Send", on_click=lambda: _send_chat()) \
                                     .props("unelevated color=primary") \
                                     .style("font-weight:600;flex-shrink:0;") \
                                     .classes("knitra-send-btn")
+
+                        # ── Clarification Re-analyse CTA ──────────────────────
+                        # Shown only in clarification output-mode so the user
+                        # has a clear "I've answered, now what?" action.
+                        if is_clarif_mode:
+                            with ui.element("div").style(
+                                "padding:0 20px 14px;"
+                                "display:flex;align-items:center;gap:10px;"
+                            ):
+                                ui.html(
+                                    '<div style="font-size:0.78rem;color:#64748b;flex:1;">'
+                                    'Knitra will automatically re-analyse once the required '
+                                    'questions are answered. Use the button if you prefer '
+                                    'to trigger it manually.'
+                                    '</div>'
+                                )
+                                ui.button(
+                                    "Re-analyse with answers",
+                                    on_click=_reanalyse_from_chat,
+                                ).props("outline color=primary size=sm icon=autorenew") \
+                                 .style("font-size:0.74rem;font-weight:700;flex-shrink:0;")
 
                         # Enter-to-send: JS intercepts Enter (not Shift+Enter)
                         # and clicks the Send button so Python handles the send.
@@ -2547,7 +3467,24 @@ async def case_detail_page(case_id: int):
                             })();
                         """)
 
+                        _busy = {"v": False}   # in-flight guard (mutable cell, no nonlocal needed)
+
                         async def _send_chat():
+                            # Re-entrancy guard: ignore double-clicks / Enter while a reply is
+                            # still in flight, and show the Send button as loading + disabled.
+                            if _busy["v"]:
+                                return
+                            _busy["v"] = True
+                            send_btn.props("loading")
+                            send_btn.disable()
+                            try:
+                                await _do_send()
+                            finally:
+                                _busy["v"] = False
+                                send_btn.props(remove="loading")
+                                send_btn.enable()
+
+                        async def _do_send():
                             # Primary: read from NiceGUI-synced value
                             content = chat_input.value.strip()
 
@@ -2578,10 +3515,8 @@ async def case_detail_page(case_id: int):
                                 except Exception:
                                     pass
 
-                            if not content:
-                                return
-
-                            # Collect any pending image IDs and clear them atomically
+                            # Collect any pending image IDs first, so an image-only send
+                            # (no typed text, just an attached photo) is also valid.
                             image_ids: list[int] = []
                             try:
                                 raw_ids = await ui.run_javascript(
@@ -2593,77 +3528,205 @@ async def case_detail_page(case_id: int):
                             except Exception:
                                 pass
 
+                            # Bail out ONLY if there is nothing to send at all.
+                            # Either a typed message OR at least one attached photo is enough.
+                            if not content and not image_ids:
+                                return
+
+                            # If the user only attached a photo (no text), use a short implicit
+                            # prompt so the assistant has something to react to. Shown in the
+                            # user bubble too, so the message thread reads naturally.
+                            if not content and image_ids:
+                                content = "Please look at this photo."
+
+                            # Capture attachment thumbnails (data URLs) BEFORE clearing the
+                            # chips, so the sent message can show the actual photo immediately.
+                            image_dataurls: list[str] = []
+                            if image_ids:
+                                try:
+                                    raw_urls = await ui.run_javascript(
+                                        "(window._knitraPendingAttachments||[])"
+                                        ".map(function(a){return a.dataUrl||'';})",
+                                        timeout=2.0,
+                                    )
+                                    if isinstance(raw_urls, list):
+                                        image_dataurls = [str(u) for u in raw_urls if u]
+                                except Exception:
+                                    pass
+
                             chat_input.set_value("")
-                            # Clear JS-side state + toolbar status/thumbs strip
+                            # Clear JS-side state: transcript, queued image IDs, the
+                            # persistent attachment chips, and the status pill.
                             await ui.run_javascript(
                                 "window._knitraTranscribedText = '';"
-                                "window._knitraPendingImageIds = [];"
+                                "window._knitraChatStatusState = null;"
+                                "if(window._chatClearAttachments)window._chatClearAttachments();"
                                 "var _st=document.getElementById('knitra-chat-status');"
-                                "if(_st)_st.textContent='';"
-                                "var _th=document.getElementById('knitra-chat-thumbs');"
-                                "if(_th)_th.innerHTML='';"
+                                "if(_st){_st.style.display='none';_st.textContent='';}"
                             )
 
                             with chat_messages:
-                                # Show attachment notice if photos were attached
-                                if image_ids:
-                                    n = len(image_ids)
-                                    noun = "photo" if n == 1 else "photos"
-                                    ui.html(
-                                        f'<div class="chat-bubble-user" '
-                                        f'style="font-style:italic;opacity:0.75;">'
-                                        f'&#128247; You attached {n} {noun}</div>'
-                                    )
-                                ui.html(
-                                    f'<div class="chat-bubble-user">{content}</div>'
-                                )
+                                # User bubble with any attached photo thumbnails inline.
+                                ui.html(_chat_user_html(content, image_dataurls))
+                                # Image-aware loading state. For an image send we cycle through
+                                # step-by-step labels (vision pass -> case comparison -> reply
+                                # composition) so the user sees Knitra is actively progressing,
+                                # not idling. The interval is cleared when the first reply token
+                                # arrives (see "typing.delete()" further down).
+                                _think = ("&#128247; Looking at your photo&#8230;" if image_ids
+                                          else "Knitra is thinking&#8230;")
                                 typing = ui.html(
-                                    '<div class="chat-bubble-typing">'
-                                    'Knitra is thinking&#8230;</div>'
+                                    f'<div id="knitra-chat-typing" '
+                                    f'class="chat-bubble-typing">{_think}</div>'
+                                )
+                            if image_ids:
+                                # Rotate labels every 3.5s so the wait feels purposeful.
+                                # innerText is read each tick to avoid stale closures.
+                                await ui.run_javascript(
+                                    "(function(){"
+                                    "  var labels = ["
+                                    "    '\\uD83D\\uDCF7 Looking at your photo\\u2026',"
+                                    "    '\\uD83D\\uDD0D Comparing with your case\\u2026',"
+                                    "    '\\uD83D\\uDCAD Thinking about a reply\\u2026'"
+                                    "  ];"
+                                    "  var i = 0;"
+                                    "  if (window._knitraChatProgressInt) {"
+                                    "    clearInterval(window._knitraChatProgressInt);"
+                                    "  }"
+                                    "  window._knitraChatProgressInt = setInterval(function(){"
+                                    "    var el = document.getElementById('knitra-chat-typing');"
+                                    "    if (!el) {"
+                                    "      clearInterval(window._knitraChatProgressInt);"
+                                    "      window._knitraChatProgressInt = null;"
+                                    "      return;"
+                                    "    }"
+                                    "    i = (i + 1) % labels.length;"
+                                    "    el.innerHTML = labels[i];"
+                                    "  }, 3500);"
+                                    "})()"
                                 )
 
+                            # Stream the reply token-by-token for a live "typing" effect.
+                            # The stream ends with a '\x1e<json>' sentinel carrying the
+                            # follow-up verdict metadata (for the action button).
                             try:
-                                async with httpx.AsyncClient() as c:
-                                    r = await c.post(
-                                        f"{API}/cases/{case_id}/chat",
+                                raw = ""
+                                meta = {}
+                                assistant_bubble = None
+                                _i = 0
+                                async with httpx.AsyncClient(timeout=120.0) as c:
+                                    async with c.stream(
+                                        "POST",
+                                        f"{API}/cases/{case_id}/chat/stream",
                                         json={"content": content, "image_ids": image_ids},
                                         headers={"Authorization": f"Bearer {token}"},
-                                        timeout=120.0,
+                                    ) as resp:
+                                        if resp.status_code != 200:
+                                            await resp.aread()
+                                            raise RuntimeError(f"stream status {resp.status_code}")
+                                        async for chunk in resp.aiter_text():
+                                            if not chunk:
+                                                continue
+                                            raw += chunk
+                                            _vis = _clean_chat(raw.split("\x1e", 1)[0])
+                                            if not _vis:
+                                                continue   # nothing visible yet (sentinel only)
+                                            if assistant_bubble is None:
+                                                # First visible token: swap the thinking dots
+                                                # for the reply bubble (keeps "thinking" during
+                                                # the model-load latency).
+                                                try:
+                                                    typing.delete()
+                                                except Exception:
+                                                    pass
+                                                # Stop the per-step progress label rotation.
+                                                await ui.run_javascript(
+                                                    "if(window._knitraChatProgressInt){"
+                                                    "clearInterval(window._knitraChatProgressInt);"
+                                                    "window._knitraChatProgressInt=null;}"
+                                                )
+                                                with chat_messages:
+                                                    assistant_bubble = ui.html(
+                                                        '<div class="chat-bubble-assistant"></div>'
+                                                    )
+                                            _i += 1
+                                            if _i % 2 == 0:   # throttle UI repaints
+                                                assistant_bubble.set_content(
+                                                    f'<div class="chat-bubble-assistant">{_vis}</div>'
+                                                )
+                                # Final paint + follow-up action from the metadata sentinel.
+                                _text, _, _metajson = raw.partition("\x1e")
+                                _final = _clean_chat(_text) or "(no response)"
+                                if assistant_bubble is None:
+                                    try:
+                                        typing.delete()
+                                    except Exception:
+                                        pass
+                                    await ui.run_javascript(
+                                        "if(window._knitraChatProgressInt){"
+                                        "clearInterval(window._knitraChatProgressInt);"
+                                        "window._knitraChatProgressInt=null;}"
                                     )
-                                typing.delete()
-                                if r.status_code == 200:
-                                    reply = r.json()
                                     with chat_messages:
-                                        ui.html(
-                                            f'<div class="chat-bubble-assistant">'
-                                            f'{reply["content"]}</div>'
+                                        assistant_bubble = ui.html(
+                                            '<div class="chat-bubble-assistant"></div>'
                                         )
-                                elif r.status_code == 503:
+                                assistant_bubble.set_content(
+                                    f'<div class="chat-bubble-assistant">{_final}</div>'
+                                )
+                                try:
+                                    meta = json.loads(_metajson) if _metajson.strip() else {}
+                                except Exception:
+                                    meta = {}
+                                with chat_messages:
+                                    _render_followup_action(meta)
+
+                                # Auto-reanalysis: backend confirmed all clarification
+                                # questions are answered — show acknowledgement, pause
+                                # so the user can read it, then fire.
+                                if meta.get("auto_reanalyse"):
                                     with chat_messages:
                                         ui.html(
                                             '<div class="chat-bubble-assistant" '
-                                            'style="color:#dc2626;">'
-                                            'AI model unavailable &#8212; '
-                                            'is Ollama running?</div>'
+                                            'style="background:#f0fdf4;border:1px solid #86efac;'
+                                            'font-style:italic;color:#166534;">'
+                                            'Thanks &#8212; I now have enough information to '
+                                            'continue. Re-analysing your case using your '
+                                            'answers&#8230;'
+                                            '</div>'
                                         )
-                                else:
-                                    with chat_messages:
-                                        ui.html(
-                                            f'<div class="chat-bubble-assistant" '
-                                            f'style="color:#dc2626;">'
-                                            f'Error {r.status_code}</div>'
-                                        )
+                                    await asyncio.sleep(2.0)
+                                    await _reanalyse_from_chat(
+                                        text_context=meta.get("auto_reanalysis_context", "")
+                                    )
                             except Exception:
-                                typing.delete()
+                                try:
+                                    typing.delete()
+                                except Exception:
+                                    pass
+                                await ui.run_javascript(
+                                    "if(window._knitraChatProgressInt){"
+                                    "clearInterval(window._knitraChatProgressInt);"
+                                    "window._knitraChatProgressInt=null;}"
+                                )
                                 with chat_messages:
                                     ui.html(
                                         '<div class="chat-bubble-assistant" '
                                         'style="color:#dc2626;">'
-                                        'Cannot reach the backend.</div>'
+                                        'Cannot reach the backend. Your message is back in the box, '
+                                        'press Send to retry.</div>'
                                     )
+                                chat_input.set_value(content)
 
-                        # Chat mic + photo upload JS (scoped to chat, not the new-case form)
-                        ui.add_body_html("""<script>
+                        # Chat mic + photo upload JS (scoped to chat, not the new-case form).
+                        #
+                        # MUST be ui.run_javascript, NOT ui.add_body_html. A <script> added via
+                        # ui.add_body_html() is injected into the DOM but the browser never
+                        # executes it, so knitraChatToggleVoice / knitraChatUpload stayed
+                        # undefined and the mic + paperclip silently did nothing. run_javascript
+                        # executes on the client (the same proven mechanism that sets
+                        # _knitraCaseId / _knitraToken above); the guard below keeps setup once.
+                        ui.run_javascript("""
 (function() {
   // Guard: only inject once even if chat section is rebuilt
   if (window._knitraChatJsReady) return;
@@ -2672,24 +3735,56 @@ async def case_detail_page(case_id: int):
   window._knitraChatRecorder    = null;
   window._knitraChatAudio       = [];
   window._knitraChatTimerInt    = null;   // interval ID for the recording clock
-  window._knitraTranscribedText = '';     // last mic transcription — read by Python _send_chat
+  window._knitraTranscribedText = '';     // last mic transcription, read by Python _send_chat
   window._knitraPendingImageIds = [];     // upload IDs queued for next chat send
+  // Canonical attachment state. Survives chat re-renders so queued photos never
+  // silently vanish. Each item: {id, name, dataUrl, status}  status ∈ uploading|ready|failed
+  window._knitraPendingAttachments = [];
+  // Sticky status so a chat re-render can restore the last message/state.
+  window._knitraChatStatusState = null;   // {msg, kind}  kind ∈ recording|busy|ok|warn|error
 
-  function _chatStatus(msg, color) {
+  // ── Status pill ───────────────────────────────────────────────────────────
+  // One prominent, colour-coded pill instead of a faint grey text node, so the
+  // user cannot miss recording / transcribing / success / failure feedback.
+  const _STATUS_STYLE = {
+    recording: 'background:#fee2e2;color:#b91c1c;',
+    busy:      'background:#e0f2fe;color:#0369a1;',
+    ok:        'background:#dcfce7;color:#15803d;',
+    warn:      'background:#fef9c3;color:#854d0e;',
+    error:     'background:#fee2e2;color:#b91c1c;',
+  };
+  function _chatStatus(msg, kind, sticky) {
+    window._knitraChatStatusState = msg ? { msg: msg, kind: kind || 'busy' } : null;
+    _chatPaintStatus();
+    if (!sticky && msg && (kind === 'ok' || kind === 'warn')) {
+      setTimeout(function() {
+        // Only clear if this exact message is still showing
+        const st = window._knitraChatStatusState;
+        if (st && st.msg === msg) { _chatStatus('', null); }
+      }, 4500);
+    }
+  }
+  function _chatPaintStatus() {
     const el = document.getElementById('knitra-chat-status');
-    if (el) { el.textContent = msg; el.style.color = color || '#94a3b8'; }
+    if (!el) return;
+    const st = window._knitraChatStatusState;
+    if (!st || !st.msg) { el.style.display = 'none'; el.textContent = ''; return; }
+    el.textContent = st.msg;
+    el.style.cssText = 'display:inline-flex;margin-left:4px;' +
+      (_STATUS_STYLE[st.kind] || _STATUS_STYLE.busy);
+    el.className = 'knitra-status-pill';
   }
 
+  // ── Recording timer ───────────────────────────────────────────────────────
   function _chatTimerStart() {
     let secs = 0;
     window._knitraChatTimerInt = setInterval(function() {
       secs++;
       const m = Math.floor(secs / 60).toString().padStart(2, '0');
       const s = (secs % 60).toString().padStart(2, '0');
-      _chatStatus('Recording ' + m + ':' + s + ' — tap mic to stop', '#6366f1');
+      _chatStatus('\\u25CF Recording ' + m + ':' + s + ', tap mic to stop', 'recording', true);
     }, 1000);
   }
-
   function _chatTimerStop() {
     if (window._knitraChatTimerInt) {
       clearInterval(window._knitraChatTimerInt);
@@ -2697,35 +3792,73 @@ async def case_detail_page(case_id: int):
     }
   }
 
-  // Show small thumbnails below the toolbar when photos are attached to the chat
-  function _chatShowThumbs(files) {
-    let strip = document.getElementById('knitra-chat-thumbs');
-    if (!strip) {
-      strip = document.createElement('div');
-      strip.id = 'knitra-chat-thumbs';
-      strip.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;';
-      const statusEl = document.getElementById('knitra-chat-status');
-      if (statusEl && statusEl.parentNode) {
-        statusEl.parentNode.insertBefore(strip, statusEl.nextSibling);
-      }
-    }
-    strip.innerHTML = '';
-    files.forEach(function(file) {
-      const url = URL.createObjectURL(file);
-      const img = document.createElement('img');
-      img.src = url;
-      img.style.cssText = 'width:48px;height:48px;object-fit:cover;border-radius:6px;' +
-                           'border:1.5px solid #bbf7d0;flex-shrink:0;';
-      img.onload = function() { URL.revokeObjectURL(url); };
-      strip.appendChild(img);
+  // ── Attachment chips (persistent, repainted after every chat render) ───────
+  window._chatRenderAttachments = function() {
+    const wrap = document.getElementById('knitra-chat-attachments');
+    if (!wrap) return;
+    const atts = window._knitraPendingAttachments || [];
+    if (!atts.length) { wrap.style.display = 'none'; wrap.innerHTML = ''; return; }
+    wrap.style.display = 'flex';
+    const n = atts.length;
+    let html = '<div class="knitra-attach-head">' +
+      '\\uD83D\\uDCCE ' + n + ' ' + (n === 1 ? 'photo' : 'photos') +
+      ' will be sent with your next message</div><div class="knitra-attach-strip">';
+    atts.forEach(function(a, i) {
+      const stateTxt = a.status === 'uploading' ? '\\u23F3 Uploading…'
+        : a.status === 'failed' ? '\\u26A0\\uFE0F Failed'
+        : '\\u2714 Ready to send';
+      const stateColor = a.status === 'uploading' ? '#0369a1'
+        : a.status === 'failed' ? '#b91c1c' : '#15803d';
+      html += '<div class="knitra-attach-chip">' +
+        (a.dataUrl ? '<img src="' + a.dataUrl + '" alt="">' : '') +
+        '<div class="knitra-attach-meta">' +
+          '<span class="knitra-attach-name" title="' + (a.name || 'photo') + '">' +
+            (a.name || 'photo') + '</span>' +
+          '<span class="knitra-attach-state" style="color:' + stateColor + ';">' +
+            stateTxt + '</span>' +
+        '</div>' +
+        '<button class="knitra-attach-x" title="Remove" ' +
+          'onclick="window._chatRemoveAttachment(' + i + ')">\\u00D7</button>' +
+      '</div>';
     });
-  }
+    html += '</div>';
+    wrap.innerHTML = html;
+  };
 
-  function _chatClearThumbs() {
-    const strip = document.getElementById('knitra-chat-thumbs');
-    if (strip) strip.innerHTML = '';
-  }
+  window._chatRemoveAttachment = function(idx) {
+    const atts = window._knitraPendingAttachments || [];
+    const a = atts[idx];
+    if (!a) return;
+    atts.splice(idx, 1);
+    // Keep the id list in sync so the removed photo is not sent
+    if (a.id != null) {
+      window._knitraPendingImageIds = (window._knitraPendingImageIds || [])
+        .filter(function(x) { return x !== a.id; });
+    }
+    window._chatRenderAttachments();
+    if (!atts.length) { _chatStatus('', null); }
+  };
 
+  // Clear everything queued (called by Python after a successful send)
+  window._chatClearAttachments = function() {
+    window._knitraPendingAttachments = [];
+    window._knitraPendingImageIds = [];
+    window._chatRenderAttachments();
+  };
+
+  // Repaint persistent UI after a chat re-render (called from Python).
+  window._knitraRepaintChat = function() {
+    _chatPaintStatus();
+    window._chatRenderAttachments();
+    // Restore the live recording highlight on the (newly recreated) mic button
+    const btn = document.getElementById('knitra-chat-mic');
+    if (btn && window._knitraChatRecorder &&
+        window._knitraChatRecorder.state === 'recording') {
+      btn.classList.add('recording');
+    }
+  };
+
+  // ── Voice input ────────────────────────────────────────────────────────────
   window.knitraChatToggleVoice = async function() {
     const btn = document.getElementById('knitra-chat-mic');
 
@@ -2739,7 +3872,7 @@ async def case_detail_page(case_id: int):
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (err) {
-      _chatStatus('Mic blocked — allow access in browser settings.', '#dc2626');
+      _chatStatus('\\uD83C\\uDFA4 Mic blocked, allow access in browser settings.', 'error', true);
       return;
     }
 
@@ -2758,10 +3891,14 @@ async def case_detail_page(case_id: int):
     rec.onstop = async function() {
       _chatTimerStop();
       stream.getTracks().forEach(t => t.stop());
-      if (btn) { btn.classList.remove('active'); }
+      const mb = document.getElementById('knitra-chat-mic');
+      if (mb) { mb.classList.remove('recording'); }
       const blob = new Blob(window._knitraChatAudio, { type: mime || 'audio/webm' });
-      if (blob.size < 1000) { _chatStatus('Nothing recorded — try again.', '#94a3b8'); return; }
-      _chatStatus('Transcribing…', '#0369a1');
+      if (blob.size < 1000) {
+        _chatStatus('\\uD83C\\uDFA4 Nothing recorded, try again.', 'warn');
+        return;
+      }
+      _chatStatus('\\u23F3 Transcribing your voice…', 'busy', true);
       const fd = new FormData();
       fd.append('audio', blob, 'recording.webm');
       try {
@@ -2772,7 +3909,7 @@ async def case_detail_page(case_id: int):
         });
         if (!resp.ok) throw new Error('Server error ' + resp.status);
         const { text } = await resp.json();
-        if (text) {
+        if (text && text.trim()) {
           const trimmed = text.trim();
           // 1. Store in window variable so Python _send_chat() can read it as fallback
           window._knitraTranscribedText = (window._knitraTranscribedText
@@ -2781,47 +3918,69 @@ async def case_detail_page(case_id: int):
           const ta = document.querySelector('.knitra-chat-textarea textarea');
           if (ta) {
             ta.value = (ta.value ? ta.value.trimEnd() + ' ' : '') + trimmed;
-            // Dispatch both 'input' and 'change' — Quasar listens to 'input'
+            // Dispatch both 'input' and 'change', Quasar listens to 'input'
             ta.dispatchEvent(new Event('input', { bubbles: true }));
             ta.dispatchEvent(new Event('change', { bubbles: true }));
             ta.focus();
+            // Brief green flash so the user SEES the words land in the box
+            const field = ta.closest('.knitra-chat-textarea');
+            if (field) {
+              field.classList.remove('knitra-text-flash');
+              void field.offsetWidth;              // restart the animation
+              field.classList.add('knitra-text-flash');
+            }
           }
-          _chatStatus('✔ Transcribed — press Send', '#15803d');
-          setTimeout(function() { _chatStatus('', ''); }, 4000);
+          _chatStatus('\\u2714 Added to your message, review and press Send', 'ok');
         } else {
-          _chatStatus('Nothing heard — try again.', '#94a3b8');
+          _chatStatus('\\uD83C\\uDFA4 Nothing heard, try speaking again.', 'warn');
         }
       } catch(err) {
-        _chatStatus('Transcription failed: ' + err.message, '#dc2626');
+        _chatStatus('\\u26A0\\uFE0F Transcription failed: ' + err.message, 'error', true);
       }
     };
 
     rec.start(200);
-    if (btn) { btn.classList.add('active'); }
-    _chatStatus('Recording 00:00 — tap mic to stop', '#6366f1');
+    if (btn) { btn.classList.add('recording'); btn.title = 'Recording, tap to stop'; }
+    _chatStatus('\\u25CF Recording 00:00, tap mic to stop', 'recording', true);
     _chatTimerStart();
   };
 
+  // ── Photo attachment ────────────────────────────────────────────────────────
   window.knitraChatUpload = async function(input) {
     const files = Array.from(input.files);
     if (!files.length) return;
     const caseId = window._knitraCaseId;
     const token  = window._knitraToken;
-    if (!caseId || !token) { _chatStatus('Upload error: not authenticated.', '#dc2626'); return; }
-
-    // Show thumbnails immediately for instant confirmation
-    _chatShowThumbs(files);
-    _chatStatus('Uploading ' + files.length + ' file' + (files.length > 1 ? 's' : '') + '…', '#0369a1');
-
-    // Ensure pending ID list exists
-    if (!Array.isArray(window._knitraPendingImageIds)) {
-      window._knitraPendingImageIds = [];
+    if (!caseId || !token) {
+      _chatStatus('\\u26A0\\uFE0F Upload error: not signed in.', 'error', true);
+      return;
     }
+    if (!Array.isArray(window._knitraPendingImageIds)) window._knitraPendingImageIds = [];
+    if (!Array.isArray(window._knitraPendingAttachments)) window._knitraPendingAttachments = [];
+
+    _chatStatus('\\u23F3 Uploading ' + files.length +
+      ' file' + (files.length > 1 ? 's' : '') + '…', 'busy', true);
+
+    // Read each file to a data URL (persists across re-render) and show an
+    // "uploading" chip immediately, before the network round-trip completes.
+    const pending = [];
+    for (const file of files) {
+      const dataUrl = await new Promise(function(res) {
+        const fr = new FileReader();
+        fr.onload = function() { res(fr.result); };
+        fr.onerror = function() { res(''); };
+        fr.readAsDataURL(file);
+      });
+      const att = { id: null, name: file.name, dataUrl: dataUrl, status: 'uploading' };
+      window._knitraPendingAttachments.push(att);
+      pending.push({ file: file, att: att });
+    }
+    window._chatRenderAttachments();
 
     let ok = 0, failMsg = '';
-    for (const file of files) {
+    for (const p of pending) {
       const fd = new FormData();
-      fd.append('file', file);
+      fd.append('file', p.file);
       try {
         const resp = await fetch('http://127.0.0.1:8000/api/v1/cases/' + caseId + '/uploads', {
           method: 'POST',
@@ -2830,43 +3989,73 @@ async def case_detail_page(case_id: int):
         });
         if (resp.ok) {
           const data = await resp.json();
-          // Store the upload ID so _send_chat can forward it to Knitra
           if (data && data.id) {
             window._knitraPendingImageIds.push(data.id);
+            p.att.id = data.id;
           }
+          p.att.status = 'ready';
           ok++;
         } else if (resp.status === 413) {
-          failMsg = 'File too large (max 10 MB).';
+          p.att.status = 'failed'; failMsg = 'File too large (max 10 MB).';
         } else if (resp.status === 415) {
-          failMsg = 'Unsupported file type.';
+          p.att.status = 'failed'; failMsg = 'Unsupported file type.';
         } else {
-          failMsg = 'Server error ' + resp.status + '.';
+          p.att.status = 'failed'; failMsg = 'Server error ' + resp.status + '.';
         }
       } catch(e) {
-        failMsg = 'Network error — check connection.';
+        p.att.status = 'failed'; failMsg = 'Network error, check connection.';
       }
+      window._chatRenderAttachments();
     }
     input.value = '';  // reset so same file can be re-selected
     if (ok > 0) {
-      const noun = ok > 1 ? 'files' : 'file';
-      _chatStatus(ok + ' ' + noun + ' ready — press Send to ask Knitra ✔', '#15803d');
-      // Don't auto-clear status/thumbs — let user see what's queued until they send
+      const noun = ok > 1 ? 'photos' : 'photo';
+      _chatStatus('\\u2714 ' + ok + ' ' + noun +
+        ' attached, press Send to ask Knitra', 'ok', true);
     } else {
-      _chatClearThumbs();
-      _chatStatus(failMsg || 'Upload failed — check connection.', '#dc2626');
+      _chatStatus('\\u26A0\\uFE0F ' + (failMsg || 'Upload failed, check connection.'), 'error', true);
     }
   };
 })();
-</script>""")
+""")
 
                         async def _quick_send(text: str):
                             chat_input.set_value(text)
                             await _send_chat()
 
+                        async def _resume_after_refresh(text: str, image_ids: list):
+                            """Re-issue the last unanswered user message after a page reload.
+
+                            The user message + photo are already persisted server-side. Rather
+                            than re-uploading or re-persisting them, we push the same image_ids
+                            into the chat send pipeline so the assistant gets called with the
+                            identical inputs. Note: this creates a second user-message row with
+                            the same image_ids, the model sees both copies of the question. That
+                            is acceptable for a clear retry, and the original message remains
+                            visible above so the user is not confused about what they asked.
+                            """
+                            try:
+                                ids_json = json.dumps([int(x) for x in (image_ids or [])
+                                                       if str(x).isdigit()])
+                            except Exception:
+                                ids_json = "[]"
+                            await ui.run_javascript(
+                                f"window._knitraPendingImageIds = {ids_json};"
+                            )
+                            chat_input.set_value(text or "")
+                            await _send_chat()
+
                         await _load_chat()
 
+                        # Repaint persistent attachment chips + status pill so that
+                        # anything queued before this re-render reappears (a chat
+                        # refresh must never make attachments/feedback silently vanish).
+                        ui.run_javascript(
+                            "if(window._knitraRepaintChat)window._knitraRepaintChat();"
+                        )
+
             # Initial render of chat section based on current analysis state
-            await _render_chat_section(_analysis_complete)
+            await _render_chat_section(_initial_status)
 
             # ── Nearby Services placeholder ───────────────────────────────────
             with ui.element("div").style(
@@ -2901,7 +4090,7 @@ async def case_detail_page(case_id: int):
                             'line-height:1.65;margin:0 0 16px;">'
                             'Once AI identifies your repair type, we&#8217;ll surface '
                             'local plumbers, electricians, and tradespeople in your area '
-                            '&#8212; so you can get expert help when you need it.</p>'
+                            '- so you can get expert help when you need it.</p>'
                         )
                         ui.html(
                             '<div style="background:rgba(255,255,255,0.05);'
@@ -2916,7 +4105,7 @@ async def case_detail_page(case_id: int):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW CASE  (/new)  — composer-style quick-start flow
+# NEW CASE  (/new) , composer-style quick-start flow
 #
 # UX: single card with drop zone + thumbnail strip + text note + action bar.
 # Images are compressed client-side (JS Canvas, max 1024px, JPEG 82%) before
@@ -2986,7 +4175,7 @@ async def new_case_page():
       _fixlyRender();
     }
 
-    // ── Photo area renderer — single container, completely replaced each call ─
+    // ── Photo area renderer, single container, completely replaced each call ─
     // This avoids any show/hide race between separate DOM elements.
     function _fixlyRender() {
       const area  = document.getElementById('fixly-media-area');
@@ -3111,7 +4300,7 @@ async def new_case_page():
       } catch (err) {
         _fixlyVoiceMsg(
           err.name === 'NotAllowedError'
-            ? 'Microphone blocked — allow access in your browser and try again.'
+            ? 'Microphone blocked, allow access in your browser and try again.'
             : 'Could not access microphone: ' + err.message,
           'error'
         );
@@ -3142,7 +4331,7 @@ async def new_case_page():
 
         const blob = new Blob(window._fixlyAudio, { type: mime || 'audio/webm' });
         if (blob.size < 2000) {
-          _fixlyVoiceMsg('Nothing recorded — tap mic and speak, then tap again to stop.', 'info');
+          _fixlyVoiceMsg('Nothing recorded, tap mic and speak, then tap again to stop.', 'info');
           return;
         }
 
@@ -3171,7 +4360,7 @@ async def new_case_page():
             }
             _fixlyVoiceMsg('', '');          // clear on success
           } else {
-            _fixlyVoiceMsg('Nothing heard — try speaking more clearly or type instead.', 'info');
+            _fixlyVoiceMsg('Nothing heard, try speaking more clearly or type instead.', 'info');
           }
         } catch (err) {
           _fixlyVoiceMsg('Transcription failed: ' + err.message, 'error');
@@ -3191,7 +4380,7 @@ async def new_case_page():
         btn.title = 'Tap to stop recording';
       } else {
         btn.classList.remove('active');
-        btn.title = 'Voice input — tap and speak';
+        btn.title = 'Voice input, tap and speak';
       }
     }
 
@@ -3230,7 +4419,7 @@ async def new_case_page():
                 '<h1 style="font-size:1.6rem;font-weight:800;color:#0f172a;'
                 'margin:0 0 2px;letter-spacing:-0.02em;">Diagnose a repair</h1>'
                 '<p style="color:#94a3b8;font-size:0.875rem;margin:0;">'
-                'Snap a photo of the problem &#8212; Knitra identifies it and '
+                'Snap a photo of the problem, Knitra identifies it and '
                 'writes your repair guide automatically.</p>'
             )
 
@@ -3240,14 +4429,14 @@ async def new_case_page():
                 "border-radius:16px;overflow:hidden;"
                 "box-shadow:0 2px 12px rgba(0,0,0,0.04);"
             ):
-                # Hidden file input — label elements trigger it natively (no JS .click() needed)
+                # Hidden file input, label elements trigger it natively (no JS .click() needed)
                 ui.html(
                     '<input type="file" id="fixly-file-input" multiple accept="image/*"'
                     ' style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;"'
                     ' onchange="fixlyHandleFiles(this.files);this.value=\'\'">'
                 )
 
-                # Single media area — _fixlyRender() rewrites its innerHTML entirely.
+                # Single media area, _fixlyRender() rewrites its innerHTML entirely.
                 # Either shows the drop zone (empty) or the green attachment panel (photos selected).
                 ui.html('<div id="fixly-media-area"></div>')
 
@@ -3256,13 +4445,13 @@ async def new_case_page():
                     '<div style="height:1px;background:#f1f5f9;margin:16px 0 0;"></div>'
                 )
 
-                # ── Note textarea — plain HTML so voice can write into it ──────
+                # ── Note textarea, plain HTML so voice can write into it ──────
                 ui.html("""
                 <div style="padding:8px 16px 4px;">
                   <textarea
                     id="fixly-note"
                     rows="2"
-                    placeholder="Describe the issue (optional) — e.g. dripping pipe under the kitchen sink…"
+                    placeholder="Describe the issue (optional), e.g. dripping pipe under the kitchen sink…"
                     style="width:100%;box-sizing:border-box;border:none;outline:none;
                            resize:none;font-size:0.9rem;color:#334155;
                            font-family:inherit;background:transparent;
@@ -3274,7 +4463,7 @@ async def new_case_page():
                               min-height:14px;"></div>
                 </div>""")
 
-                # ── Bottom action bar — all pure HTML for reliable gesture handling
+                # ── Bottom action bar, all pure HTML for reliable gesture handling
                 ui.html("""
                 <div style="padding:10px 16px 14px;display:flex;
                             align-items:center;gap:8px;">
@@ -3300,7 +4489,7 @@ async def new_case_page():
                   <!-- Mic: native <button> → always a proper user gesture for getUserMedia -->
                   <button id="fixly-mic-btn" class="fixly-icon-btn"
                           onclick="fixlyToggleVoice()"
-                          title="Voice input — tap and speak">
+                          title="Voice input, tap and speak">
                     <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
                          viewBox="0 0 24 24" fill="none" stroke="currentColor"
                          stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -3310,7 +4499,7 @@ async def new_case_page():
                     </svg>
                   </button>
 
-                  <!-- Video — coming soon -->
+                  <!-- Video, coming soon -->
                   <div class="fixly-icon-btn-soon" title="Video support coming soon">
                     <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
                          viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -3324,7 +4513,7 @@ async def new_case_page():
                 </div>
                 """)
 
-                # Submit button — stays NiceGUI (no file/mic picker needed here)
+                # Submit button, stays NiceGUI (no file/mic picker needed here)
                 submit_btn = ui.button("Analyse →") \
                     .props("unelevated color=primary") \
                     .style(
@@ -3350,7 +4539,7 @@ async def new_case_page():
                 '</div>'
             )
 
-    # ── Handler — defined after UI so all element refs are in scope ───────────
+    # ── Handler, defined after UI so all element refs are in scope ───────────
     async def _start_diagnosis():
         import base64 as _b64
 
@@ -3402,7 +4591,7 @@ async def new_case_page():
             _lbls[k].classes(remove="step-pending step-active", add="step-done")
             _lbls[k].set_text(f"✓  {_texts[k]}")
 
-        # Step 1 — create case
+        # Step 1, create case
         _active("case")
         try:
             async with httpx.AsyncClient() as client:
@@ -3427,7 +4616,7 @@ async def new_case_page():
             submit_btn.props(remove="loading disable")
             return
 
-        # Step 2 — upload files (already compressed by JS)
+        # Step 2, upload files (already compressed by JS)
         _active("upload")
         uploaded = 0
         for i, f in enumerate(files):
@@ -3447,12 +4636,12 @@ async def new_case_page():
             except Exception:
                 pass
         if uploaded == 0:
-            err_label.set_text("Could not upload any photos — check your connection and try again.")
+            err_label.set_text("Could not upload any photos, check your connection and try again.")
             submit_btn.props(remove="loading disable")
             return
         _done("upload")
 
-        # Step 3 — trigger analysis
+        # Step 3, trigger analysis
         _active("analyse")
         text_ctx = (await ui.run_javascript("return fixlyGetNote()") or "").strip() or None
         try:
@@ -3479,7 +4668,7 @@ async def new_case_page():
     #  and causes a TimeoutError; a short timer fires once the connection exists.)
     async def _reset_js_store():
         """
-        Fires 400ms after page build — by then the WebSocket is open.
+        Fires 400ms after page build, by then the WebSocket is open.
         Resets the file list, exposes the auth token to JS (needed for the
         Whisper transcription fetch call), and renders the empty drop zone.
         """

@@ -1063,12 +1063,28 @@ async def cases_page():
                                                 f'align-items:center;gap:6px;">'
                                                 f'{_cat_html}{_conf_badge}</div>'
                                             )
-                                    ui.html(
-                                        f'<span style="background:{s["bg"]};color:{s["fg"]};'
-                                        f'padding:3px 11px;border-radius:100px;font-size:11.5px;'
-                                        f'font-weight:600;white-space:nowrap;flex-shrink:0;">'
-                                        f'{s["label"]}</span>'
-                                    )
+                                    with ui.element("div").style(
+                                        "display:flex;flex-direction:column;"
+                                        "align-items:flex-end;gap:4px;flex-shrink:0;"
+                                    ):
+                                        ui.html(
+                                            f'<span style="background:{s["bg"]};color:{s["fg"]};'
+                                            f'padding:3px 11px;border-radius:100px;font-size:11.5px;'
+                                            f'font-weight:600;white-space:nowrap;">'
+                                            f'{s["label"]}</span>'
+                                        )
+                                        # Awaiting Acknowledgement badge
+                                        if (
+                                            case.get("output_mode") == "assessment_first"
+                                            and not case.get("hazard_ack", False)
+                                        ):
+                                            ui.html(
+                                                '<span style="background:#fef3c7;color:#92400e;'
+                                                'border:1px solid #f59e0b;'
+                                                'padding:3px 11px;border-radius:100px;'
+                                                'font-size:11px;font-weight:600;white-space:nowrap;">'
+                                                '&#9888; Awaiting Acknowledgement</span>'
+                                            )
 
                                 ui.html(
                                     f'<span style="font-size:0.775rem;color:#cbd5e1;">'
@@ -1491,6 +1507,18 @@ async def case_detail_page(case_id: int):
                                     f'padding:4px 12px;border-radius:100px;'
                                     f'font-size:12px;font-weight:600;">{s["label"]}</span>'
                                 )
+                                # Awaiting Acknowledgement badge — assessment_first, unacknowledged
+                                if (
+                                    case.get("output_mode") == "assessment_first"
+                                    and not case.get("hazard_ack", False)
+                                ):
+                                    ui.html(
+                                        '<span style="background:#fef3c7;color:#92400e;'
+                                        'border:1px solid #f59e0b;'
+                                        'padding:4px 12px;border-radius:100px;'
+                                        'font-size:12px;font-weight:600;">'
+                                        '&#9888; Awaiting Acknowledgement</span>'
+                                    )
                                 ui.html(
                                     f'<span style="color:#cbd5e1;font-size:12px;">'
                                     f'Opened {case["created_at"][:10]}</span>'
@@ -2004,7 +2032,7 @@ async def case_detail_page(case_id: int):
                             f'</div>'
                         )
 
-            def _draw_assessment_first(sr: dict):
+            def _draw_assessment_first(sr: dict, hazard_ack: bool = False):
                 """Render the assessment-first output mode.
 
                 Only shows: diagnosis header + professional assessment banner,
@@ -2084,6 +2112,79 @@ async def case_detail_page(case_id: int):
                         f'</div></div></div>'
                     )
 
+                    # ── Safety responsibility notice ───────────────────────────
+                    ui.html(
+                        '<div style="display:flex;align-items:flex-start;gap:9px;'
+                        'background:#fff7ed;border:1px solid #fed7aa;'
+                        'border-radius:9px;padding:11px 13px;">'
+                        '<span style="font-size:0.95rem;flex-shrink:0;margin-top:1px;">&#9888;&#65039;</span>'
+                        '<p style="margin:0;font-size:0.78rem;color:#7c2d12;line-height:1.6;">'
+                        '<strong>Do not attempt this repair yourself.</strong> '
+                        'The AI has identified safety indicators that require a professional to assess '
+                        'the situation before any work is carried out. The guidance on this page is '
+                        'for information only. Proceeding without professional assessment may be '
+                        'dangerous. You are responsible for any actions you choose to take.'
+                        '</p></div>'
+                    )
+
+                    # ── Hazard acknowledgement gate ───────────────────────────
+                    # Shown once per case (stored permanently in the database).
+                    # If the user has already acknowledged, render all detail
+                    # sections immediately.  If not, show the acknowledgement
+                    # card and return early — detail sections are hidden until
+                    # the user clicks "I Understand".
+                    # On confirm: PATCH /cases/{case_id}/hazard-ack is called,
+                    # the page reloads, _draw_assessment_first re-runs with
+                    # hazard_ack=True and the detail sections render directly.
+                    if not hazard_ack:
+                        with ui.element("div").style(
+                            "background:white;border:1.5px solid #fecaca;"
+                            "border-radius:14px;padding:24px 26px;"
+                            "display:flex;flex-direction:column;gap:16px;"
+                            "box-shadow:0 1px 6px rgba(0,0,0,0.04);"
+                        ):
+                            ui.html(
+                                '<div style="font-size:1.05rem;font-weight:800;'
+                                'color:#0f172a;margin-bottom:2px;">'
+                                '&#9888;&#65039; This case has been flagged as hazardous</div>'
+                                '<div style="font-size:0.845rem;color:#334155;line-height:1.65;">'
+                                'The AI has identified indicators that make this repair unsuitable '
+                                'for DIY work. A professional assessment is recommended before '
+                                'anything is attempted.'
+                                '</div>'
+                                '<div style="font-size:0.845rem;color:#334155;line-height:1.65;">'
+                                'Knitra will not provide repair instructions for this case. '
+                                'Asking Knitra to help with this repair will not override this '
+                                'recommendation.'
+                                '</div>'
+                                '<div style="font-size:0.845rem;color:#334155;line-height:1.65;">'
+                                'Safety-related interactions within this case may be recorded for '
+                                'audit, safety, and system-improvement purposes. You remain '
+                                'responsible for any actions you choose to take.'
+                                '</div>'
+                            )
+
+                            async def _on_hazard_ack():
+                                try:
+                                    async with httpx.AsyncClient() as c:
+                                        await c.patch(
+                                            f"{API}/cases/{case_id}/hazard-ack",
+                                            headers={"Authorization": f"Bearer {token}"},
+                                            timeout=10.0,
+                                        )
+                                except Exception:
+                                    pass
+                                ui.navigate.to(f"/cases/{case_id}")
+
+                            ui.button(
+                                "I Understand",
+                                on_click=_on_hazard_ack,
+                            ).props("unelevated color=negative").style(
+                                "font-weight:700;width:100%;"
+                            )
+
+                        return
+
                     # ── Immediate Actions ─────────────────────────────────────
                     immediate = sa.get("immediate_actions") or []
                     if immediate:
@@ -2144,6 +2245,9 @@ async def case_detail_page(case_id: int):
                 """
                 s1 = sr.get("stage_1") or {}
                 cl = sr.get("clarification") or {}
+                # Bounded-clarification fallback: pipeline hit MAX rounds and is no
+                # longer asking questions.  Render a distinct terminal banner.
+                _inconclusive = bool(cl.get("inconclusive"))
 
                 sev = s1.get("severity", "")
                 sev_labels = {
@@ -2157,6 +2261,31 @@ async def case_detail_page(case_id: int):
                 with ui.element("div").style(
                     "padding:22px 24px;display:flex;flex-direction:column;gap:18px;"
                 ):
+                    # ── Inconclusive fallback banner ───────────────────────────
+                    # Shown ONLY when the bounded-clarification limit was reached.
+                    # Visually distinct (amber) so it does not read as another
+                    # needs-answers round.
+                    if _inconclusive:
+                        ui.html(
+                            '<div style="background:#fffbeb;border:1px solid #fcd34d;'
+                            'border-radius:12px;padding:16px 18px;'
+                            'display:flex;align-items:flex-start;gap:12px;">'
+                            '<span style="font-size:1.4rem;line-height:1;flex-shrink:0;">'
+                            '&#9888;&#65039;</span>'
+                            '<div>'
+                            '<div style="font-weight:800;color:#92400e;font-size:0.95rem;'
+                            'margin-bottom:4px;">Could not reach a confident assessment</div>'
+                            '<div style="font-size:0.84rem;color:#78350f;line-height:1.6;">'
+                            'Knitra could not reach a confident assessment from the '
+                            'available photos and answers, so it has stopped asking '
+                            'questions. Please provide clearer, well-lit photos from '
+                            'another angle, or have the issue checked in person before '
+                            'starting work.'
+                            '</div>'
+                            '</div>'
+                            '</div>'
+                        )
+
                     # ── Diagnosis header (compact) ─────────────────────────────
                     ui.html('<div class="analysis-section-label">Diagnosis</div>')
                     with ui.element("div").classes("analysis-card"):
@@ -2216,8 +2345,12 @@ async def case_detail_page(case_id: int):
                         )
 
                     # ── What is unclear ────────────────────────────────────────
+                    # Suppressed in the inconclusive fallback: the amber banner
+                    # above already carries this guidance, so rendering it here too
+                    # would be redundant.  Kept as a safety net for the edge case
+                    # where the inconclusive flag is absent but questions are empty.
                     unclear = cl.get("what_is_unclear") or []
-                    if unclear:
+                    if unclear and not _inconclusive:
                         ui.html('<div class="analysis-section-label">What the photo cannot confirm</div>')
                         with ui.element("div").classes("analysis-card"):
                             for item in unclear:
@@ -2338,7 +2471,7 @@ async def case_detail_page(case_id: int):
 
                 # Route to mode-specific renderer
                 if mode == "assessment_first":
-                    _draw_assessment_first(sr)
+                    _draw_assessment_first(sr, hazard_ack=data.get("hazard_ack", False))
                     _draw_time_footer(ms)
                     return
 
@@ -2355,6 +2488,56 @@ async def case_detail_page(case_id: int):
                 # Legacy / DIY / verify_first path — full Stage 2 + Stage 3 render
                 s2 = sr.get("stage_2") or {}
                 s3 = sr.get("stage_3") or {}
+
+                # ── Clarification history badge ───────────────────────────────
+                # Shown when this analysis was produced by a re-analysis run that
+                # included clarification answers (text_context has Q/A structure).
+                # First-pass analyses have text_context=None and never show this.
+                _tc = (data.get("text_context") or "").strip()
+                _has_qa = bool(_tc) and ("Q1:" in _tc or _tc.startswith("User answers"))
+                if _has_qa:
+                    import re as _re
+                    _qs = _re.findall(r"Q\d+:\s*(.+?)(?=\nA\d+:|\Z)", _tc, _re.DOTALL)
+                    _as = _re.findall(r"A\d+:\s*(.+?)(?=\nQ\d+:|\Z)", _tc, _re.DOTALL)
+                    _pairs = list(zip(
+                        [q.strip() for q in _qs],
+                        [a.strip() for a in _as],
+                    ))
+                    with ui.element("div").style(
+                        "padding:14px 24px 0;"
+                    ):
+                        with ui.element("div").style(
+                            "background:#f0fdf4;border:1px solid #86efac;"
+                            "border-radius:10px;padding:12px 16px;"
+                        ):
+                            ui.html(
+                                '<div style="display:flex;align-items:center;'
+                                'justify-content:space-between;flex-wrap:wrap;gap:8px;">'
+                                '<span style="font-weight:700;color:#166534;font-size:0.82rem;">'
+                                '&#10003; Updated after clarification</span>'
+                                '</div>'
+                            )
+                            if _pairs:
+                                _hist_html = (
+                                    '<details style="margin-top:8px;">'
+                                    '<summary style="cursor:pointer;font-size:0.78rem;'
+                                    'color:#166534;font-weight:600;list-style:none;'
+                                    'display:flex;align-items:center;gap:4px;">'
+                                    '&#9656; Previous clarification</summary>'
+                                    '<div style="margin-top:8px;display:flex;'
+                                    'flex-direction:column;gap:6px;">'
+                                )
+                                for _q, _a in _pairs:
+                                    _hist_html += (
+                                        f'<div style="font-size:0.78rem;line-height:1.5;">'
+                                        f'<span style="color:#374151;font-weight:600;">Q:</span> '
+                                        f'<span style="color:#374151;">{_q}</span><br>'
+                                        f'<span style="color:#374151;font-weight:600;">A:</span> '
+                                        f'<span style="color:#166534;">{_a}</span>'
+                                        f'</div>'
+                                    )
+                                _hist_html += '</div></details>'
+                                ui.html(_hist_html)
 
                 sev = s1.get("severity", "")
                 _sev = {
@@ -2541,7 +2724,97 @@ async def case_detail_page(case_id: int):
                             f'</div></div>'
                         )
 
-                    # ── 2. What you'll need ───────────────────────────────────
+                    # ── AI responsibility notice ──────────────────────────────
+                    ui.html(
+                        '<div style="display:flex;align-items:flex-start;gap:8px;'
+                        'background:#f8fafc;border:1px solid #e2e8f0;'
+                        'border-radius:8px;padding:10px 12px;">'
+                        '<span style="font-size:0.85rem;flex-shrink:0;margin-top:1px;">&#8505;&#65039;</span>'
+                        '<p style="margin:0;font-size:0.76rem;color:#64748b;line-height:1.55;">'
+                        'This repair plan is AI-generated and may not reflect your exact situation. '
+                        'Verify materials and steps before starting. Stop and consult a professional '
+                        'if you encounter anything unexpected. '
+                        '<strong style="color:#475569;">You are responsible for any actions you take.</strong>'
+                        '</p></div>'
+                    )
+
+                    # ── Safety acknowledgement gate ──────────────────────────
+                    # Shown once per browser session before sections 2-5 are
+                    # revealed.  The ack state is stored in app.storage.user
+                    # (keyed by case_id so each case is gated independently).
+                    # On confirm: ack is stored and the page reloads, which
+                    # re-enters _draw_complete with the ack already set so
+                    # the tools/materials/steps sections render immediately.
+                    # The `return` below exits _draw_complete; Python's `with`
+                    # context manager unwinds the outer div cleanly.
+                    _ack_key = f"ack_{case_id}"
+                    if not app.storage.user.get(_ack_key, False):
+                        with ui.element("div").style(
+                            "background:white;border:1.5px solid #e2e8f0;"
+                            "border-radius:14px;padding:24px 26px;"
+                            "display:flex;flex-direction:column;gap:16px;"
+                            "box-shadow:0 1px 6px rgba(0,0,0,0.04);"
+                        ):
+                            ui.html(
+                                '<div style="font-size:1.05rem;font-weight:800;'
+                                'color:#0f172a;margin-bottom:2px;">Before you begin</div>'
+                                '<div style="font-size:0.82rem;color:#64748b;line-height:1.6;">'
+                                'This repair plan is AI-generated. Please read and confirm '
+                                'each point before viewing the tools and repair steps.</div>'
+                            )
+
+                            _checks: list = []
+
+                            def _update_confirm_btn(_=None):
+                                if all(c.value for c in _checks):
+                                    _confirm_btn.enable()
+                                else:
+                                    _confirm_btn.disable()
+
+                            for _lbl in [
+                                "I understand this advice is AI-generated and may be "
+                                "incomplete or incorrect.",
+                                "I will check local safety regulations before starting "
+                                "any work.",
+                                "I will stop immediately and contact a qualified "
+                                "professional if I am unsure or encounter anything "
+                                "unexpected.",
+                                "I accept responsibility for the actions I choose to "
+                                "take based on this advice.",
+                            ]:
+                                _checks.append(
+                                    ui.checkbox(_lbl, on_change=_update_confirm_btn)
+                                    .style("font-size:0.83rem;align-items:flex-start;")
+                                )
+
+                            async def _on_confirm():
+                                app.storage.user[_ack_key] = True
+                                ui.navigate.to(f"/cases/{case_id}")
+
+                            _confirm_btn = (
+                                ui.button(
+                                    "I understand — show me the steps",
+                                    on_click=_on_confirm,
+                                )
+                                .props("unelevated color=primary")
+                                .style(
+                                    "font-weight:700;width:100%;margin-top:4px;"
+                                )
+                            )
+                            _confirm_btn.disable()
+
+                            ui.html(
+                                '<p style="font-size:0.72rem;color:#94a3b8;'
+                                'text-align:center;margin:0;line-height:1.5;">'
+                                'This acknowledgement does not constitute a safety '
+                                'assessment. If in doubt, always consult a qualified '
+                                'professional.</p>'
+                            )
+
+                        _draw_time_footer(data.get("processing_time_ms") or 0)
+                        return
+
+                    # ── 2. What you'll need ── (shown after acknowledgement) ───
                     ui.html(
                         '<div class="analysis-section-label">'
                         'What you&#8217;ll need</div>'
@@ -2934,8 +3207,18 @@ async def case_detail_page(case_id: int):
                 """
                 status = (data or {}).get("status")
                 # Track whether the current analysis is in clarification output mode
+                _sr_now = (data or {}).get("structured_result") or {}
                 _clarif_mode_ref["v"] = (
-                    ((data or {}).get("structured_result") or {}).get("output_mode") == "clarification"
+                    _sr_now.get("output_mode") == "clarification"
+                )
+                # Track the bounded-clarification fallback (no questions, inconclusive)
+                _inconclusive_ref["v"] = bool(
+                    (_sr_now.get("clarification") or {}).get("inconclusive")
+                )
+                # Lock Ask Knitra when the case is assessment_first and unacknowledged
+                _chat_locked_ref["v"] = (
+                    ((data or {}).get("structured_result") or {}).get("output_mode") == "assessment_first"
+                    and not (data or {}).get("hazard_ack", False)
                 )
 
                 # Button area
@@ -2997,6 +3280,17 @@ async def case_detail_page(case_id: int):
             # Updated by _redraw; read by _render_chat_section.
             _clarif_mode_ref = {"v": False}
 
+            # Mutable cell: True when the clarification output is the bounded-rounds
+            # fallback (inconclusive, no questions).  In that state the chat must NOT
+            # tell the user to "answer the questions below" — there are none.
+            # Updated by _redraw; read by _render_chat_section.
+            _inconclusive_ref = {"v": False}
+
+            # Mutable cell: True when the case is assessment_first AND the user has NOT yet
+            # acknowledged the hazard notice.  Locks Ask Knitra until "I Understand" is clicked.
+            # Updated by _redraw; read by _render_chat_section.
+            _chat_locked_ref = {"v": False}
+
             async def _do_poll():
                 nonlocal _was_running, _title_updated
                 data  = await _get_analysis()
@@ -3049,6 +3343,16 @@ async def case_detail_page(case_id: int):
             _clarif_mode_ref["v"] = (
                 ((_initial or {}).get("structured_result") or {}).get("output_mode") == "clarification"
             )
+            # Seed inconclusive ref (bounded-clarification fallback)
+            _inconclusive_ref["v"] = bool(
+                (((_initial or {}).get("structured_result") or {}).get("clarification") or {})
+                .get("inconclusive")
+            )
+            # Seed chat-locked ref: assessment_first + not yet acknowledged
+            _chat_locked_ref["v"] = (
+                ((_initial or {}).get("structured_result") or {}).get("output_mode") == "assessment_first"
+                and not (_initial or {}).get("hazard_ack", False)
+            )
             _redraw(_initial)
             if (_initial or {}).get("status") in ("pending", "running"):
                 _was_running = True
@@ -3081,6 +3385,8 @@ async def case_detail_page(case_id: int):
                 is_clarification = analysis_status == "needs_clarification"
                 # Also treat output_mode=clarification (status=complete) as clarification
                 is_clarif_mode   = _clarif_mode_ref["v"] or is_clarification
+                # Bounded-clarification fallback: clarif mode but NO questions to answer.
+                is_inconclusive  = _inconclusive_ref["v"]
 
                 chat_section.clear()
                 with chat_section:
@@ -3101,6 +3407,59 @@ async def case_detail_page(case_id: int):
                                 'The repair chat will open once the AI has finished '
                                 'analysing your case. Analyse your photos above to '
                                 'get started.</div>'
+                            )
+                        return
+
+                    # ── Hazard-locked placeholder ──────────────────────────────
+                    # Shown for assessment_first cases when hazard_ack is False.
+                    # Cleared automatically on page reload after "I Understand" is
+                    # clicked (at that point hazard_ack=True, so this branch is skipped).
+                    if _chat_locked_ref["v"]:
+                        with ui.element("div").style(
+                            "background:white;border:1px solid #fecaca;"
+                            "border-radius:14px;padding:28px 24px;"
+                            "text-align:center;"
+                        ):
+                            ui.html(
+                                '<div style="font-size:2rem;margin-bottom:10px;'
+                                'opacity:0.5;">&#128274;</div>'
+                                '<div style="font-weight:700;color:#991b1b;'
+                                'font-size:0.95rem;margin-bottom:8px;">Ask Knitra</div>'
+                                '<div style="color:#64748b;font-size:0.83rem;'
+                                'line-height:1.6;max-width:380px;margin:0 auto;">'
+                                'Ask Knitra is available after you acknowledge the hazardous '
+                                'case notice above. This does not override the recommendation '
+                                'for professional assessment.'
+                                '</div>'
+                            )
+                        return
+
+                    # ── DIY safety-gate placeholder ────────────────────────────
+                    # In DIY mode, the repair steps are hidden behind the "Before
+                    # you begin" acknowledgement. Keep the chat locked to the same
+                    # gate so there is no gap between seeing the steps and being
+                    # able to ask questions about them.
+                    _ack_key     = f"ack_{case_id}"
+                    _diy_unacked = (
+                        not is_clarif_mode
+                        and not _chat_locked_ref["v"]
+                        and not app.storage.user.get(_ack_key, False)
+                    )
+                    if _diy_unacked:
+                        with ui.element("div").style(
+                            "background:white;border:1px solid #e2e8f0;"
+                            "border-radius:14px;padding:28px 24px;"
+                            "text-align:center;"
+                        ):
+                            ui.html(
+                                '<div style="font-size:2rem;margin-bottom:10px;'
+                                'opacity:0.35;">&#128172;</div>'
+                                '<div style="font-weight:700;color:#334155;'
+                                'font-size:0.95rem;margin-bottom:8px;">Ask Knitra</div>'
+                                '<div style="color:#64748b;font-size:0.83rem;'
+                                'line-height:1.6;max-width:380px;margin:0 auto;">'
+                                'Read and confirm the safety notice above to open Ask Knitra.'
+                                '</div>'
                             )
                         return
 
@@ -3127,16 +3486,31 @@ async def case_detail_page(case_id: int):
                                     '<div style="font-size:1rem;font-weight:700;'
                                     'color:#0f172a;">Ask Knitra</div>'
                                 )
-                                _chat_subtitle = (
-                                    "Answer the questions below, then press Re-analyse "
-                                    "for an updated plan"
-                                    if is_clarif_mode else
-                                    "Knows your full case. Chat answers are conversational, "
-                                    "press Re-analyse above for an official updated diagnosis."
-                                )
+                                if is_inconclusive:
+                                    _chat_subtitle = (
+                                        "No more questions right now. Add a clearer photo or "
+                                        "description above, then press Re-analyse — or check "
+                                        "the issue in person."
+                                    )
+                                elif is_clarif_mode:
+                                    _chat_subtitle = (
+                                        "Answer the questions below, then press Re-analyse "
+                                        "for an updated plan"
+                                    )
+                                else:
+                                    _chat_subtitle = (
+                                        "Knows your full case. Chat answers are conversational, "
+                                        "press Re-analyse above for an official updated diagnosis."
+                                    )
                                 ui.html(
                                     f'<div style="font-size:0.75rem;color:#94a3b8;'
                                     f'margin-top:1px;">{_chat_subtitle}</div>'
+                                )
+                                ui.html(
+                                    '<div style="font-size:0.7rem;color:#94a3b8;'
+                                    'margin-top:3px;line-height:1.45;">'
+                                    'AI advice only &mdash; not a substitute for a qualified professional.'
+                                    '</div>'
                                 )
                             # Expand / collapse the message area for more room.
                             ui.html(
@@ -3153,23 +3527,29 @@ async def case_detail_page(case_id: int):
                         # Message list
                         chat_messages = ui.element("div").classes("chat-wrap")
 
-                        _SUGGESTIONS = (
-                            [
+                        if is_inconclusive:
+                            _SUGGESTIONS = [
+                                "What kind of photo would help most?",
+                                "Why couldn't you assess this?",
+                                "Should I call a professional?",
+                                "What should I check in person?",
+                            ]
+                        elif is_clarif_mode:
+                            _SUGGESTIONS = [
                                 "It's a plastic push-fit fitting",
                                 "The wall is plasterboard",
                                 "There's no sign of damp",
                                 "The pipe is copper",
                                 "Can I describe this instead?",
                             ]
-                            if is_clarif_mode else
-                            [
+                        else:
+                            _SUGGESTIONS = [
                                 "What tools do I need?",
                                 "Is this safe to DIY?",
                                 "How long will this take?",
                                 "What could go wrong?",
                                 "How is confidence calculated?",
                             ]
-                        )
 
                         async def _reanalyse_from_chat(text_context: str = ""):
                             """Trigger the official Re-analyse then reload into the running/polling flow.
@@ -3433,20 +3813,34 @@ async def case_detail_page(case_id: int):
                         # ── Clarification Re-analyse CTA ──────────────────────
                         # Shown only in clarification output-mode so the user
                         # has a clear "I've answered, now what?" action.
+                        # In the inconclusive fallback there are no questions, so the
+                        # copy and button label avoid implying answers are pending.
                         if is_clarif_mode:
                             with ui.element("div").style(
                                 "padding:0 20px 14px;"
                                 "display:flex;align-items:center;gap:10px;"
                             ):
+                                if is_inconclusive:
+                                    _cta_text = (
+                                        'No questions are pending. Add a clearer photo or a '
+                                        'short description above, then re-analyse — or have '
+                                        'the issue checked in person.'
+                                    )
+                                    _cta_label = "Re-analyse"
+                                else:
+                                    _cta_text = (
+                                        'Knitra will automatically re-analyse once the required '
+                                        'questions are answered. Use the button if you prefer '
+                                        'to trigger it manually.'
+                                    )
+                                    _cta_label = "Re-analyse with answers"
                                 ui.html(
-                                    '<div style="font-size:0.78rem;color:#64748b;flex:1;">'
-                                    'Knitra will automatically re-analyse once the required '
-                                    'questions are answered. Use the button if you prefer '
-                                    'to trigger it manually.'
-                                    '</div>'
+                                    f'<div style="font-size:0.78rem;color:#64748b;flex:1;">'
+                                    f'{_cta_text}'
+                                    f'</div>'
                                 )
                                 ui.button(
-                                    "Re-analyse with answers",
+                                    _cta_label,
                                     on_click=_reanalyse_from_chat,
                                 ).props("outline color=primary size=sm icon=autorenew") \
                                  .style("font-size:0.74rem;font-weight:700;flex-shrink:0;")
@@ -4421,6 +4815,21 @@ async def new_case_page():
                 '<p style="color:#94a3b8;font-size:0.875rem;margin:0;">'
                 'Snap a photo of the problem, Knitra identifies it and '
                 'writes your repair guide automatically.</p>'
+            )
+
+            # ── AI disclaimer ─────────────────────────────────────────────────
+            ui.html(
+                '<div style="display:flex;align-items:flex-start;gap:10px;'
+                'background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;'
+                'padding:12px 14px;">'
+                '<span style="font-size:1rem;flex-shrink:0;margin-top:1px;">&#8505;&#65039;</span>'
+                '<p style="margin:0;font-size:0.78rem;color:#475569;line-height:1.6;">'
+                '<strong style="color:#334155;">AI-assisted advice &mdash; always use your judgement.</strong> '
+                'Knitra uses a local AI model and may make mistakes. It is not a substitute for a '
+                'qualified professional. Never attempt repairs involving electrical mains, gas, or '
+                'structural load without professional guidance. '
+                'You are responsible for any actions you choose to take.'
+                '</p></div>'
             )
 
             # ── Single composer card ───────────────────────────────────────────

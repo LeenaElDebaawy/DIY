@@ -64,6 +64,7 @@ import ollama
 from fastapi import HTTPException, status
 from pydantic import ValidationError
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
@@ -112,6 +113,42 @@ CHAT_NUM_PREDICT    = int(os.getenv("CHAT_NUM_PREDICT",    "768"))
 # Set to "0" on RAM-constrained machines to unload immediately.
 OLLAMA_KEEP_ALIVE   = os.getenv("OLLAMA_KEEP_ALIVE", "5m")
 
+# ── Feature flag: repeated-question filter ────────────────────────────────────
+# When True, clarifying_questions that repeat a topic already present in the
+# re-analysis text_context are dropped before _determine_output_mode runs.
+# This prevents the pipeline from looping in clarification mode after the user
+# has already answered a question Stage 1 is asking again.
+#
+# Disable instantly by setting FILTER_REPEATED_CLARIFICATION_QUESTIONS=false
+# in backend/.env and restarting the backend.  No code change required.
+#
+# Default: true  — the filter is conservative (requires 2+ content-word overlap)
+# and the alternative (leaving it off) is a demonstrably broken loop for burn-
+# mark cases.  Set to false to revert to pre-filter behaviour.
+_FILTER_REPEATED_CLARIFICATION_Q: bool = (
+    os.getenv("FILTER_REPEATED_CLARIFICATION_QUESTIONS", "true")
+    .strip().lower() == "true"
+)
+
+# When true: if the care-mode hazard gate fires on a re-analysis (text_context
+# present) and Stage 1 was already satisfied (no clarifying_questions), trust
+# Stage 1's judgment and route directly to diy instead of asking another
+# clarifying question.  Stage 1 read the user's context and produced no
+# unknowns — the gate firing is a false positive in that situation.
+#
+# Disable instantly: set TRUST_STAGE1_ON_REANALYSIS=false in .env and restart
+# the backend only.  Default: false (safe off; enable explicitly for demo).
+_TRUST_STAGE1_ON_REANALYSIS: bool = (
+    os.getenv("TRUST_STAGE1_ON_REANALYSIS", "false")
+    .strip().lower() == "true"
+)
+
+# Maximum number of clarification rounds before the pipeline falls back to
+# verify_first.  Prevents infinite Q/A loops when Stage 1 keeps returning
+# clarifying_questions despite receiving user answers.
+# Default: 2  (most genuine ambiguities resolve in one or two exchanges).
+_MAX_CLARIFICATION_ROUNDS: int = int(os.getenv("MAX_CLARIFICATION_ROUNDS", "2"))
+
 # Upload directory, resolved the same way as uploads_service.py so paths match.
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
 
@@ -143,8 +180,118 @@ _SC_DONE    = "stage_c_complete"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PUBLIC API  (unchanged from Session 1)
+# PUBLIC API
 # ─────────────────────────────────────────────────────────────────────────────
+
+async def _build_manual_reanalysis_context(
+    db: AsyncSession,
+    case_id: int,
+    caller_text: str | None,
+) -> str | None:
+    """
+    Build cumulative Q/A text_context for a manual re-analyse triggered from
+    the clarification textarea.
+
+    The frontend only sends the textarea value.  This function reconstructs the
+    full context that auto re-analysis would have built:
+      - prior analysis.text_context  (earlier clarification rounds)
+      - Q/A pairs from THIS round only (answers after the most-recent opener)
+      - optional "Additional note" from the textarea
+
+    To avoid duplicating earlier rounds, answer collection is anchored to the
+    MOST RECENT clarification_opener — exactly like the auto re-analysis path in
+    chat_service._check_auto_reanalyse.  Earlier rounds already live in the prior
+    analysis.text_context, so re-collecting all answers across the case would
+    double-count them.
+
+    Returns caller_text unchanged when there are no clarification-answer messages
+    for the current round (fresh analysis, or textarea-only re-analyse).
+    """
+    from app.models import Message  # local to avoid circular import risk
+
+    # Fetch the latest completed clarification analysis for this case
+    analysis_r = await db.execute(
+        select(Analysis)
+        .where(
+            Analysis.session_id == case_id,
+            Analysis.status == "complete",
+        )
+        .order_by(Analysis.id.desc())
+    )
+    latest_analysis = analysis_r.scalars().first()
+    if latest_analysis is None:
+        return caller_text  # no prior analysis — nothing to accumulate
+
+    prior_result = (latest_analysis.structured_result or {})
+    if prior_result.get("output_mode") != "clarification":
+        return caller_text  # last analysis wasn't clarification — pass through
+
+    # Anchor on the MOST RECENT clarification opener so we only gather answers
+    # belonging to THIS round.  Earlier rounds are already in prior text_context.
+    opener_r = await db.execute(
+        select(Message)
+        .where(
+            Message.session_id == case_id,
+            Message.message_type == "clarification_opener",
+        )
+        .order_by(Message.created_at.desc())
+        .limit(1)
+    )
+    opener = opener_r.scalar_one_or_none()
+
+    # Collect this round's clarification-answer messages, oldest-first.
+    # If an opener exists, scope to messages after it; otherwise (defensive)
+    # fall back to all clarification-answer messages on the case.
+    msg_q = (
+        select(Message)
+        .where(
+            Message.session_id == case_id,
+            Message.role == "user",
+        )
+        .order_by(Message.created_at.asc())
+    )
+    if opener is not None:
+        msg_q = msg_q.where(Message.created_at > opener.created_at)
+    msgs_r = await db.execute(msg_q)
+    all_user_msgs = list(msgs_r.scalars().all())
+    answer_msgs = [m for m in all_user_msgs if (m.msg_metadata or {}).get("clarification_answer")]
+
+    if not answer_msgs:
+        return caller_text  # no current-round answers — textarea-only or none
+
+    # Build Q/A block (same format as auto re-analysis so the sanitiser guard works)
+    clarif = prior_result.get("clarification") or {}
+    questions = list((clarif.get("clarifying_questions") or []))
+
+    parts: list[str] = ["User answers to clarification questions:"]
+    for i, msg in enumerate(answer_msgs, 1):
+        q = questions[i - 1] if i <= len(questions) else ""
+        if q:
+            parts.append(f"Q{i}: {q}")
+        parts.append(f"A{i}: {msg.content.strip()}")
+
+    qa_block = "\n".join(parts)
+
+    # Prepend prior round's text_context so all rounds accumulate (round 1 lives
+    # there; this qa_block is the current round only — no duplication).
+    prior_ctx = (latest_analysis.text_context or "").strip()
+    if prior_ctx:
+        text_context = prior_ctx + "\n\n" + qa_block
+    else:
+        text_context = qa_block
+
+    # Append textarea note if the user also typed something
+    note = (caller_text or "").strip()
+    if note:
+        text_context += f"\n\nAdditional note from user: {note}"
+
+    log.info(
+        "manual_reanalysis_context_built case=%d round_answers=%d opener=%s prior_ctx=%s note=%s",
+        case_id, len(answer_msgs), "yes" if opener else "no",
+        "yes" if prior_ctx else "no", "yes" if note else "no",
+    )
+    return text_context
+
 
 async def create_analysis(
     db: AsyncSession,
@@ -191,6 +338,21 @@ async def create_analysis(
                    "Wait for it to complete, then re-trigger if needed.",
         )
 
+    # 4a. On manual re-analyse from the clarification textarea the frontend
+    #     sends only the textarea value — not the prior Q/A conversation.
+    #     Reconstruct the full cumulative context so Stage 1 sees all answers.
+    #     Skip when the caller already passed a pre-built Q/A block (auto
+    #     re-analysis path, which starts with "User answers").
+    _is_prebuilt_qa = bool(
+        text_context
+        and (
+            text_context.strip().startswith("User answers")
+            or "Q1:" in text_context
+        )
+    )
+    if not _is_prebuilt_qa:
+        text_context = await _build_manual_reanalysis_context(db, case_id, text_context)
+
     # 4. Create the Analysis row (status="pending", no results yet)
     analysis = Analysis(
         session_id=case_id,
@@ -231,6 +393,7 @@ async def get_latest_analysis(
     result = await db.execute(
         select(Analysis)
         .where(Analysis.session_id == case_id)
+        .options(selectinload(Analysis.session))   # needed for Analysis.hazard_ack property
         .order_by(Analysis.created_at.desc())
         .limit(1)
     )
@@ -726,9 +889,33 @@ async def _run_pipeline(
             # confidence with the model's own uncertainty BEFORE it can influence
             # the gate or propagate into Stages 2 and 3. Grounded in real cases
             # #54 (triple-duplicated observation) and #56/#57 (overconfidence).
-            _s1_fixes = _sanitize_stage_1(s1)
+            _s1_fixes = _sanitize_stage_1(s1, text_context=text_context)
             if _s1_fixes:
                 log.info("Stage 1 reliability pass: %s", "; ".join(_s1_fixes))
+
+            # ── Repeated-question filter (feature-flagged) ────────────────────
+            # Stage 1 sometimes re-asks a question whose topic was already covered
+            # in a previous clarification round.  When the flag is on, drop those
+            # repeats before _determine_output_mode sees the list so the pipeline
+            # can advance rather than loop.
+            #
+            # Guards: flag on AND text_context present AND Stage 1 has questions.
+            # A missing or non-Q/A text_context causes _filter_answered_questions
+            # to return the list unchanged, so first-pass analyses are unaffected.
+            #
+            # Disable: set FILTER_REPEATED_CLARIFICATION_QUESTIONS=false in .env
+            # and restart the backend.
+            if _FILTER_REPEATED_CLARIFICATION_Q and text_context and s1.clarifying_questions:
+                _kept_qs, _dropped_qs = _filter_answered_questions(
+                    s1.clarifying_questions, text_context
+                )
+                if _dropped_qs:
+                    log.info(
+                        "filter_answered_questions: dropped %d repeated question(s): %s",
+                        len(_dropped_qs),
+                        "; ".join(q[:70] for q in _dropped_qs),
+                    )
+                    s1.clarifying_questions = _kept_qs
 
             # ── Thin one-way safety net ───────────────────────────────────────
             # For a few inherently dangerous trades, raise the model's risk signals
@@ -808,7 +995,7 @@ async def _run_pipeline(
             # The current implementation branches on assessment_first (Stage A) vs
             # the full DIY path (Stage 2 + Stage 3). Future steps add branches for
             # clarification (step 4) and care (step 3).
-            _mode = _determine_output_mode(s1)
+            _mode = _determine_output_mode(s1, text_context=text_context)
             log.info("Output mode: %s (trade=%s risk=%s diy=%s prof=%s hazards=%d q=%d)",
                      _mode, s1.trade_category, s1.risk_level, s1.diy_suitability,
                      s1.professional_assessment_recommended, len(s1.safety_concerns),
@@ -853,6 +1040,7 @@ async def _run_pipeline(
                 analysis.pipeline_stage     = "complete"
                 if case_row is not None:
                     case_row.status = "complete"
+                    case_row.clarification_round = 0
                 analysis.processing_time_ms = _ms_total
                 analysis.provider           = "ollama"
                 analysis.model              = f"{STAGE_1_MODEL} | {STAGE_3_MODEL}(A)"
@@ -865,57 +1053,126 @@ async def _run_pipeline(
 
             elif _mode == "clarification":
                 # ── Clarification mode — surface questions, skip Stage 2 + 3 ──
-                # Build ClarificationOutput DETERMINISTICALLY from Stage 1 data.
-                # No extra model call — Stage 1 already identified the unknowns.
-                _unc_lines = [l.strip() for l in (s1.uncertainty_notes or "").split(".")
-                              if l.strip() and len(l.strip()) > 10]
-                _what_unclear = _unc_lines[:4] if _unc_lines else (
-                    ["The exact repair method cannot be confirmed from the photo alone."]
-                )
-                _diy_hint = {
-                    "conditional": (
-                        "Once these questions are answered, this should be a manageable DIY repair."
-                    ),
-                    "suitable": (
-                        "This is likely DIY-suitable once the details above are clarified."
-                    ),
-                }.get(s1.diy_suitability, "")
-                _plural = len(s1.clarifying_questions) > 1
-                _why = (
-                    f"{'These answers' if _plural else 'This answer'} will affect the repair "
-                    f"method, the materials or parts to buy, and whether the job is safe to "
-                    f"do yourself. {_diy_hint}"
-                ).strip()
-                clarif = ClarificationOutput(
-                    what_is_known=(
-                        f"{s1.problem_type}: " + "; ".join(s1.observations[:3])
-                        if s1.observations else s1.problem_type
-                    ),
-                    what_is_unclear=_what_unclear,
-                    clarifying_questions=list(s1.clarifying_questions[:3]),
-                    optional_questions=list((s1.optional_questions or [])[:1]),
-                    why_it_matters=_why,
-                )
-                combined = AnalysisResult(
-                    output_mode="clarification",
-                    stage_1=s1,
-                    clarification=clarif,
-                )
-                _ms_total = int((time.monotonic() - start) * 1000)
-                analysis.structured_result  = combined.model_dump()
-                analysis.status             = "complete"
-                analysis.pipeline_stage     = "complete"
+                # Increment clarification_round.  If the limit is reached, fall
+                # back to verify_first so the loop can't run forever.
+                _current_round = (case_row.clarification_round if case_row is not None else 0)
+                _new_round     = _current_round + 1
                 if case_row is not None:
-                    case_row.status = "needs_info"
-                analysis.processing_time_ms = _ms_total
-                analysis.provider           = "ollama"
-                analysis.model              = f"{STAGE_1_MODEL} (clarification)"
-                analysis.validation_issues  = (
-                    f'{{"stage_1_ms":{_ms_s1},"total_ms":{_ms_total},"mode":"clarification"}}'
-                )
-                log.info("Pipeline complete (clarification), S1:%ds total:%ds, questions=%d",
-                         _ms_s1 // 1000, _ms_total // 1000, len(s1.clarifying_questions))
-                await db.commit()
+                    case_row.clarification_round = _new_round
+
+                if _new_round > _MAX_CLARIFICATION_ROUNDS:
+                    # ── Bounded clarification fallback → verify_first ──────────
+                    log.warning(
+                        "clarification_round=%d > MAX=%d — forcing verify_first (case=%d)",
+                        _new_round, _MAX_CLARIFICATION_ROUNDS, case_id,
+                    )
+                    # Use clarification mode with no questions, flagged inconclusive
+                    # so the frontend shows a distinct "could not reach a confident
+                    # assessment" banner instead of a normal needs-answers card.
+                    # Guidance goes into what_is_unclear (a rendered field); the
+                    # frontend does NOT render why_it_matters, so it must not be the
+                    # only place the guidance lives.
+                    _vf_clarif = ClarificationOutput(
+                        what_is_known=(
+                            f"{s1.problem_type}: " + "; ".join(s1.observations[:3])
+                            if s1.observations else s1.problem_type
+                        ),
+                        what_is_unclear=[
+                            "Knitra could not reach a confident assessment from the "
+                            "available photos and answers.",
+                            "No more clarification questions are being asked right now.",
+                            "Please provide clearer, well-lit photos from another angle, "
+                            "or have the issue checked in person before starting work.",
+                        ],
+                        clarifying_questions=[],
+                        optional_questions=[],
+                        why_it_matters=(
+                            "Please provide clearer photos or verify the issue in person "
+                            "before starting work."
+                        ),
+                        inconclusive=True,
+                    )
+                    combined = AnalysisResult(
+                        output_mode="clarification",
+                        stage_1=s1,
+                        clarification=_vf_clarif,
+                    )
+                    _ms_total = int((time.monotonic() - start) * 1000)
+                    analysis.structured_result  = combined.model_dump()
+                    analysis.status             = "complete"
+                    analysis.pipeline_stage     = "complete"
+                    if case_row is not None:
+                        # status stays needs_info so the UI stays in clarif mode;
+                        # round is reset so future user action starts clean.
+                        case_row.status = "needs_info"
+                        case_row.clarification_round = 0
+                    analysis.processing_time_ms = _ms_total
+                    analysis.provider           = "ollama"
+                    analysis.model              = f"{STAGE_1_MODEL} (verify_first_fallback)"
+                    analysis.validation_issues  = (
+                        f'{{"stage_1_ms":{_ms_s1},"total_ms":{_ms_total},'
+                        f'"mode":"clarification","reason":"max_clarification_rounds"}}'
+                    )
+                    log.info("Pipeline complete (verify_first/fallback), round=%d", _new_round)
+                    await db.commit()
+
+                else:
+                    # ── Normal clarification path ─────────────────────────────
+                    # Build ClarificationOutput DETERMINISTICALLY from Stage 1 data.
+                    # No extra model call — Stage 1 already identified the unknowns.
+                    _unc_lines = [l.strip() for l in (s1.uncertainty_notes or "").split(".")
+                                  if l.strip() and len(l.strip()) > 10]
+                    _what_unclear = _unc_lines[:4] if _unc_lines else (
+                        ["The exact repair method cannot be confirmed from the photo alone."]
+                    )
+                    _diy_hint = {
+                        "conditional": (
+                            "Once these questions are answered, this should be a manageable DIY repair."
+                        ),
+                        "suitable": (
+                            "This is likely DIY-suitable once the details above are clarified."
+                        ),
+                    }.get(s1.diy_suitability, "")
+                    _plural = len(s1.clarifying_questions) > 1
+                    _why = (
+                        f"{'These answers' if _plural else 'This answer'} will affect the repair "
+                        f"method, the materials or parts to buy, and whether the job is safe to "
+                        f"do yourself. {_diy_hint}"
+                    ).strip()
+                    clarif = ClarificationOutput(
+                        what_is_known=(
+                            f"{s1.problem_type}: " + "; ".join(s1.observations[:3])
+                            if s1.observations else s1.problem_type
+                        ),
+                        what_is_unclear=_what_unclear,
+                        clarifying_questions=list(s1.clarifying_questions[:3]),
+                        optional_questions=list((s1.optional_questions or [])[:1]),
+                        why_it_matters=_why,
+                    )
+                    combined = AnalysisResult(
+                        output_mode="clarification",
+                        stage_1=s1,
+                        clarification=clarif,
+                    )
+                    _ms_total = int((time.monotonic() - start) * 1000)
+                    analysis.structured_result  = combined.model_dump()
+                    analysis.status             = "complete"
+                    analysis.pipeline_stage     = "complete"
+                    if case_row is not None:
+                        case_row.status = "needs_info"
+                    analysis.processing_time_ms = _ms_total
+                    analysis.provider           = "ollama"
+                    analysis.model              = f"{STAGE_1_MODEL} (clarification)"
+                    analysis.validation_issues  = (
+                        f'{{"stage_1_ms":{_ms_s1},"total_ms":{_ms_total},'
+                        f'"mode":"clarification","round":{_new_round}}}'
+                    )
+                    log.info(
+                        "Pipeline complete (clarification), S1:%ds total:%ds questions=%d round=%d",
+                        _ms_s1 // 1000, _ms_total // 1000,
+                        len(s1.clarifying_questions), _new_round,
+                    )
+                    await db.commit()
 
             elif _mode == "care":
                 # ── STAGE C — Care-mode output ────────────────────────────────
@@ -948,6 +1205,7 @@ async def _run_pipeline(
                 analysis.pipeline_stage     = "complete"
                 if case_row is not None:
                     case_row.status = "complete"
+                    case_row.clarification_round = 0
                 analysis.processing_time_ms = _ms_total
                 analysis.provider           = "ollama"
                 analysis.model              = f"{STAGE_1_MODEL} | {STAGE_3_MODEL}(C)"
@@ -1011,6 +1269,7 @@ async def _run_pipeline(
                 analysis.pipeline_stage     = "complete"
                 if case_row is not None:
                     case_row.status = "complete"
+                    case_row.clarification_round = 0
                 analysis.processing_time_ms = _ms_total
                 analysis.provider           = "ollama"
                 analysis.model              = f"{STAGE_1_MODEL} | {STAGE_2_MODEL} | {STAGE_3_MODEL}"
@@ -1086,6 +1345,24 @@ _UNSURE_MARKERS = (
 # When the model admits it cannot establish the CAUSE/root of the problem,
 # confidence is capped here so the UI never shows near-certainty on a guess.
 _UNCERTAINTY_CONF_CAP = 84
+
+# ── Stopwords for the repeated-question filter ────────────────────────────────
+# Words that carry no diagnostic meaning and must be ignored when comparing
+# a new clarifying_question against questions already present in text_context.
+# Kept deliberately small: only words that are (a) high-frequency and (b) would
+# never distinguish two genuinely different questions.
+_Q_STOPWORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "to", "of", "in", "for",
+    "on", "with", "at", "by", "from", "as", "if", "it", "its", "this",
+    "that", "or", "and", "but", "not", "no", "nor",
+    "what", "which", "how", "when", "where", "who", "why",
+    "you", "your", "me", "my", "we", "our", "they", "their",
+    "please", "tell", "describe", "explain",
+    "eg", "example", "such", "like", "any", "some",
+    "approximately", "about", "around", "roughly",
+})
 
 # ── Extended clarification backfill keyword groups ────────────────────────────
 # Used by block 6 of _sanitize_stage_1 to catch Qwen's specific failure mode:
@@ -1186,11 +1463,81 @@ def _dedupe_strings(items: list[str], jaccard_threshold: float = 0.7) -> list[st
     return out
 
 
-def _sanitize_stage_1(s1: Stage1Output) -> list[str]:
+def _filter_answered_questions(
+    questions: list[str],
+    text_context: str,
+) -> tuple[list[str], list[str]]:
+    """Filter out clarifying questions whose topic was already covered in text_context.
+
+    Called only on re-analysis runs (text_context is the Q/A block built by
+    _check_auto_reanalyse).  Stage 1 sometimes re-asks a question whose topic
+    was already in the previous round, in violation of its own CONTEXT RULE.
+    This deterministic filter removes those repeats before _determine_output_mode
+    sees the list, preventing an unnecessary extra clarification cycle.
+
+    Algorithm
+    ---------
+    1. Parse previous question texts from text_context (lines starting "Q<n>: ").
+       If no Q/A structure is found (plain text_context), return unchanged.
+    2. For each new question: tokenise (lowercase, strip punctuation, drop
+       stopwords and single/two-character words).
+    3. If a new question shares >= 2 content tokens with ANY previous question,
+       it covers the same topic and is dropped.  Otherwise it is kept.
+
+    The >= 2 threshold is the key safety guard:
+      - A repeated cause question shares 3-5 words with the original  -> dropped.
+      - A new depth/size/condition question shares 0-1 words           -> kept.
+      - A safety/risk question uses different vocabulary entirely       -> kept.
+
+    Returns
+    -------
+    (kept, dropped) — both are lists of question strings.
+    The caller reassigns s1.clarifying_questions = kept and logs dropped.
+    """
+    import re as _re
+
+    # Step 1 — extract previous question texts from the structured Q/A block.
+    # Format produced by _check_auto_reanalyse:
+    #   "User answers to clarification questions:\nQ1: <q>\nA1: <a>\nQ2: ..."
+    prev_qs: list[str] = _re.findall(
+        r"Q\d+:\s*(.+?)(?=\nA\d+:|\Z)", text_context, _re.DOTALL
+    )
+    prev_qs = [q.strip() for q in prev_qs if q.strip()]
+
+    # No Q/A structure in text_context (plain description, first-pass fallback,
+    # or a manually typed note) — nothing to compare against, return unchanged.
+    if not prev_qs:
+        return questions, []
+
+    def _tokens(text: str) -> frozenset[str]:
+        """Lowercase content words, length > 2, not in stopword list."""
+        words = _re.sub(r"[^\w\s]", " ", text.lower()).split()
+        return frozenset(w for w in words if len(w) > 2 and w not in _Q_STOPWORDS)
+
+    prev_token_sets: list[frozenset[str]] = [_tokens(q) for q in prev_qs]
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    for new_q in questions:
+        new_tok = _tokens(new_q)
+        is_repeat = any(
+            len(new_tok & prev_tok) >= 2
+            for prev_tok in prev_token_sets
+        )
+        (dropped if is_repeat else kept).append(new_q)
+
+    return kept, dropped
+
+
+def _sanitize_stage_1(s1: Stage1Output, text_context: str | None = None) -> list[str]:
     """
     Clean a validated Stage1Output in place. Returns notes on what changed.
 
     Safe to call on any Stage1Output, including the text-only fallback object.
+
+    text_context is passed on re-analysis runs so that extended backfill block 6
+    can detect Q/A-structured input and skip re-injecting questions the user has
+    already answered.
     """
     fixes: list[str] = []
 
@@ -1287,13 +1634,28 @@ def _sanitize_stage_1(s1: Stage1Output) -> list[str]:
     #      - uncertainty_notes is non-empty   (real text to draw from)
     #      - professional_assessment_recommended is False  (assessment-first cases stay put)
     #      - safety_concerns is empty         (hazard cases stay on their path)
+    #      - NOT a re-analysis with Q/A-structured text_context — on re-analysis the
+    #        model already saw the answers and deliberately left questions empty.
+    #        Re-injecting the original questions here would loop the case back into
+    #        clarification mode even though the user already responded.  The filter
+    #        (FILTER_REPEATED_CLARIFICATION_QUESTIONS) is a second safety net, but
+    #        it cannot reset diy_suitability after the backfill changes it to
+    #        "conditional", so blocking the backfill entirely is the right fix.
     #    Then: trade + uncertainty keywords must match a known method-changing pattern.
+    _is_reanalysis_qa = bool(
+        text_context
+        and (
+            "Q1:" in text_context
+            or text_context.strip().startswith("User answers")
+        )
+    )
     if (
         s1.diy_suitability == "suitable"
         and not s1.clarifying_questions
         and (s1.uncertainty_notes or "").strip()
         and not s1.professional_assessment_recommended
         and not s1.safety_concerns
+        and not _is_reanalysis_qa
     ):
         unc_lower = (s1.uncertainty_notes or "").casefold()
         tc = (s1.trade_category or "").strip().lower()
@@ -1446,7 +1808,7 @@ def _decide_actions(s1: Stage1Output) -> dict:
     }
 
 
-def _determine_output_mode(s1: Stage1Output) -> str:
+def _determine_output_mode(s1: Stage1Output, text_context: str | None = None) -> str:
     """
     Determine which pipeline output mode this Stage 1 result calls for.
 
@@ -1548,15 +1910,64 @@ def _determine_output_mode(s1: Stage1Output) -> str:
                     "trade": s1.trade_category,
                 },
             )
+            # ── Re-analysis bypass (feature-flagged) ──────────────────────────
+            # If text_context is present (re-analysis) and Stage 1 returned no
+            # questions, Stage 1 read the user's context and was satisfied.
+            # Routing to clarification here would be a false positive — trust
+            # Stage 1 and go directly to diy so Stages 2 and 3 run.
+            if _TRUST_STAGE1_ON_REANALYSIS and text_context and not s1.clarifying_questions:
+                log.info(
+                    "care_mode_hazard_gate_bypassed: text_context present and "
+                    "Stage 1 satisfied (no questions) — routing to diy."
+                )
+                return "diy"
             # Inject a clarification question so the pipeline has something to
             # surface to the user (block 2 in _determine_output_mode fires next).
+            #
+            # The question is tailored to the type of hazard word that triggered
+            # the gate:
+            #   Electrical words (spark, mains, live wire…) → ask whether this is
+            #     an electrical component, because that is the dangerous ambiguity.
+            #   Fire/heat/burn words without electrical context → ask what caused
+            #     the mark and what material is affected, because the answer
+            #     determines whether the repair is a simple surface treatment or
+            #     something that requires specialist attention.
+            #
+            # Using the electrical question for a surface burn mark (e.g. candle
+            # mark on wooden flooring) is unanswerable and traps the case in an
+            # infinite clarification loop.  Separating the two question types
+            # breaks that loop while preserving the safety gate for both hazard
+            # classes.
             if not s1.clarifying_questions:
-                s1.clarifying_questions = [
-                    "Can you describe what is happening in more detail? "
-                    "For example, is this an electrical component, metalwork, "
-                    "or something else? A clearer description will help identify "
-                    "the safest next step."
-                ]
+                _electrical_trigger_words: frozenset[str] = frozenset({
+                    "spark", "sparks", "electric", "electrical", "electricity",
+                    "mains", "voltage", "live wire", "live conductor",
+                    "fuse", "arc flash", "short circuit", "short-circuit",
+                })
+                _has_electrical_trigger = bool(
+                    {w for w in _electrical_trigger_words if w in _combined}
+                )
+                if _has_electrical_trigger:
+                    # Electrical / arcing context — the original question is
+                    # correct: confirm what the scene actually is before giving
+                    # any advice.
+                    s1.clarifying_questions = [
+                        "Can you describe what is happening in more detail? "
+                        "For example, is this an electrical component, metalwork, "
+                        "or something else? A clearer description will help identify "
+                        "the safest next step."
+                    ]
+                else:
+                    # Burn/heat/smoke without electrical indicators (e.g. a scorch
+                    # mark on flooring, a heat stain on a worktop).  Ask for cause
+                    # and surface type — the two unknowns that actually determine
+                    # the repair method and material choice.
+                    s1.clarifying_questions = [
+                        "What caused this mark or damage — for example, was it a "
+                        "candle, heat, a chemical, or friction? "
+                        "And what material is the affected surface "
+                        "(for example, wood, carpet, stone, or plastic)?"
+                    ]
             return "clarification"
         return "care"
 
@@ -1825,10 +2236,27 @@ async def _stage_1_analyse(
 
     user_prompt = "Examine the attached image(s) carefully. What physical object or fixture is shown, and what is damaged or needs repair?"
     if text_context:
-        user_prompt = (
-            f"The user has described the problem as: {text_context}\n\n"
-            + user_prompt
-        )
+        # Detect a structured Q/A block produced by _check_auto_reanalyse
+        # (format: "User answers to clarification questions:\nQ1: ...\nA1: ...").
+        # Use a stronger "do not re-ask" framing for structured blocks so Stage 1
+        # treats these as resolved topics rather than just context.
+        # Plain user descriptions keep the original "described the problem as" framing.
+        _has_qa_structure = "Q1:" in text_context or text_context.strip().startswith("User answers")
+        if _has_qa_structure:
+            user_prompt = (
+                "PREVIOUSLY RESOLVED — DO NOT RE-ASK:\n"
+                "The following questions were asked in a previous analysis round and "
+                "have been answered by the user. These topics are now known. "
+                "Do not include any of these in clarifying_questions — not even rephrased.\n\n"
+                f"{text_context}\n\n"
+                "Only raise a new clarifying_question if it covers a DIFFERENT unknown "
+                "that would materially change the repair method, safety assessment, or "
+                "tool/material choice, and that is NOT already answered above.\n\n"
+            ) + user_prompt
+        else:
+            user_prompt = (
+                f"The user has described the problem as: {text_context}\n\n"
+            ) + user_prompt
     user_prompt += " Return your diagnosis as a JSON object matching the schema described."
 
     messages = [

@@ -447,6 +447,11 @@ class ClarificationOutput(BaseModel):
     clarifying_questions: list[str] = [] # REQUIRED questions — block auto-reanalysis until answered
     optional_questions:   list[str] = [] # helpful extras — shown separately, do not block auto-reanalysis
     why_it_matters: str = ""             # why the answers change the recommendation
+    # True ONLY for the bounded-clarification fallback: the pipeline hit
+    # MAX_CLARIFICATION_ROUNDS and is no longer asking questions.  The frontend
+    # renders a distinct "could not reach a confident assessment" banner instead
+    # of a normal needs-answers card.  Default False keeps old analyses valid.
+    inconclusive: bool = False
 
 
 class CareOutput(BaseModel):
@@ -530,3 +535,12 @@ class AnalysisResponse(BaseModel):
     model: Optional[str]                # which model was used
 
     created_at: datetime.datetime
+    # The user's clarification answers passed to this re-analysis run.
+    # None for first-pass analyses.  Present when the case went through at least
+    # one clarification round — used by the frontend to show the "Updated after
+    # clarification" badge and the collapsible Q/A history section.
+    text_context: Optional[str] = None
+    # Hazardous-case acknowledgement, delegated from the owning session via the
+    # Analysis.hazard_ack property.  False until the user clicks "I Understand"
+    # on the assessment_first acknowledgement card.
+    hazard_ack: bool = False

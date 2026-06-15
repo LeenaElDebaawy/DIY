@@ -1,3 +1,4 @@
+import datetime
 from pathlib import Path
 
 from sqlalchemy import select
@@ -54,12 +55,19 @@ async def get_case(
     case_id: int,
     user_id: int,
 ) -> RepairSession | None:
-    """Return a single case if it exists and belongs to the user."""
+    """Return a single case if it exists and belongs to the user.
+
+    Analyses are selectinload-ed so that Session.output_mode and
+    Session.confidence (Python properties that read structured_result JSONB)
+    are accessible without triggering lazy-load errors in the async context.
+    """
     result = await db.execute(
-        select(RepairSession).where(
+        select(RepairSession)
+        .where(
             RepairSession.id == case_id,
             RepairSession.user_id == user_id,
         )
+        .options(selectinload(RepairSession.analyses))
     )
     return result.scalar_one_or_none()
 
@@ -85,6 +93,60 @@ async def patch_case(
     if title    is not None: case.title    = title
     if category is not None: case.category = category
     if status   is not None: case.status   = status
+    await db.commit()
+    await db.refresh(case)
+    return case
+
+
+async def acknowledge_hazard(
+    db: AsyncSession,
+    case_id: int,
+    user_id: int,
+) -> RepairSession | None:
+    """
+    Permanently record that the user has acknowledged the hazard notice for
+    this case.
+
+    Rules:
+    - Returns None if the case does not exist or belongs to another user.
+    - Returns 400 (raised here as ValueError) if the case's output_mode is
+      not 'assessment_first' — only hazardous cases may be acknowledged.
+    - Idempotent: if hazard_ack is already True the row is not modified and
+      the existing timestamp is preserved.
+
+    The output_mode is read from the latest completed Analysis.structured_result.
+    If no completed analysis exists yet the call is rejected with ValueError
+    ("no completed analysis") so the route handler can return 409.
+
+    P5 integration point: when hazard_events is implemented, emit a
+    HAZARD_ACK event inside this function after the commit.
+    """
+    from app.models import Analysis  # local import avoids circular dependency
+
+    case = await get_case(db, case_id, user_id)
+    if case is None:
+        return None
+
+    # Idempotent: already acknowledged — return as-is without touching timestamp.
+    if case.hazard_ack:
+        return case
+
+    # Verify the case is assessment_first before acknowledging.
+    analysis_result = await db.execute(
+        select(Analysis)
+        .where(Analysis.session_id == case_id, Analysis.status == "complete")
+        .order_by(Analysis.created_at.desc())
+        .limit(1)
+    )
+    analysis = analysis_result.scalar_one_or_none()
+    if analysis is None:
+        raise ValueError("no_completed_analysis")
+    output_mode = (analysis.structured_result or {}).get("output_mode", "diy")
+    if output_mode != "assessment_first":
+        raise ValueError(f"wrong_output_mode:{output_mode}")
+
+    case.hazard_ack = True
+    case.hazard_ack_at = datetime.datetime.now(datetime.timezone.utc)
     await db.commit()
     await db.refresh(case)
     return case

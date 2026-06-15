@@ -1,7 +1,7 @@
 import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -122,6 +122,18 @@ class Session(Base):
         nullable=False,
     )
 
+    # ── Hazardous-case acknowledgement ────────────────────────────────────────
+    # Set to True (with timestamp) when the user clicks "I Understand" on the
+    # hazard acknowledgement card shown for assessment_first cases.
+    # Stored permanently — not session-scoped — so it survives page reloads
+    # and forms the seed event for the P5 hazard_events audit trail.
+    hazard_ack: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    hazard_ack_at: Mapped[Optional[datetime.datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+
     # Optional relationship back to user
     user: Mapped[Optional["User"]] = relationship(back_populates="sessions")
 
@@ -135,6 +147,29 @@ class Session(Base):
     messages: Mapped[list["Message"]] = relationship(
         back_populates="session", cascade="all, delete-orphan"
     )
+
+    @property
+    def output_mode(self) -> Optional[str]:
+        """
+        Output mode of the latest completed analysis ('diy', 'assessment_first',
+        'clarification', 'care', 'verify_first').
+
+        Derived at read-time from Analysis.structured_result JSONB so no extra
+        column is needed.  Returns None for cases with no completed analysis.
+
+        Requires the analyses relationship to be pre-loaded (selectinload).
+        Returns None gracefully if the relationship is not loaded.
+        """
+        try:
+            rows = list(getattr(self, "analyses", None) or [])
+        except Exception:
+            return None
+        for analysis in sorted(rows, key=lambda a: a.id, reverse=True):
+            if analysis.status == "complete" and analysis.structured_result:
+                v = (analysis.structured_result or {}).get("output_mode")
+                if isinstance(v, str):
+                    return v
+        return None
 
     @property
     def confidence(self) -> Optional[int]:
@@ -259,6 +294,25 @@ class Analysis(Base):
 
     # Relationship back to session
     session: Mapped["Session"] = relationship(back_populates="analyses")
+
+    @property
+    def hazard_ack(self) -> bool:
+        """
+        Delegate to the owning session's hazard_ack flag.
+
+        Used by AnalysisResponse (from_attributes=True) so the frontend
+        receives the case-level acknowledgement state alongside the analysis
+        data — no extra API call required.
+
+        Requires the session relationship to be pre-loaded (selectinload)
+        before this property is accessed.  Returns False gracefully if the
+        relationship is not loaded or if any error occurs.
+        """
+        try:
+            sess = getattr(self, "session", None)
+            return bool(sess.hazard_ack) if sess is not None else False
+        except Exception:
+            return False
 
 
 # ---------------------------------------------------------------------------

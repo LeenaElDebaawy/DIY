@@ -5,7 +5,14 @@ from app.core.deps import get_current_user
 from app.database import get_db
 from app.models import User
 from app.schemas.cases import CaseCreate, CasePatch, CaseResponse
-from app.services.cases_service import create_case, delete_case, get_case, list_cases, patch_case
+from app.services.cases_service import (
+    acknowledge_hazard,
+    create_case,
+    delete_case,
+    get_case,
+    list_cases,
+    patch_case,
+)
 
 # Mounted under /api/v1 in router.py, so full paths are:
 #   POST   /api/v1/cases
@@ -65,6 +72,54 @@ async def patch_my_case(
     )
     if case is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Case not found.")
+    return case
+
+
+@router.patch(
+    "/{case_id}/hazard-ack",
+    response_model=CaseResponse,
+    summary="Acknowledge the hazard notice for an assessment-first case",
+)
+async def acknowledge_hazard_notice(
+    case_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Record that the user has read and acknowledged the hazardous-case safety
+    notice.
+
+    Rules:
+    - 404 if the case does not exist or belongs to another user.
+    - 400 if the case's output_mode is not 'assessment_first'.
+    - 409 if no completed analysis exists yet for the case.
+    - Idempotent: calling twice returns 200 with the existing timestamp unchanged.
+
+    On success returns the updated CaseResponse with hazard_ack=true and
+    hazard_ack_at set to the UTC timestamp of the first acknowledgement.
+    """
+    try:
+        case = await acknowledge_hazard(db, case_id, current_user.id)
+    except ValueError as exc:
+        msg = str(exc)
+        if msg == "no_completed_analysis":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="No completed analysis found for this case. "
+                       "Run the analysis first.",
+            )
+        # wrong_output_mode:diy / clarification / care / verify_first
+        mode = msg.split(":", 1)[-1] if ":" in msg else msg
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Hazard acknowledgement is only valid for assessment_first "
+                   f"cases (this case is '{mode}').",
+        )
+    if case is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Case not found.",
+        )
     return case
 
 

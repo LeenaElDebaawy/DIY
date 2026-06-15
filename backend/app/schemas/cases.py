@@ -39,3 +39,10 @@ class CaseResponse(BaseModel):
     # Derived from the latest completed Analysis.structured_result, None for
     # cases that have no completed analysis (still running, failed, or new).
     confidence: Optional[int] = None
+    # Hazardous-case acknowledgement — set permanently when the user clicks
+    # "I Understand" on assessment_first cases.  False for all other cases.
+    hazard_ack: bool = False
+    hazard_ack_at: Optional[datetime.datetime] = None
+    # Output mode of the latest completed analysis — derived from structured_result
+    # JSONB via Session.output_mode property.  None if no completed analysis yet.
+    output_mode: Optional[str] = None

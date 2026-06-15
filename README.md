@@ -1,4 +1,4 @@
-# Knitra — A Trust-Oriented Multimodal Repair Assessment System
+# Knitra : A Trust-Oriented Multimodal Repair Assessment System
 
 Knitra is a locally hosted, privacy-preserving research prototype that helps people
 assess household repair problems from a photograph. A user uploads an image of a

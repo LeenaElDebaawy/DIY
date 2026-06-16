@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api import analysis, auth, cases, chat, health, transcribe, uploads
+from app.api import analysis, auth, cases, chat, feedback, health, transcribe, uploads
 
 # Health routes stay at the root level
 router = APIRouter()
@@ -15,5 +15,7 @@ v1.include_router(analysis.router)  # /api/v1/cases/{case_id}/analyse  (POST tri
                                      # /api/v1/cases/{case_id}/analysis (GET result)
 v1.include_router(chat.router)       # /api/v1/cases/{case_id}/chat     (GET + POST)
 v1.include_router(transcribe.router) # /api/v1/transcribe               (POST audio→text)
+v1.include_router(feedback.user_router)   # /api/v1/cases/{case_id}/feedback (POST)
+v1.include_router(feedback.admin_router)  # /api/v1/admin/feedback/...       (admin-only)
 
 router.include_router(v1)

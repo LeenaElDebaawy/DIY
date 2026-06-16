@@ -69,11 +69,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
 from app.models import Analysis, Session as RepairSession, Upload
+from app.services.clarification_reasoning import assess_clarification, finalize_context
 from app.schemas.analysis import (
     AnalysisResult,
     AssessmentOutput,
     CareOutput,
     ClarificationOutput,
+    OutOfScopeOutput,
     RepairStep,
     Stage1Output,
     Stage2Output,
@@ -259,36 +261,33 @@ async def _build_manual_reanalysis_context(
     if not answer_msgs:
         return caller_text  # no current-round answers — textarea-only or none
 
-    # Build Q/A block (same format as auto re-analysis so the sanitiser guard works)
+    # Delegate coverage, content-aware question/answer mapping, and cumulative
+    # de-duplication to the shared clarification reasoning unit (the same unit the
+    # automatic path will adopt). The DB fetch above stays here; the unit is pure.
     clarif = prior_result.get("clarification") or {}
     questions = list((clarif.get("clarifying_questions") or []))
-
-    parts: list[str] = ["User answers to clarification questions:"]
-    for i, msg in enumerate(answer_msgs, 1):
-        q = questions[i - 1] if i <= len(questions) else ""
-        if q:
-            parts.append(f"Q{i}: {q}")
-        parts.append(f"A{i}: {msg.content.strip()}")
-
-    qa_block = "\n".join(parts)
-
-    # Prepend prior round's text_context so all rounds accumulate (round 1 lives
-    # there; this qa_block is the current round only — no duplication).
+    optional = list((clarif.get("optional_questions") or []))
+    answer_texts = [m.content for m in answer_msgs]
     prior_ctx = (latest_analysis.text_context or "").strip()
-    if prior_ctx:
-        text_context = prior_ctx + "\n\n" + qa_block
-    else:
-        text_context = qa_block
 
-    # Append textarea note if the user also typed something
-    note = (caller_text or "").strip()
-    if note:
-        text_context += f"\n\nAdditional note from user: {note}"
+    assessment = assess_clarification(
+        required_questions=questions,
+        answer_messages=answer_texts,
+        prior_context=prior_ctx or None,
+        optional_questions=optional,
+    )
+    # Final assembly is shared with the automatic path (finalize_context) so both
+    # paths produce identical context for identical inputs. Manual re-analysis is a
+    # deliberate override, so it passes the textarea note and still proceeds even
+    # when coverage is incomplete; unmapped answers are preserved, never dropped.
+    text_context = finalize_context(assessment, answer_texts, note=caller_text)
 
     log.info(
-        "manual_reanalysis_context_built case=%d round_answers=%d opener=%s prior_ctx=%s note=%s",
-        case_id, len(answer_msgs), "yes" if opener else "no",
-        "yes" if prior_ctx else "no", "yes" if note else "no",
+        "manual_reanalysis_context_built case=%d round_answers=%d mapped=%d "
+        "ready=%s opener=%s prior_ctx=%s note=%s",
+        case_id, len(answer_msgs), len(assessment.resolved_pairs),
+        assessment.ready, "yes" if opener else "no",
+        "yes" if prior_ctx else "no", "yes" if (caller_text or "").strip() else "no",
     )
     return text_context
 
@@ -1049,6 +1048,60 @@ async def _run_pipeline(
                 )
                 log.info("Pipeline complete (assessment_first), S1:%ds SA:%ds total:%ds",
                          _ms_s1 // 1000, _ms_sa // 1000, _ms_total // 1000)
+                await db.commit()
+
+            elif _mode == "out_of_scope":
+                # ── Out-of-scope — active emergency OR not a repair image ──────
+                # Stage 1's scope decision short-circuited here. Run NO further
+                # stages (no Stage A/2/3): no repair plan, tools, materials, steps,
+                # or trade-professional referral. Build a deterministic guidance
+                # object from the scope value — no extra model call.
+                _scope = (s1.scope or "not_repair")
+                _is_emergency = (_scope == "emergency")
+                if _is_emergency:
+                    _oos = OutOfScopeOutput(
+                        scope=_scope,
+                        is_emergency=True,
+                        headline="This looks like an active emergency",
+                        guidance=(
+                            "This appears to be an active emergency. Move away from danger, "
+                            "evacuate if necessary, and contact emergency services. Do not "
+                            "attempt a repair while the hazard is active."
+                        ),
+                    )
+                else:
+                    _oos = OutOfScopeOutput(
+                        scope=_scope,
+                        is_emergency=False,
+                        headline="No repair issue identified",
+                        guidance=(
+                            "Knitra could not identify an in-scope household repair issue from "
+                            "this image. Please upload a clear image of the damaged area or "
+                            "repair concern."
+                        ),
+                    )
+                combined = AnalysisResult(
+                    output_mode="out_of_scope",
+                    stage_1=s1,
+                    out_of_scope=_oos,
+                    # stage_2 / stage_3 / assessment intentionally omitted (None)
+                )
+                _ms_total = int((time.monotonic() - start) * 1000)
+                analysis.structured_result  = combined.model_dump()
+                analysis.status             = "complete"
+                analysis.pipeline_stage     = "complete"
+                if case_row is not None:
+                    case_row.status = "complete"
+                    case_row.clarification_round = 0
+                analysis.processing_time_ms = _ms_total
+                analysis.provider           = "ollama"
+                analysis.model              = f"{STAGE_1_MODEL} (out_of_scope/{_scope})"
+                analysis.validation_issues  = (
+                    f'{{"stage_1_ms":{_ms_s1},"total_ms":{_ms_total},'
+                    f'"mode":"out_of_scope","scope":"{_scope}"}}'
+                )
+                log.info("Pipeline complete (out_of_scope), scope=%s S1:%ds total:%ds",
+                         _scope, _ms_s1 // 1000, _ms_total // 1000)
                 await db.commit()
 
             elif _mode == "clarification":
@@ -1855,13 +1908,36 @@ def _determine_output_mode(s1: Stage1Output, text_context: str | None = None) ->
     effects and no model calls. All five test cases must return the expected mode
     before any other pipeline stage runs.
     """
+    # ── 0. Scope gate (highest priority) ──────────────────────────────────────
+    # Decided by the model BEFORE any repair routing. Anything that is not an
+    # in-scope repair (active emergency, a non-repair image, or too ambiguous to
+    # tell) short-circuits to the terminal out_of_scope mode — no Stage 2/3/A, no
+    # repair plan, no trade-professional referral. This is the deterministic
+    # enforcement of the model-led scope decision: it removes the pressure that
+    # forced an emergency (e.g. a stovetop fire) into a fabricated repair trade.
+    # "unclear" is routed here rather than to clarification because clarification
+    # is built around answering repair-specific questions about an in-scope
+    # repair; an image that may not be a repair at all has no such questions, so
+    # the safe minimal response is "we couldn't identify a repair, send a clearer
+    # repair image" — the same out_of_scope guidance, worded for ambiguity.
+    if (s1.scope or "repair") != "repair":
+        return "out_of_scope"
+
     diy = (s1.diy_suitability or "conditional").strip().lower()
     has_hazard = bool(s1.safety_concerns)
 
     # ── 1. Assessment-first ───────────────────────────────────────────────────
-    # Model said professional assessment is needed OR the job is not DIY-suitable,
-    # AND it can name a concrete hazard to justify that call.
-    if (s1.professional_assessment_recommended or diy == "not_recommended") and has_hazard:
+    # diy_suitability == "not_recommended" is a HARD escalation: the model has said
+    # a competent DIYer should NOT attempt this, which is fundamentally incompatible
+    # with producing a DIY plan. Escalate even when no concrete hazard was named —
+    # the safe failure direction is over-caution, never a contradictory full plan.
+    # (Stage A produces a coherent assessment from the wider context when
+    # safety_concerns is empty, so no hazard synthesis is required here.)
+    if diy == "not_recommended":
+        return "assessment_first"
+    # The professional-assessment-recommended path keeps the named-hazard guard so a
+    # vague over-call without any justification does not escalate on its own.
+    if s1.professional_assessment_recommended and has_hazard:
         return "assessment_first"
 
     # ── 2. Clarification ──────────────────────────────────────────────────────
@@ -1872,11 +1948,13 @@ def _determine_output_mode(s1: Stage1Output, text_context: str | None = None) ->
         return "clarification"
 
     # ── 3. Verify-first ───────────────────────────────────────────────────────
-    # High hidden-damage risk without full professional assessment requirement:
-    # the repair may be DIY but there is significant unknown behind the surface.
-    # This is checked BEFORE care because hidden=high always warrants a warning
-    # even on an otherwise low-risk maintenance subject.
-    if s1.hidden_damage_risk == "high":
+    # The repair may be DIY, but either important damage may be hidden from the
+    # photo (hidden_damage_risk=high) OR the model rated the job high/critical risk.
+    # Either warrants verification before committing. Checked AFTER assessment-first
+    # and clarification so a stronger escalation always wins. Including risk_level
+    # here aligns the authoritative router with _decide_actions, which already used
+    # it, closing a divergence that let high-risk cases fall through to diy.
+    if s1.hidden_damage_risk == "high" or s1.risk_level in ("high", "critical"):
         return "verify_first"
 
     # ── 4. Care ───────────────────────────────────────────────────────────────
@@ -2072,6 +2150,12 @@ async def _stage_1_analyse(
         "  that exact condition is plainly visible. If you are INFERRING a likely cause, failure\n"
         "  mode, or hidden damage, do NOT put it in observations, put it in uncertainty_notes.\n\n"
         "You must return a single JSON object with exactly these fields:\n"
+        "  scope               : decide first, one of: repair, emergency, not_repair, unclear.\n"
+        "                        emergency = active fire/flames/smoke, active flooding, collapse in\n"
+        "                        progress, or a person in danger. not_repair = not a household repair\n"
+        "                        (food, pet, person, scenery, screenshot). unclear = cannot tell.\n"
+        "                        repair = an ordinary household repair. When scope is not repair, set\n"
+        "                        trade_category to general/other and do not invent a repair fault.\n"
         "  problem_type        : string, name the specific damage you can actually SEE, matching\n"
         "                        your main observation (e.g. 'Hole through cabinet door panel',\n"
         "                        'Leaking pipe joint', 'Cracked wall plaster'). Do not guess a\n"
@@ -2178,13 +2262,15 @@ async def _stage_1_analyse(
         "                        should inspect BEFORE any repair, because the photo cannot establish\n"
         "                        safety or the correct fix AND a real hazard is present. False for\n"
         "                        ordinary visible DIY repairs.\n"
-        "  safety_concerns     : array naming the SPECIFIC hazards you can actually justify from the\n"
-        "                        scene (e.g. 'electric shock from live conductors', 'concealed\n"
-        "                        structural damage', 'fuel/airbag systems'). CONSISTENCY RULE: if you\n"
-        "                        set risk_level to high or critical, OR diy_suitability to\n"
-        "                        not_recommended, OR professional_assessment_recommended to true, you\n"
-        "                        MUST name at least one concrete hazard here. If you cannot name a\n"
-        "                        real hazard, the risk is LOW and the job is suitable, leave this [].\n"
+        "  safety_concerns     : array naming hazards that are VISIBLE in the image (a clearly\n"
+        "                        visible danger such as fire or standing water counts). Do NOT claim\n"
+        "                        exposed mains, exposed conductors, or an electrical fault unless\n"
+        "                        bare/charred wiring is actually visible; a hazard you only infer goes\n"
+        "                        in uncertainty_notes, not here. CONSISTENCY RULE: if risk_level is\n"
+        "                        high/critical, OR diy_suitability is not_recommended, OR\n"
+        "                        professional_assessment_recommended is true, name the visible hazard\n"
+        "                        plainly rather than inventing a mechanism. If you cannot name any\n"
+        "                        real visible hazard, the risk is LOW and the job is suitable, [].\n"
         "  clarifying_questions: Work through these three checks before deciding what to ask:\n"
         "      CHECK 1: What am I NOT sure about that would change my DIAGNOSIS of what is broken?\n"
         "      CHECK 2: What would change whether this is safe for DIY or needs a professional?\n"
@@ -2227,10 +2313,11 @@ async def _stage_1_analyse(
         "  'Approximately how wide is the mark?',\n"
         "  'Does the surface feel soft, cracked, raised, or deeply charred?'],\n"
         "  optional_questions ['Can you upload a closer photo in natural light?'].\n"
-        "  Exposed/live mains, consumer unit, or scorched wiring -> risk_level critical,\n"
-        "  diy_suitability not_recommended, professional_assessment_recommended true,\n"
-        "  safety_concerns ['electric shock from live mains'], clarifying_questions [],\n"
-        "  optional_questions [].\n\n"
+        "  Visibly exposed/charred wiring -> scope repair, risk_level critical, not_recommended,\n"
+        "  safety_concerns about exposed conductors (visible), professional_assessment_recommended true.\n"
+        "  Active fire or flames (e.g. a pan on fire) -> scope emergency, trade_category general/other,\n"
+        "  safety_concerns name the visible fire; do not infer exposed mains unless wiring is visible.\n"
+        "  Not a repair (food, pet, person, scenery, screenshot) -> scope not_repair, general/other.\n\n"
         "Return ONLY the JSON object.  No explanation, no markdown, no extra text."
     )
 

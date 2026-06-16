@@ -1,14 +1,15 @@
 import datetime
 from pathlib import Path
 
-from sqlalchemy import select
+from fastapi import HTTPException, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 # The ORM model is named Session (a repair session).
 # We alias it to RepairSession here to avoid confusion with
 # SQLAlchemy's own AsyncSession class, which is also in scope.
-from app.models import Session as RepairSession, Upload
+from app.models import Feedback, Session as RepairSession, Upload
 
 
 async def create_case(
@@ -180,6 +181,19 @@ async def delete_case(
     case = result.scalar_one_or_none()
     if case is None:
         return False
+
+    # Safety-evidence guard: refuse to delete a case that carries safety feedback,
+    # so a reported safety incident's originating analysis is preserved for review.
+    _safety_n = (await db.execute(
+        select(func.count()).select_from(Feedback).where(
+            Feedback.session_id == case_id, Feedback.is_safety.is_(True)
+        )
+    )).scalar_one()
+    if _safety_n > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This case has safety feedback and cannot be deleted while under review.",
+        )
 
     # backend/uploads/, resolved relative to this file so it is correct
     # regardless of where uvicorn is launched from.

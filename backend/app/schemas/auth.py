@@ -38,6 +38,9 @@ class UserResponse(BaseModel):
     email: str
     name: str
     plan: str
+    # Computed from the ADMIN_EMAILS allow-list (User.is_admin property). Used by
+    # the frontend to show the admin nav item; access is enforced server-side.
+    is_admin: bool = False
 
 
 class AuthResponse(BaseModel):

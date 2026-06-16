@@ -5,7 +5,10 @@ import httpx
 from nicegui import app, ui
 from nicegui.events import UploadEventArguments
 
-BACKEND = "http://127.0.0.1:8000"
+# TEMP: pointing at 8001 because an orphaned socket holds port 8000 with stale
+# backend code. After a reboot (which clears the zombie), change this back to 8000
+# and run the backend normally on 8000.
+BACKEND = "http://127.0.0.1:8001"
 API     = f"{BACKEND}/api/v1"
 
 STATUS = {
@@ -510,6 +513,11 @@ def sidebar(active_path: str = "/cases"):
             nav("📋", "My Cases", "/cases")
             nav("➕", "New Case", "/new")
 
+            # Admin-only: feedback dashboard. Shown only when the logged-in user is
+            # an admin (UX gate; access is enforced server-side via require_admin).
+            if app.storage.user.get("is_admin", False):
+                nav("📊", "Feedback", "/admin/feedback")
+
             ui.html(
                 '<div style="height:1px;background:rgba(255,255,255,0.05);'
                 'margin:10px 16px;"></div>'
@@ -758,6 +766,7 @@ async def register_page():
                             app.storage.user["token"] = d["token"]
                             app.storage.user["name"]  = d["user"]["name"]
                             app.storage.user["email"] = d["user"]["email"]
+                            app.storage.user["is_admin"] = d["user"].get("is_admin", False)
                             ui.navigate.to("/cases")
                         elif r.status_code == 409:
                             err.set_text("An account with this email already exists.")
@@ -836,6 +845,7 @@ async def login_page():
                             app.storage.user["token"] = d["token"]
                             app.storage.user["name"]  = d["user"]["name"]
                             app.storage.user["email"] = d["user"]["email"]
+                            app.storage.user["is_admin"] = d["user"].get("is_admin", False)
                             ui.navigate.to("/cases")
                         elif r.status_code == 401:
                             err.set_text("Incorrect email or password.")
@@ -2177,7 +2187,7 @@ async def case_detail_page(case_id: int):
                                 ui.navigate.to(f"/cases/{case_id}")
 
                             ui.button(
-                                "I Understand",
+                                "I understand and accept responsibility",
                                 on_click=_on_hazard_ack,
                             ).props("unelevated color=negative").style(
                                 "font-weight:700;width:100%;"
@@ -2460,6 +2470,63 @@ async def case_detail_page(case_id: int):
                     f'</div>'
                 )
 
+            def _draw_out_of_scope(sr: dict):
+                """Render the out_of_scope mode: active emergency OR non-repair image.
+
+                Shows ONLY guidance — never tools, materials, PPE, repair steps, or a
+                trade-professional referral. Emergency uses a red banner and emergency
+                guidance; non-repair / unclear uses a neutral amber 'send a clearer
+                repair image' card.
+                """
+                oos = sr.get("out_of_scope") or {}
+                is_emergency = bool(oos.get("is_emergency"))
+                headline = oos.get("headline") or (
+                    "This looks like an active emergency" if is_emergency
+                    else "No repair issue identified"
+                )
+                guidance = oos.get("guidance") or (
+                    "This appears to be an active emergency. Move away from danger, "
+                    "evacuate if necessary, and contact emergency services. Do not "
+                    "attempt a repair while the hazard is active."
+                    if is_emergency else
+                    "Knitra could not identify an in-scope household repair issue from this "
+                    "image. Please upload a clear image of the damaged area or repair concern."
+                )
+                with ui.element("div").style(
+                    "padding:22px 24px;display:flex;flex-direction:column;gap:14px;"
+                ):
+                    if is_emergency:
+                        ui.html(
+                            f'<div style="background:#fef2f2;border:1px solid #fca5a5;'
+                            f'border-radius:12px;padding:18px 20px;'
+                            f'display:flex;align-items:flex-start;gap:12px;">'
+                            f'<span style="font-size:1.5rem;line-height:1;flex-shrink:0;">'
+                            f'&#128721;</span>'
+                            f'<div>'
+                            f'<div style="font-weight:800;color:#991b1b;font-size:1rem;'
+                            f'margin-bottom:6px;">{headline}</div>'
+                            f'<div style="font-size:0.88rem;color:#7f1d1d;line-height:1.6;">'
+                            f'{guidance}</div>'
+                            f'<div style="font-size:0.82rem;color:#991b1b;font-weight:700;'
+                            f'margin-top:10px;">Call emergency services now if anyone is in '
+                            f'danger.</div>'
+                            f'</div></div>'
+                        )
+                    else:
+                        ui.html(
+                            f'<div style="background:#fffbeb;border:1px solid #fcd34d;'
+                            f'border-radius:12px;padding:18px 20px;'
+                            f'display:flex;align-items:flex-start;gap:12px;">'
+                            f'<span style="font-size:1.4rem;line-height:1;flex-shrink:0;">'
+                            f'&#128247;</span>'
+                            f'<div>'
+                            f'<div style="font-weight:700;color:#92400e;font-size:0.95rem;'
+                            f'margin-bottom:4px;">{headline}</div>'
+                            f'<div style="font-size:0.86rem;color:#78350f;line-height:1.6;">'
+                            f'{guidance}</div>'
+                            f'</div></div>'
+                        )
+
             def _draw_complete(data: dict):
                 """Full result view. Routes to the correct render function based
                 on output_mode stored in structured_result. Old analyses without
@@ -2482,6 +2549,11 @@ async def case_detail_page(case_id: int):
 
                 if mode == "clarification":
                     _draw_clarification(sr)
+                    _draw_time_footer(ms)
+                    return
+
+                if mode == "out_of_scope":
+                    _draw_out_of_scope(sr)
                     _draw_time_footer(ms)
                     return
 
@@ -2737,6 +2809,55 @@ async def case_detail_page(case_id: int):
                         '<strong style="color:#475569;">You are responsible for any actions you take.</strong>'
                         '</p></div>'
                     )
+
+                    # ── Professional-required guard (rendering safety net) ─────
+                    # If Stage 3 judged this NOT DIY-suitable, withhold the entire
+                    # repair plan (What you'll need / tools / materials / PPE / steps).
+                    # Showing "Professional required" alongside DIY steps is an unsafe
+                    # contradiction. Backend routing now sends most such cases to
+                    # assessment_first; this guard also fixes ALREADY-STORED analyses
+                    # (e.g. case 167) without re-analysis. Render guidance only, then
+                    # exit _draw_complete before any plan section.
+                    if not diy_ok:
+                        _who = f"a {pro_type}" if pro_type else "a qualified professional"
+                        _reason = (s3.get("when_to_call_professional") or "").strip()
+                        if not _reason:
+                            _concerns = s1.get("safety_concerns") or []
+                            _reason = (
+                                "; ".join(_concerns) if _concerns
+                                else "This repair carries risks that should be assessed in person."
+                            )
+                        with ui.element("div").style(
+                            "padding:22px 24px;display:flex;flex-direction:column;gap:14px;"
+                        ):
+                            ui.html(
+                                f'<div style="background:#fef2f2;border:1px solid #fecaca;'
+                                f'border-radius:10px;padding:14px 16px;">'
+                                f'<div style="font-weight:700;color:#991b1b;font-size:0.85rem;'
+                                f'margin-bottom:4px;">Why a professional is needed</div>'
+                                f'<div style="color:#7f1d1d;font-size:0.83rem;line-height:1.6;">'
+                                f'{_reason}</div></div>'
+                            )
+                            ui.html(
+                                f'<div style="background:#f8fafc;border:1px solid #e2e8f0;'
+                                f'border-radius:10px;padding:14px 16px;">'
+                                f'<div style="font-weight:700;color:#334155;font-size:0.85rem;'
+                                f'margin-bottom:4px;">What to do next</div>'
+                                f'<div style="color:#475569;font-size:0.83rem;line-height:1.6;">'
+                                f'Contact {_who} to assess and carry out this repair. '
+                                f'Do not attempt it yourself.</div></div>'
+                            )
+                            ui.html(
+                                '<div style="display:flex;align-items:flex-start;gap:8px;'
+                                'background:#fffbeb;border:1px solid #fcd34d;'
+                                'border-radius:10px;padding:12px 14px;">'
+                                '<span style="font-size:0.95rem;flex-shrink:0;">&#9888;&#65039;</span>'
+                                '<div style="font-size:0.82rem;color:#78350f;line-height:1.55;">'
+                                'Step-by-step repair instructions are intentionally withheld for this '
+                                'case because it should be handled by a professional.</div></div>'
+                            )
+                        _draw_time_footer(data.get("processing_time_ms") or 0)
+                        return
 
                     # ── Safety acknowledgement gate ──────────────────────────
                     # Shown once per browser session before sections 2-5 are
@@ -3199,6 +3320,135 @@ async def case_detail_page(case_id: int):
                             f'{issue}</div>'
                         )
 
+            # ── Feedback widget (Phase 1) ────────────────────────────────────
+            # Shown under any completed result. Mode-aware second question. Posts
+            # to /cases/{id}/feedback. Safety options are sent as safety_category
+            # (the backend also auto-flags hazardous/emergency modes).
+            def _draw_feedback_widget(data: dict):
+                analysis_id = data.get("id")
+                sr = data.get("structured_result") or {}
+                mode = sr.get("output_mode", "diy")
+                if not analysis_id:
+                    return
+                _done_key = f"fb_done_{analysis_id}"
+
+                # Mode-aware issue options: (label, kind, value). kind: "issue" | "safety".
+                _common = [
+                    ("Wrong severity / risk", "issue", "wrong_severity"),
+                    ("Wrong trade / category", "issue", "wrong_trade"),
+                    ("Something else", "issue", "other"),
+                ]
+                _by_mode = {
+                    "diy": [
+                        ("Steps were unclear or incomplete", "issue", "steps_unclear"),
+                        ("Wrong DIY recommendation", "issue", "wrong_diy_recommendation"),
+                        ("Should have recommended a professional", "issue", "wrong_professional_recommendation"),
+                    ],
+                    "verify_first": [
+                        ("Steps were unclear or incomplete", "issue", "steps_unclear"),
+                        ("Wrong DIY recommendation", "issue", "wrong_diy_recommendation"),
+                    ],
+                    "assessment_first": [
+                        ("Professional escalation was not appropriate", "issue", "wrong_professional_recommendation"),
+                        ("Recommendation felt unsafe", "safety", "unsafe_recommendation"),
+                        ("A real hazard was missed", "safety", "missed_hazard"),
+                    ],
+                    "clarification": [
+                        ("The questions were not useful", "issue", "clarification_not_useful"),
+                        ("Scope decision was wrong", "issue", "scope_incorrect"),
+                    ],
+                    "care": [
+                        ("The care advice was not useful", "issue", "care_not_useful"),
+                    ],
+                    "out_of_scope": [
+                        ("Scope decision was incorrect", "issue", "scope_incorrect"),
+                        ("This was wrongly called an emergency", "safety", "incorrect_emergency"),
+                        ("A real emergency was missed", "safety", "missed_emergency"),
+                    ],
+                }
+                _opts = _by_mode.get(mode, _by_mode["diy"]) + _common
+                _label_map = {lbl: (kind, val) for (lbl, kind, val) in _opts}
+
+                _heading = {
+                    "assessment_first": "Was the professional recommendation right?",
+                    "clarification":    "Were these questions helpful?",
+                    "care":             "Was this care advice useful?",
+                    "out_of_scope":     "Was this the right call?",
+                }.get(mode, "Was this assessment helpful?")
+
+                with ui.element("div").style(
+                    "margin-top:10px;background:white;border:1px solid #e2e8f0;"
+                    "border-radius:14px;padding:18px 22px;"
+                ):
+                    if app.storage.user.get(_done_key, False):
+                        ui.html(
+                            '<div style="display:flex;align-items:center;gap:8px;'
+                            'color:#15803d;font-size:0.86rem;font-weight:600;">'
+                            '<span>&#10003;</span><span>Thanks — your feedback was recorded.</span></div>'
+                        )
+                        return
+
+                    ui.html(
+                        f'<div style="font-weight:700;color:#0f172a;font-size:0.9rem;'
+                        f'margin-bottom:10px;">{_heading}</div>'
+                    )
+                    rating = ui.radio(
+                        {"helpful": "Helpful", "partial": "Partially", "not": "No"},
+                    ).props("inline").style("font-size:0.85rem;")
+
+                    issue_select = ui.select(
+                        list(_label_map.keys()), label="What was the main issue?",
+                    ).props("outlined dense").style("width:100%;margin-top:8px;display:none;")
+                    comment = ui.textarea(
+                        placeholder="Optional: what actually happened? (helps us improve)",
+                    ).props("outlined dense autogrow rows=2").style(
+                        "width:100%;margin-top:8px;font-size:0.85rem;"
+                    )
+
+                    def _on_rating(_=None):
+                        # Reveal the issue dropdown only for partial/no.
+                        issue_select.style(
+                            "width:100%;margin-top:8px;display:block;"
+                            if rating.value in ("partial", "not")
+                            else "width:100%;margin-top:8px;display:none;"
+                        )
+                    rating.on_value_change(_on_rating)
+
+                    _msg = ui.label("").style("font-size:0.8rem;color:#dc2626;min-height:16px;margin-top:6px;")
+
+                    async def _submit():
+                        if not rating.value:
+                            _msg.set_text("Please choose Helpful, Partially, or No.")
+                            return
+                        body = {"analysis_id": analysis_id, "rating": rating.value}
+                        if rating.value in ("partial", "not") and issue_select.value:
+                            kind, val = _label_map.get(issue_select.value, ("issue", "other"))
+                            if kind == "safety":
+                                body["safety_category"] = val
+                            else:
+                                body["issue_category"] = val
+                        if (comment.value or "").strip():
+                            body["comment"] = comment.value.strip()
+                        try:
+                            async with httpx.AsyncClient() as c:
+                                r = await c.post(
+                                    f"{API}/cases/{case_id}/feedback",
+                                    json=body,
+                                    headers={"Authorization": f"Bearer {token}"},
+                                    timeout=10.0,
+                                )
+                            if r.status_code in (200, 201):
+                                app.storage.user[_done_key] = True
+                                _redraw(data)   # re-render → thank-you state
+                            else:
+                                _msg.set_text(f"Could not submit ({r.status_code}). Please try again.")
+                        except Exception:
+                            _msg.set_text("Could not reach the server. Please try again.")
+
+                    ui.button("Submit feedback", on_click=_submit) \
+                        .props("unelevated color=primary size=sm") \
+                        .style("font-weight:600;margin-top:8px;")
+
             # ── Master redraw, called on every state transition ──────────────
             def _redraw(data):
                 """
@@ -3215,6 +3465,13 @@ async def case_detail_page(case_id: int):
                 _inconclusive_ref["v"] = bool(
                     (_sr_now.get("clarification") or {}).get("inconclusive")
                 )
+                # Track out-of-scope (emergency / not_repair) — chat gives no repair help
+                _out_of_scope_ref["v"] = (
+                    (_sr_now.get("out_of_scope") or {}).get("scope", "")
+                    if _sr_now.get("output_mode") == "out_of_scope" else ""
+                )
+                # Track diy/verify_first — the only modes with the "Before you begin" gate
+                _diy_mode_ref["v"] = _sr_now.get("output_mode") in ("diy", "verify_first")
                 # Lock Ask Knitra when the case is assessment_first and unacknowledged
                 _chat_locked_ref["v"] = (
                     ((data or {}).get("structured_result") or {}).get("output_mode") == "assessment_first"
@@ -3264,6 +3521,7 @@ async def case_detail_page(case_id: int):
                         _draw_running(data)
                     elif status == "complete":
                         _draw_complete(data)
+                        _draw_feedback_widget(data)
                     elif status == "needs_clarification":
                         _draw_needs_clarification(data)
                     elif status == "failed":
@@ -3285,6 +3543,18 @@ async def case_detail_page(case_id: int):
             # tell the user to "answer the questions below" — there are none.
             # Updated by _redraw; read by _render_chat_section.
             _inconclusive_ref = {"v": False}
+
+            # Mutable cell: "emergency" / "not_repair" / "" — set when output_mode is
+            # out_of_scope. Ask Knitra must not give repair guidance in these states.
+            # Updated by _redraw; read by _render_chat_section.
+            _out_of_scope_ref = {"v": ""}
+
+            # Mutable cell: True when output_mode is diy/verify_first — the ONLY modes
+            # that hide repair steps behind the "Before you begin" acknowledgement. The
+            # DIY chat gate must apply only to these; otherwise it wrongly blocks Ask
+            # Knitra for assessment_first (after hazard ack) and care cases, which have
+            # no such steps gate. Updated by _redraw; read by _render_chat_section.
+            _diy_mode_ref = {"v": False}
 
             # Mutable cell: True when the case is assessment_first AND the user has NOT yet
             # acknowledged the hazard notice.  Locks Ask Knitra until "I Understand" is clicked.
@@ -3348,6 +3618,14 @@ async def case_detail_page(case_id: int):
                 (((_initial or {}).get("structured_result") or {}).get("clarification") or {})
                 .get("inconclusive")
             )
+            # Seed out-of-scope ref (emergency / not_repair)
+            _initial_sr = ((_initial or {}).get("structured_result") or {})
+            _out_of_scope_ref["v"] = (
+                (_initial_sr.get("out_of_scope") or {}).get("scope", "")
+                if _initial_sr.get("output_mode") == "out_of_scope" else ""
+            )
+            # Seed diy-mode ref (diy / verify_first only)
+            _diy_mode_ref["v"] = _initial_sr.get("output_mode") in ("diy", "verify_first")
             # Seed chat-locked ref: assessment_first + not yet acknowledged
             _chat_locked_ref["v"] = (
                 ((_initial or {}).get("structured_result") or {}).get("output_mode") == "assessment_first"
@@ -3434,14 +3712,52 @@ async def case_detail_page(case_id: int):
                             )
                         return
 
+                    # ── Out-of-scope placeholder ───────────────────────────────
+                    # For emergency / not_repair cases Ask Knitra must not give repair
+                    # guidance. Emergency points to emergency services; non-repair asks
+                    # for a proper repair image.
+                    if _out_of_scope_ref["v"]:
+                        _oos_scope = _out_of_scope_ref["v"]
+                        if _oos_scope == "emergency":
+                            _oos_icon, _oos_color, _oos_msg = (
+                                "&#128721;", "#991b1b",
+                                "Ask Knitra is unavailable for active emergencies. Move to "
+                                "safety and contact emergency services. Knitra does not provide "
+                                "guidance while a hazard is active.",
+                            )
+                        else:
+                            _oos_icon, _oos_color, _oos_msg = (
+                                "&#128247;", "#92400e",
+                                "Ask Knitra opens once a household repair has been identified. "
+                                "Please upload a clear image of the repair problem above.",
+                            )
+                        with ui.element("div").style(
+                            "background:white;border:1px solid #e2e8f0;"
+                            "border-radius:14px;padding:28px 24px;text-align:center;"
+                        ):
+                            ui.html(
+                                f'<div style="font-size:2rem;margin-bottom:10px;'
+                                f'opacity:0.5;">{_oos_icon}</div>'
+                                f'<div style="font-weight:700;color:{_oos_color};'
+                                f'font-size:0.95rem;margin-bottom:8px;">Ask Knitra</div>'
+                                f'<div style="color:#64748b;font-size:0.83rem;'
+                                f'line-height:1.6;max-width:380px;margin:0 auto;">'
+                                f'{_oos_msg}</div>'
+                            )
+                        return
+
                     # ── DIY safety-gate placeholder ────────────────────────────
                     # In DIY mode, the repair steps are hidden behind the "Before
                     # you begin" acknowledgement. Keep the chat locked to the same
                     # gate so there is no gap between seeing the steps and being
                     # able to ask questions about them.
+                    # Applies ONLY to diy/verify_first (the modes that gate repair steps
+                    # behind "Before you begin"). For assessment_first the hazard
+                    # acknowledgement is the relevant gate — once given, Ask Knitra opens.
                     _ack_key     = f"ack_{case_id}"
                     _diy_unacked = (
-                        not is_clarif_mode
+                        _diy_mode_ref["v"]
+                        and not is_clarif_mode
                         and not _chat_locked_ref["v"]
                         and not app.storage.user.get(_ack_key, False)
                     )
@@ -4790,6 +5106,94 @@ async def new_case_page():
     }
     </script>""")
 
+    # ── Camera capture (Stage 1B: in-app webcam via getUserMedia) ──────────────
+    # Isolated head block. Reuses fixlyHandleFiles/_fixlyFiles from the block above
+    # so a captured frame flows through the EXACT same compress/preview/submit path
+    # as an uploaded image. No backend, model, or schema involvement.
+    ui.add_head_html("""<script>
+    window._fixlyCamStream = null;
+    window._fixlyCamFacing = 'environment';   // rear camera by default
+
+    function _fixlyCamMsg(msg, isError) {
+      const el = document.getElementById('fixly-cam-msg');
+      if (!el) return;
+      el.textContent = msg || '';
+      el.style.color = isError ? '#fca5a5' : '#e2e8f0';
+      el.style.display = msg ? 'block' : 'none';
+    }
+
+    function _fixlyCamStop() {
+      if (window._fixlyCamStream) {
+        window._fixlyCamStream.getTracks().forEach(function(t){ t.stop(); });
+        window._fixlyCamStream = null;
+      }
+      const v = document.getElementById('fixly-cam-video');
+      if (v) v.srcObject = null;
+    }
+
+    function fixlyCloseCamera() {
+      _fixlyCamStop();
+      const ov = document.getElementById('fixly-cam-overlay');
+      if (ov) ov.style.display = 'none';
+    }
+
+    async function _fixlyCamStart() {
+      _fixlyCamStop();
+      const v  = document.getElementById('fixly-cam-video');
+      const fb = document.getElementById('fixly-cam-fallback');
+      if (fb) fb.style.display = 'none';
+      try {
+        window._fixlyCamStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: window._fixlyCamFacing }, audio: false
+        });
+        if (v) v.srcObject = window._fixlyCamStream;
+        _fixlyCamMsg('', false);
+      } catch (err) {
+        const name = (err && err.name) ? err.name : '';
+        _fixlyCamMsg(
+          name === 'NotAllowedError'
+            ? 'Camera access was blocked. Allow it in your browser, or use your device camera / add photos from your gallery instead.'
+            : 'No in-app camera is available here. Use your device camera, or add photos from your gallery instead.',
+          true
+        );
+        if (fb) fb.style.display = 'inline-flex';  // offer the native-camera fallback
+      }
+    }
+
+    async function fixlyOpenCamera() {
+      // No getUserMedia at all (old browser / insecure context) -> native input.
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        const inp = document.getElementById('fixly-camera-input');
+        if (inp) inp.click();
+        return;
+      }
+      const ov = document.getElementById('fixly-cam-overlay');
+      if (ov) ov.style.display = 'flex';
+      await _fixlyCamStart();
+    }
+
+    async function fixlySwitchCamera() {
+      window._fixlyCamFacing = (window._fixlyCamFacing === 'environment') ? 'user' : 'environment';
+      await _fixlyCamStart();
+    }
+
+    function fixlyCapture() {
+      const v = document.getElementById('fixly-cam-video');
+      if (!v || !v.videoWidth) { _fixlyCamMsg('Camera is still starting, try again in a moment.', true); return; }
+      const c = document.getElementById('fixly-cam-canvas');
+      c.width = v.videoWidth; c.height = v.videoHeight;
+      c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+      c.toBlob(function(blob) {
+        if (!blob) { _fixlyCamMsg('Could not capture the frame, try again.', true); return; }
+        // Reuse the existing path exactly: File -> fixlyHandleFiles -> _fixlyCompress
+        // (1024px / JPEG 82%) -> window._fixlyFiles -> preview grid -> submit/upload.
+        const file = new File([blob], 'camera-' + Date.now() + '.jpg', { type: 'image/jpeg' });
+        fixlyHandleFiles([file]);
+        fixlyCloseCamera();
+      }, 'image/jpeg', 0.92);
+    }
+    </script>""")
+
     mobile_bar()
     sidebar("/new")
 
@@ -4844,6 +5248,50 @@ async def new_case_page():
                     ' style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;"'
                     ' onchange="fixlyHandleFiles(this.files);this.value=\'\'">'
                 )
+
+                # Stage 1A: native camera input (separate from the gallery input above,
+                # so the gallery keeps multi-select). On mobile, capture="environment"
+                # opens the rear camera directly. Feeds the same fixlyHandleFiles path.
+                ui.html(
+                    '<input type="file" id="fixly-camera-input" accept="image/*" capture="environment"'
+                    ' style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;"'
+                    ' onchange="fixlyHandleFiles(this.files);this.value=\'\';fixlyCloseCamera()">'
+                )
+
+                # Stage 1B: in-app webcam overlay (hidden until "Take Photo" is pressed).
+                ui.html("""
+                <div id="fixly-cam-overlay" style="display:none;position:fixed;inset:0;z-index:9999;
+                     background:rgba(15,23,42,0.92);align-items:center;justify-content:center;
+                     flex-direction:column;gap:14px;padding:20px;">
+                  <video id="fixly-cam-video" autoplay playsinline muted
+                         style="max-width:100%;max-height:68vh;border-radius:12px;background:#000;"></video>
+                  <div id="fixly-cam-msg" style="display:none;color:#e2e8f0;font-size:0.85rem;
+                       max-width:440px;text-align:center;line-height:1.55;"></div>
+                  <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center;align-items:center;">
+                    <button onclick="fixlyCapture()"
+                            style="background:#6366f1;color:#fff;border:none;border-radius:10px;
+                                   padding:11px 22px;font-weight:700;font-size:0.9rem;cursor:pointer;">
+                      Capture
+                    </button>
+                    <button onclick="fixlySwitchCamera()"
+                            style="background:transparent;color:#e2e8f0;border:1px solid #475569;
+                                   border-radius:10px;padding:11px 16px;font-weight:600;font-size:0.85rem;cursor:pointer;">
+                      Switch camera
+                    </button>
+                    <button onclick="fixlyCloseCamera()"
+                            style="background:transparent;color:#e2e8f0;border:1px solid #475569;
+                                   border-radius:10px;padding:11px 16px;font-weight:600;font-size:0.85rem;cursor:pointer;">
+                      Cancel
+                    </button>
+                    <label for="fixly-camera-input" id="fixly-cam-fallback"
+                           style="display:none;background:#0f172a;color:#e2e8f0;border:1px solid #6366f1;
+                                  border-radius:10px;padding:11px 16px;font-weight:600;font-size:0.85rem;cursor:pointer;">
+                      Use device camera
+                    </label>
+                  </div>
+                  <canvas id="fixly-cam-canvas" style="display:none;"></canvas>
+                </div>
+                """)
 
                 # Single media area, _fixlyRender() rewrites its innerHTML entirely.
                 # Either shows the drop zone (empty) or the green attachment panel (photos selected).
@@ -4905,6 +5353,18 @@ async def new_case_page():
                       <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
                       <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
                       <line x1="12" x2="12" y1="19" y2="22"/>
+                    </svg>
+                  </button>
+
+                  <!-- Take Photo: in-app webcam (laptop) / device camera (mobile) -->
+                  <button id="fixly-cam-btn" class="fixly-icon-btn"
+                          onclick="fixlyOpenCamera()"
+                          title="Take a photo with your camera">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                         viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                         stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/>
+                      <circle cx="12" cy="13" r="3"/>
                     </svg>
                   </button>
 
@@ -5093,6 +5553,228 @@ async def new_case_page():
             pass
 
     ui.timer(0.4, _reset_js_store, once=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN — Feedback dashboard (Phase 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@ui.page("/admin/feedback")
+async def admin_feedback_page():
+    token = app.storage.user.get("token")
+    if not token:
+        ui.navigate.to("/login")
+        return
+    # UX gate: non-admins are silently sent back to their cases. (Access is also
+    # enforced server-side — the admin API returns 403, handled below.)
+    if not app.storage.user.get("is_admin", False):
+        ui.navigate.to("/cases")
+        return
+
+    H = {"Authorization": f"Bearer {token}"}
+
+    async def _get(path):
+        try:
+            async with httpx.AsyncClient() as c:
+                r = await c.get(f"{API}/admin/feedback/{path}", headers=H, timeout=10.0)
+            if r.status_code == 403:
+                return "forbidden"
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            return None
+        return None
+
+    overview = await _get("overview")
+    if overview == "forbidden":
+        ui.navigate.to("/cases")
+        return
+
+    inject_styles()   # global CSS (.sidebar / .main / .nav-item) — same as every page
+    priority = await _get("priority") or []
+    modes    = await _get("modes") or []
+    safety   = await _get("safety") or []
+    comments = await _get("comments?limit=8") or []
+    overview = overview or {}
+
+    _ISSUE_LABELS = {
+        "wrong_trade": "Wrong trade/category", "wrong_severity": "Wrong severity/risk",
+        "wrong_diy_recommendation": "Wrong DIY recommendation",
+        "wrong_professional_recommendation": "Wrong professional recommendation",
+        "clarification_not_useful": "Clarification not useful",
+        "scope_incorrect": "Scope decision incorrect", "steps_unclear": "Steps unclear",
+        "care_not_useful": "Care advice not useful", "other": "Other",
+    }
+
+    mobile_bar()
+    sidebar("/admin/feedback")
+
+    with ui.element("div").classes("main"):
+        with ui.element("div").style(
+            "padding:32px;max-width:920px;display:flex;flex-direction:column;gap:18px;"
+        ):
+            tf = overview.get("total_feedback", 0)
+            maturity = ("Established", "#15803d") if tf >= 50 else \
+                       ("Emerging", "#92400e") if tf >= 20 else ("Early data", "#b45309")
+
+            # Header + data-maturity pill
+            ui.html(
+                f'<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">'
+                f'<h1 style="font-size:1.5rem;font-weight:800;color:#0f172a;margin:0;">Feedback</h1>'
+                f'<span style="background:#f1f5f9;color:{maturity[1]};font-size:0.72rem;'
+                f'font-weight:700;padding:3px 10px;border-radius:100px;">{maturity[0]} · '
+                f'{tf} response{"s" if tf != 1 else ""}</span></div>'
+            )
+
+            # Safety bar (preempts everything)
+            s_open = overview.get("safety_open", 0)
+            if s_open > 0:
+                ui.html(
+                    f'<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:12px;'
+                    f'padding:14px 18px;display:flex;align-items:center;gap:10px;">'
+                    f'<span style="font-size:1.2rem;">&#128721;</span>'
+                    f'<span style="font-weight:700;color:#991b1b;font-size:0.9rem;">'
+                    f'{s_open} safety incident{"s" if s_open != 1 else ""} awaiting review</span></div>'
+                )
+            else:
+                ui.html(
+                    '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:12px;'
+                    'padding:12px 18px;color:#15803d;font-weight:600;font-size:0.86rem;">'
+                    '&#10003; No safety incidents awaiting review</div>'
+                )
+
+            # Headline takeaway sentence (counts-first)
+            helpful = overview.get("helpful", 0)
+            top_issue = _ISSUE_LABELS.get(priority[0]["issue_category"], priority[0]["issue_category"]) if priority else None
+            _take = (
+                f"Based on {tf} response{'s' if tf != 1 else ''}: "
+                f"helpful {helpful}/{tf}"
+                + (f"; top issue: {top_issue} ({priority[0]['count']})" if top_issue else "")
+                + f"; {overview.get('safety_total', 0)} safety report(s)."
+            )
+            ui.html(
+                f'<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;'
+                f'padding:12px 16px;font-size:0.86rem;color:#334155;line-height:1.5;">{_take}</div>'
+            )
+
+            # Health cards — count-first, N-tagged
+            def _card(label, value, sub=""):
+                return (
+                    f'<div style="background:#f8fafc;border-radius:10px;padding:14px 16px;flex:1;min-width:140px;">'
+                    f'<div style="font-size:0.72rem;color:#94a3b8;font-weight:600;text-transform:uppercase;'
+                    f'letter-spacing:0.04em;">{label}</div>'
+                    f'<div style="font-size:1.5rem;font-weight:800;color:#0f172a;margin-top:2px;">{value}</div>'
+                    f'<div style="font-size:0.72rem;color:#94a3b8;">{sub}</div></div>'
+                )
+            rr = round(overview.get("response_rate", 0) * 100)
+            ui.html(
+                '<div style="display:flex;gap:12px;flex-wrap:wrap;">'
+                + _card("Analyses", overview.get("total_analyses", 0))
+                + _card("Feedback", tf, f"{rr}% response rate")
+                + _card("Helpful", f"{helpful}/{tf}", "of responses")
+                + _card("Safety reports", overview.get("safety_total", 0), f"{s_open} open")
+                + '</div>'
+            )
+
+            # Priority Board — weighted-count ranking (no chart; honest bars)
+            ui.html('<div style="font-weight:700;color:#0f172a;font-size:0.95rem;margin-top:4px;">Fix first</div>')
+            if not priority:
+                ui.html('<div style="color:#94a3b8;font-size:0.84rem;">No issues reported yet.</div>')
+            else:
+                _maxs = max(p["priority_score"] for p in priority) or 1
+                rows = ""
+                for p in priority:
+                    label = _ISSUE_LABELS.get(p["issue_category"], p["issue_category"])
+                    pct = int(100 * p["priority_score"] / _maxs)
+                    rows += (
+                        f'<div style="margin-bottom:8px;">'
+                        f'<div style="display:flex;justify-content:space-between;font-size:0.82rem;'
+                        f'color:#334155;margin-bottom:3px;"><span>{label}</span>'
+                        f'<span style="color:#64748b;">{p["count"]} report(s) · score {p["priority_score"]}</span></div>'
+                        f'<div style="background:#eef2ff;border-radius:6px;height:8px;">'
+                        f'<div style="background:#6366f1;height:8px;border-radius:6px;width:{pct}%;"></div></div></div>'
+                    )
+                ui.html(f'<div style="background:white;border:1px solid #e2e8f0;border-radius:12px;padding:16px 18px;">{rows}</div>')
+
+            # Performance by mode — scorecards (each shows own N)
+            ui.html('<div style="font-weight:700;color:#0f172a;font-size:0.95rem;margin-top:4px;">By output mode</div>')
+            if not modes:
+                ui.html('<div style="color:#94a3b8;font-size:0.84rem;">No feedback yet.</div>')
+            else:
+                cards = ""
+                for m in modes:
+                    cards += (
+                        f'<div style="background:#f8fafc;border-radius:10px;padding:12px 14px;min-width:150px;flex:1;">'
+                        f'<div style="font-weight:700;color:#334155;font-size:0.82rem;">{m["output_mode"]}</div>'
+                        f'<div style="font-size:0.78rem;color:#64748b;margin-top:3px;">'
+                        f'{m["helpful"]} helpful · {m["partial"]} partial · {m["not"]} no '
+                        f'<span style="color:#94a3b8;">(N={m["total"]})</span></div></div>'
+                    )
+                ui.html(f'<div style="display:flex;gap:12px;flex-wrap:wrap;">{cards}</div>')
+
+            # Safety Centre — incident queue with review controls
+            ui.html('<div style="font-weight:700;color:#0f172a;font-size:0.95rem;margin-top:4px;">Safety Centre</div>')
+            if not safety:
+                ui.html('<div style="color:#94a3b8;font-size:0.84rem;">No safety incidents.</div>')
+            else:
+                for inc in safety:
+                    with ui.element("div").style(
+                        "background:white;border:1px solid #fecaca;border-radius:12px;"
+                        "padding:14px 16px;display:flex;flex-direction:column;gap:8px;"
+                    ):
+                        ui.html(
+                            f'<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;">'
+                            f'<span style="font-weight:700;color:#991b1b;font-size:0.84rem;">'
+                            f'{inc.get("safety_category") or "safety report"} · {inc.get("output_mode")}</span>'
+                            f'<span style="font-size:0.74rem;color:#64748b;">case {inc.get("session_id")} · '
+                            f'analysis {inc.get("analysis_id")} · status: {inc.get("status")}'
+                            + (f' ({inc.get("resolution")})' if inc.get("resolution") else "")
+                            + '</span></div>'
+                        )
+                        if inc.get("comment"):
+                            ui.html(f'<div style="font-size:0.82rem;color:#334155;">{inc["comment"]}</div>')
+                        with ui.element("div").style("display:flex;gap:8px;flex-wrap:wrap;align-items:center;"):
+                            st = ui.select(["new", "reviewing", "resolved"], value=inc.get("status", "new")) \
+                                .props("outlined dense").style("min-width:120px;")
+                            res = ui.select(
+                                {"": "—", "fixed": "fixed", "accepted_limitation": "accepted limitation", "dismissed": "dismissed"},
+                                value=inc.get("resolution") or "",
+                            ).props("outlined dense").style("min-width:150px;")
+                            note = ui.input(
+                                value=inc.get("reviewer_note") or "",
+                                placeholder="reviewer note",
+                            ).props("outlined dense").style("flex:1;min-width:160px;")
+
+                            async def _update(_=None, fid=inc["id"], st=st, res=res, note=note):
+                                body = {"status": st.value}
+                                if res.value:
+                                    body["resolution"] = res.value
+                                if (note.value or "").strip():
+                                    body["reviewer_note"] = note.value.strip()
+                                try:
+                                    async with httpx.AsyncClient() as c:
+                                        await c.patch(f"{API}/admin/feedback/{fid}", json=body, headers=H, timeout=10.0)
+                                    ui.navigate.to("/admin/feedback")
+                                except Exception:
+                                    ui.notify("Could not update incident.", type="negative")
+
+                            ui.button("Update", on_click=_update).props("unelevated color=primary size=sm")
+
+            # User Voice — recent comments (qualitative evidence)
+            ui.html('<div style="font-weight:700;color:#0f172a;font-size:0.95rem;margin-top:4px;">Recent comments</div>')
+            if not comments:
+                ui.html('<div style="color:#94a3b8;font-size:0.84rem;">No comments yet.</div>')
+            else:
+                rows = ""
+                for c in comments:
+                    tag = _ISSUE_LABELS.get(c.get("issue_category"), c.get("issue_category") or c.get("rating"))
+                    rows += (
+                        f'<div style="border-bottom:1px solid #f1f5f9;padding:10px 0;">'
+                        f'<div style="font-size:0.83rem;color:#334155;">{c.get("comment")}</div>'
+                        f'<div style="font-size:0.72rem;color:#94a3b8;margin-top:2px;">'
+                        f'{c.get("rating")} · {c.get("output_mode")} · {tag}</div></div>'
+                    )
+                ui.html(f'<div style="background:white;border:1px solid #e2e8f0;border-radius:12px;padding:6px 16px;">{rows}</div>')
 
 
 # ─────────────────────────────────────────────────────────────────────────────

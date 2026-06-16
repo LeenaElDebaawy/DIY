@@ -22,7 +22,7 @@ Analysis.structured_result as a JSONB dict.
 """
 
 import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
@@ -73,6 +73,13 @@ class Stage1Output(BaseModel):
     cause the pipeline to stop and ask the user for a clearer photo or description
     instead of generating potentially wrong repair steps.
     """
+    # Scope decision — made BEFORE trade categorisation. A trade is only meaningful
+    # when scope == "repair"; emergency / not_repair / unclear must NOT be forced
+    # into a repair trade (that pressure is what made a stovetop fire hallucinate an
+    # "exposed live mains" electrical fault). Defaults to "repair" so analyses stored
+    # before this field still load and route exactly as before.
+    scope: Literal["repair", "emergency", "not_repair", "unclear"] = "repair"
+
     problem_type: str           # short human-readable description, e.g. "Leaking pipe joint"
     trade_category: str         # normalised trade label, see docstring
     severity: str               # "low" | "medium" | "high"
@@ -100,6 +107,23 @@ class Stage1Output(BaseModel):
     safety_concerns: list[str] = []            # specific hazards seen (e.g. "electrocution", "structural collapse", "airbag/fuel")
     clarifying_questions: list[str] = []       # REQUIRED questions — answers block auto-reanalysis
     optional_questions:   list[str] = []       # helpful extras — do not block auto-reanalysis (max 1)
+
+    @field_validator("scope", mode="before")
+    @classmethod
+    def _normalise_scope(cls, v: object) -> str:
+        """Map to repair/emergency/not_repair/unclear; tolerate common synonyms.
+        Unknown/empty -> 'repair' (the documented default) so behaviour is
+        unchanged for anything that does not clearly signal a different scope."""
+        raw = str(v).strip().lower().replace("-", "_").replace(" ", "_") if v is not None else ""
+        if raw in ("repair", "emergency", "not_repair", "unclear"):
+            return raw
+        if raw in ("active_emergency", "emergency_active", "hazard_active", "fire", "flood", "flooding"):
+            return "emergency"
+        if raw in ("non_repair", "notrepair", "out_of_scope", "not_a_repair", "irrelevant"):
+            return "not_repair"
+        if raw in ("ambiguous", "uncertain", "unknown", "insufficient"):
+            return "unclear"
+        return "repair"
 
     @field_validator("risk_level", mode="before")
     @classmethod
@@ -476,6 +500,26 @@ class CareOutput(BaseModel):
     expected_outcome: str = ""          # what good looks like after following the advice
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# OUT-OF-SCOPE OUTPUT  (produced when output_mode == 'out_of_scope': the image is
+# an active emergency or is not a household repair. NO Stage 2 / Stage 3 / Stage A
+# run — no repair plan, tools, materials, steps, or trade-professional referral.
+# Built deterministically from Stage 1's scope decision; no extra model call.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OutOfScopeOutput(BaseModel):
+    """Produced when Stage 1 decides the image is not an in-scope repair.
+
+    is_emergency switches the wording between active-emergency guidance and a
+    'this is not a repair image' message. Carries no repair content by design.
+    Defaults keep old analyses (which never have this) loading cleanly.
+    """
+    scope: str = "not_repair"           # echo of Stage1Output.scope (emergency / not_repair / unclear)
+    is_emergency: bool = False
+    headline: str = ""                  # short banner title
+    guidance: str = ""                  # the safe, generic guidance message
+
+
 class AnalysisResult(BaseModel):
     """
     The output of the analysis pipeline.
@@ -486,6 +530,8 @@ class AnalysisResult(BaseModel):
       clarification  - Stage 1 only + clarifying questions (Step 4)
       assessment_first - Stage 1 + AssessmentOutput, NO Stage 2/Stage 3
       care           - Stage 1 + care recommendations (Step 3)
+      out_of_scope   - Stage 1 + OutOfScopeOutput, NO Stage 2/3/A (emergency or
+                       non-repair image; no repair plan or trade-professional)
 
     stage_2 and stage_3 are None for assessment_first and clarification modes.
     assessment is None unless output_mode == 'assessment_first'.
@@ -501,6 +547,7 @@ class AnalysisResult(BaseModel):
     assessment: Optional[AssessmentOutput] = None
     care: Optional[CareOutput] = None
     clarification: Optional[ClarificationOutput] = None
+    out_of_scope: Optional[OutOfScopeOutput] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 import datetime
+import os
 from typing import Optional
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
@@ -6,6 +7,14 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+
+
+def _admin_emails() -> set[str]:
+    """Allow-listed admin emails from the ADMIN_EMAILS env var (comma-separated).
+    Read at call time so changing the env does not require a process restart in
+    dev. Lower-cased to match the normalised emails stored on users."""
+    raw = os.getenv("ADMIN_EMAILS", "")
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +54,17 @@ class User(Base):
 
     # One user can have many sessions
     sessions: Mapped[list["Session"]] = relationship(back_populates="user")
+
+    @property
+    def is_admin(self) -> bool:
+        """True when this user's email is in the ADMIN_EMAILS allow-list.
+
+        Computed (no DB column, no migration) so admin access is config-driven
+        for the MVP. Mirrors the computed-property pattern used elsewhere
+        (Session.output_mode, Analysis.hazard_ack). Enforced server-side via the
+        require_admin dependency; the frontend only uses it to show/hide the nav.
+        """
+        return bool(self.email and self.email.strip().lower() in _admin_emails())
 
 
 # ---------------------------------------------------------------------------
@@ -350,3 +370,67 @@ class Message(Base):
 
     # Relationship back to session
     session: Mapped["Session"] = relationship(back_populates="messages")
+
+
+# ---------------------------------------------------------------------------
+# Feedback  (Phase 1 — feedback / data-collection mechanism)
+# ---------------------------------------------------------------------------
+
+class Feedback(Base):
+    """User feedback on a completed analysis.
+
+    Additive table — references existing rows, never mutates them. output_mode
+    and is_safety are SNAPSHOT at creation so dashboard queries stay simple and
+    are not affected if the case is later re-analysed. Safety-flagged rows carry
+    a small review lifecycle (status + resolution + reviewer_note); ordinary
+    feedback simply feeds aggregates.
+    """
+    __tablename__ = "feedback"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    # Links to the case, the specific analysis, and the user who gave feedback.
+    # ondelete=SET NULL on analysis so a re-analysis cleanup never orphans the row;
+    # session/user use SET NULL so feedback survives even if a case is removed
+    # (the case-deletion guard separately blocks deleting cases with safety rows).
+    session_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True
+    )
+    analysis_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("analyses.id", ondelete="SET NULL"), nullable=True
+    )
+    user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # Core feedback. rating: 'helpful' | 'partial' | 'not'
+    rating: Mapped[str] = mapped_column(String(20), nullable=False)
+    issue_category: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Snapshot of the analysis context at feedback time (for trivial analytics).
+    output_mode: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+
+    # Safety lane. is_safety is auto-flagged (by mode or by safety issue type).
+    is_safety: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    safety_category: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # Review lifecycle (used for safety incidents): 'new' | 'reviewing' | 'resolved'.
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="new", server_default="new"
+    )
+    # Resolution reason when status == 'resolved': fixed | accepted_limitation | dismissed
+    resolution: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    reviewer_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )

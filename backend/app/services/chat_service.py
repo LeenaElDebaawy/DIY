@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -45,8 +46,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import AsyncSessionLocal
 
 from app.models import Analysis, Message, Session as RepairSession, Upload
+from app.services.clarification_reasoning import (
+    assess_clarification,
+    build_reprompt,
+    finalize_context,
+)
 
 log = logging.getLogger(__name__)
+
+# Intra-round safeguard: after this many answer attempts in a single clarification
+# round still leave coverage incomplete, the automatic path stops re-prompting and
+# transparently proceeds to re-analysis with whatever context it has. The existing
+# clarification-round mechanism (and its inconclusive pathway) then governs
+# termination — this is NOT a second inconclusive mechanism.
+_INTRAROUND_ANSWER_LIMIT = 3
 
 OLLAMA_BASE_URL   = os.getenv("OLLAMA_BASE_URL",   "http://localhost:11434")
 CHAT_MODEL        = os.getenv("CHAT_MODEL",        "llama3.1:8b")
@@ -497,19 +510,43 @@ async def stream_message(
              "image_ids": image_ids}
             if (image_ids and followup_verdict) else None
         )
+
+        # Evaluate the clarification round BEFORE committing the reply, so a
+        # deterministic re-prompt can be appended to the same assistant message.
+        # Coverage (not message order) decides what happens. The official analysis
+        # panel is never touched here — only chat output and the trigger sentinel.
+        sentinel: dict = dict(msg_meta or {})
+        fire = False
+        fire_ctx = ""
+        decision = await _evaluate_clarification(db, case_id)
+        if decision.eligible:
+            if decision.ready:
+                # Coverage complete -> fire automatic re-analysis.
+                fire, fire_ctx = True, decision.context
+            elif decision.attempts >= _INTRAROUND_ANSWER_LIMIT:
+                # Intra-round safeguard: stop re-prompting and proceed transparently
+                # with the context gathered so far. The clarification-round mechanism
+                # and its inconclusive pathway then govern termination.
+                fire, fire_ctx = True, decision.context
+                _note = ("\n\nI'll go ahead and re-check the analysis with the "
+                         "details you've given so far.")
+                reply_content += _note
+                yield _note
+            else:
+                # NOT READY (under the limit): deterministic re-prompt — never silent.
+                # Acknowledge what was answered and ask ONLY the open question(s).
+                reply_content = (reply_content + "\n\n" + decision.reprompt).strip()
+                yield "\n\n" + decision.reprompt
+
+        # Commit the (possibly augmented) assistant message exactly once.
         db.add(Message(
             session_id=case_id, role="assistant", content=reply_content,
             message_type="chat", msg_metadata=msg_meta,
         ))
         await db.commit()
 
-        # After commit, check if all clarification questions are now answered.
-        # If yes, write a dedup sentinel to the DB (so a second message in the
-        # same session doesn't re-trigger) and include the flag in the stream
-        # sentinel for the frontend.
-        sentinel: dict = dict(msg_meta or {})
-        auto_ok, auto_ctx = await _check_auto_reanalyse(db, case_id)
-        if auto_ok:
+        if fire:
+            # Dedup sentinel so a later message in the same round does not re-trigger.
             db.add(Message(
                 session_id=case_id,
                 role="assistant",
@@ -519,30 +556,35 @@ async def stream_message(
             ))
             await db.commit()
             sentinel["auto_reanalyse"] = True
-            sentinel["auto_reanalysis_context"] = auto_ctx
+            sentinel["auto_reanalysis_context"] = fire_ctx
 
         yield "\x1e" + json.dumps(sentinel)
 
 
-async def _check_auto_reanalyse(db: AsyncSession, case_id: int) -> tuple[bool, str]:
-    """Return (should_trigger, text_context) for clarification auto-reanalysis.
+@dataclass
+class _ClarificationDecision:
+    """Outcome of evaluating the current clarification round for the auto path."""
+    eligible: bool        # clarification case, with an opener, not already triggered this round
+    ready: bool           # all required questions are covered
+    attempts: int         # number of answer messages in this round
+    context: str          # finalized re-analysis context (for a ready or override fire)
+    reprompt: str         # deterministic re-prompt text (for the not-ready case)
 
-    Triggers ONLY when ALL of the following are true:
-      1. Latest complete analysis is in clarification output_mode.
-      2. Most-recent clarification_opener exists for this round.
-      3. No sentinel (clarification_reanalysis_triggered) exists after the opener
-         (prevents duplicate triggers).
-      4. The user's answers from the FIRST EXCHANGE after the opener (i.e. messages
-         committed before the first assistant chat reply) satisfy the required count.
 
-    Condition 4 is the key safety rule: once the chat model has replied to the
-    user, we are in a conversational back-and-forth.  Any further user messages
-    are answering the assistant's follow-up questions, NOT the structured opener
-    questions.  Counting those would cause premature auto-reanalysis when the user
-    is still chatting.  Requiring the manual Re-analyse button for subsequent
-    exchanges is the correct and safe behaviour.
+async def _evaluate_clarification(db: AsyncSession, case_id: int) -> _ClarificationDecision:
+    """Evaluate the current clarification round using the shared reasoning unit.
+
+    Replaces the previous first-exchange heuristic: ALL of this round's answer
+    messages (since the most-recent opener) are accumulated and coverage is decided
+    by the reasoning unit. Triggering is decided by coverage, not message order.
+
+    Returns an ineligible decision when this is not an answerable clarification
+    round (not clarification mode, no questions, no opener, or already triggered
+    this round — including the inconclusive terminal state, which has no questions).
     """
-    # 1. Must be in clarification mode
+    _none = _ClarificationDecision(eligible=False, ready=False, attempts=0, context="", reprompt="")
+
+    # Must be in clarification mode with required questions still to answer.
     r = await db.execute(
         select(Analysis)
         .where(Analysis.session_id == case_id, Analysis.status == "complete")
@@ -551,19 +593,17 @@ async def _check_auto_reanalyse(db: AsyncSession, case_id: int) -> tuple[bool, s
     )
     analysis = r.scalar_one_or_none()
     if analysis is None:
-        return (False, "")
+        return _none
     sr = analysis.structured_result or {}
     if sr.get("output_mode") != "clarification":
-        return (False, "")
-
-    questions: list[str] = (sr.get("clarification") or {}).get("clarifying_questions") or []
+        return _none
+    clar = sr.get("clarification") or {}
+    questions: list[str] = clar.get("clarifying_questions") or []
+    optional: list[str] = clar.get("optional_questions") or []
     if not questions:
-        return (False, "")
+        return _none  # no questions (e.g. inconclusive terminal state) — nothing to do
 
-    # 2. Find the MOST RECENT clarification opener as the time anchor for this round.
-    # Using the most recent opener ensures each clarification round has its own
-    # anchor: Round 1 answers are counted from Round 1's opener, Round 2 answers
-    # from Round 2's opener, and so on.
+    # Anchor on the MOST RECENT opener so each round is evaluated independently.
     opener_r = await db.execute(
         select(Message)
         .where(
@@ -575,11 +615,10 @@ async def _check_auto_reanalyse(db: AsyncSession, case_id: int) -> tuple[bool, s
     )
     opener = opener_r.scalar_one_or_none()
     if opener is None:
-        return (False, "")
+        return _none
 
-    # 3. Dedup: check for a sentinel written the first time we triggered FOR THIS
-    # ROUND.  The sentinel must be AFTER this round's opener so that Round 1's
-    # sentinel does not permanently block Round 2's auto-reanalysis.
+    # Dedup: if we already triggered re-analysis for THIS round, do nothing more —
+    # the pending re-analysis is the movement the user will see.
     sentinel_r = await db.execute(
         select(Message)
         .where(
@@ -590,80 +629,44 @@ async def _check_auto_reanalyse(db: AsyncSession, case_id: int) -> tuple[bool, s
         .limit(1)
     )
     if sentinel_r.scalar_one_or_none() is not None:
-        return (False, "")
+        return _none
 
-    # 4. Find the FIRST assistant chat reply after the opener.
-    # This marks the end of the "answering window" — the window in which the user
-    # is directly responding to the structured opener questions.  Once the chat
-    # model has replied, the conversation has become a back-and-forth: the user's
-    # subsequent messages answer the AI's follow-up questions, not the opener.
-    # Counting those would fire auto-reanalysis prematurely.
-    window_end_r = await db.execute(
+    # Accumulate ALL of this round's answer messages (no first-exchange cutoff).
+    ans_r = await db.execute(
         select(Message)
         .where(
             Message.session_id == case_id,
-            Message.role == "assistant",
-            Message.message_type == "chat",
+            Message.role == "user",
             Message.created_at > opener.created_at,
         )
         .order_by(Message.created_at.asc())
-        .limit(1)
     )
-    window_end = window_end_r.scalar_one_or_none()
+    answer_msgs = [
+        m for m in ans_r.scalars().all()
+        if (m.msg_metadata or {}).get("clarification_answer")
+    ]
+    answer_texts = [m.content for m in answer_msgs]
 
-    # Count user clarification answers within the first-exchange window only.
-    # If an assistant chat reply exists, only messages before it count.
-    # If no reply exists yet (shouldn't happen since this runs after a stream
-    # commit, but defensive), count all messages after the opener.
-    if window_end is not None:
-        ans_r = await db.execute(
-            select(Message)
-            .where(
-                Message.session_id == case_id,
-                Message.role == "user",
-                Message.created_at > opener.created_at,
-                Message.created_at < window_end.created_at,
-            )
-            .order_by(Message.created_at.asc())
-        )
-    else:
-        ans_r = await db.execute(
-            select(Message)
-            .where(
-                Message.session_id == case_id,
-                Message.role == "user",
-                Message.created_at > opener.created_at,
-            )
-            .order_by(Message.created_at.asc())
-        )
-    user_msgs = list(ans_r.scalars().all())
-    answer_msgs = [m for m in user_msgs if (m.msg_metadata or {}).get("clarification_answer")]
-
-    if not answer_msgs:
-        return (False, "")
-
-    # Build text_context: pair each question with its answer where possible
-    parts: list[str] = ["User answers to clarification questions:"]
-    for i, msg in enumerate(answer_msgs, 1):
-        q = questions[i - 1] if i <= len(questions) else ""
-        if q:
-            parts.append(f"Q{i}: {q}")
-        parts.append(f"A{i}: {msg.content.strip()}")
-    text_context = "\n".join(parts)
-
-    # Accumulate across clarification rounds: prepend the previous analysis
-    # round's text_context so Stage 1 sees ALL answers, not just the latest.
-    # This prevents Stage 1 re-asking questions that were resolved in earlier rounds.
-    prior_text_context = (analysis.text_context or "").strip()
-    if prior_text_context:
-        text_context = prior_text_context + "\n\n" + text_context
+    assessment = assess_clarification(
+        required_questions=questions,
+        answer_messages=answer_texts,
+        prior_context=(analysis.text_context or "").strip() or None,
+        optional_questions=optional,
+    )
+    context = finalize_context(assessment, answer_texts, note=None)
+    reprompt = build_reprompt(assessment.resolved_pairs, assessment.open_questions)
 
     log.info(
-        "auto_reanalyse_ready case=%d questions=%d answers=%d prior_ctx=%s",
-        case_id, len(questions), len(answer_msgs),
-        "yes" if prior_text_context else "no",
+        "clarification_evaluated case=%d attempts=%d ready=%s open=%d",
+        case_id, len(answer_msgs), assessment.ready, len(assessment.open_questions),
     )
-    return (True, text_context)
+    return _ClarificationDecision(
+        eligible=True,
+        ready=assessment.ready,
+        attempts=len(answer_msgs),
+        context=context,
+        reprompt=reprompt,
+    )
 
 
 async def spawn_case_from_image(

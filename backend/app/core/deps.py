@@ -30,3 +30,15 @@ async def get_current_user(
         )
 
     return user
+
+
+async def require_admin(current_user: User = Depends(get_current_user)) -> User:
+    """Allow only allow-listed admins (User.is_admin). Server-side enforcement —
+    the frontend nav/redirect is UX only. Returns 403 for authenticated
+    non-admins (401 for missing/invalid auth is handled by get_current_user)."""
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator access required.",
+        )
+    return current_user

@@ -246,9 +246,21 @@ class Upload(Base):
     # File path on disk
     storage_path: Mapped[str] = mapped_column(String(500), nullable=False)
 
-    # Image dimensions
+    # Image dimensions (None for video uploads)
     width: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     height: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Modality discriminator: "image" (default) or "video"
+    source_type: Mapped[str] = mapped_column(
+        String(10), default="image", server_default="image", nullable=False
+    )
+
+    # Duration in seconds for video uploads; None for images
+    duration_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # Filenames of JPEG display thumbnails extracted from video at 10/50/90 %
+    # of its duration.  None for image uploads.
+    thumbnail_paths: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
 
     # Timestamp created automatically by the database
     uploaded_at: Mapped[datetime.datetime] = mapped_column(

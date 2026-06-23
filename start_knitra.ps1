@@ -117,6 +117,7 @@ if (Test-PortListening 8000) {
 `$Host.UI.RawUI.WindowTitle = 'Knitra Backend (8000)'
 Write-Host ' Knitra Backend -- http://localhost:8000 ' -ForegroundColor White -BackgroundColor DarkBlue
 Write-Host ''
+`$env:FORCE_QWENVL_VIDEO_READER = 'torchvision'
 Set-Location '$BackendDir'
 & '$PythonExe' -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 "@

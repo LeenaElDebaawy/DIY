@@ -108,6 +108,18 @@ class Stage1Output(BaseModel):
     clarifying_questions: list[str] = []       # REQUIRED questions — answers block auto-reanalysis
     optional_questions:   list[str] = []       # helpful extras — do not block auto-reanalysis (max 1)
 
+    # ── Video-path fields (image analyses leave these at their defaults) ───────
+    # Added as optional fields on Stage1Output so the JSONB structured_result
+    # stores them automatically for video cases without a schema migration.
+    # Image analyses never set these; the defaults are all falsy/empty so they
+    # do not influence routing or display logic on the image path.
+    input_modality: str = "image"          # "image" | "video"
+    motion_detected: bool = False          # condition actively changing during recording
+    brief_hazard_observed: bool = False    # hazard appeared briefly, may not persist
+    key_moments: list[str] = []            # temporal observations with approximate timestamps
+    temporal_confidence: Optional[float] = None  # model's certainty about the temporal narrative
+    video_quality_notes: str = ""          # what the model could not assess due to quality
+
     @field_validator("scope", mode="before")
     @classmethod
     def _normalise_scope(cls, v: object) -> str:
@@ -317,6 +329,70 @@ class Stage1Output(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# VIDEO STAGE 1 OUTPUT
+# Subclass of Stage1Output used by the video analysis path.
+# All base fields are populated exactly as for image analysis.
+# The five video-specific fields are guaranteed non-None/non-empty here;
+# on Stage1Output they carry safe defaults for image cases.
+#
+# Routing note: VideoStage1Output IS a Stage1Output (Pydantic inheritance +
+# Python duck typing).  _determine_output_mode, _apply_safety_net, and all
+# downstream stage functions accept it without modification.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class VideoStage1Output(Stage1Output):
+    """Diagnostic output produced by the video analysis path.
+
+    Extends Stage1Output with video-specific observations.  The routing,
+    safety escalation, and repair planning pipeline receives this as a
+    Stage1Output and requires no modification.
+
+    temporal_confidence is required (not Optional) for video cases: the model
+    must always report how certain it is about the temporal narrative, separate
+    from its overall diagnostic confidence.
+
+    Epistemic clarity fields
+    ────────────────────────
+    Video evidence is harder to interpret than a still photo (motion blur, angle
+    changes, brief events).  These three fields make the model's certainty
+    explicit rather than burying it in uncertainty_notes.  The spike and future
+    integration prompt ask for them directly.
+
+    Safety fields
+    ─────────────
+    safety_precautions is the per-concern action list paired with safety_concerns
+    (from Stage1Output).  The base field holds the hazard names; this field holds
+    the protective actions the homeowner should take.
+
+    recommended_next_action
+    ───────────────────────
+    The single most important next step, written in plain English for the
+    homeowner.  Distils the diagnosis into one clear action (e.g.
+    "Turn off the water supply immediately and call a plumber today.").
+    Not to be confused with Stage 3's repair steps — those are only produced
+    once the video is analysed and routed through the pipeline.
+    """
+    input_modality: str = "video"          # always "video" for this subclass
+    motion_detected: bool = False
+    brief_hazard_observed: bool = False    # True if any transient hazard was visible
+    brief_hazards: list[str] = []          # description of each transient hazard observed
+    key_moments: list[str] = []            # timestamped observations, e.g. "0:04 – water drips"
+    temporal_confidence: float = 75.0     # required for video — override the Optional base default
+    video_quality_notes: str = ""          # what could not be assessed due to video quality
+
+    # Epistemic clarity — explicit structured version of uncertainty for video cases
+    what_can_be_confirmed: list[str] = []       # things the model is confident about
+    what_cannot_be_confirmed: list[str] = []    # things that could not be determined
+    missing_information: list[str] = []         # specific evidence that would improve the diagnosis
+
+    # Safety (video path adds per-concern precautions alongside base safety_concerns)
+    safety_precautions: list[str] = []          # protective actions paired with safety_concerns
+
+    # Explicit next action (distilled from the full diagnosis)
+    recommended_next_action: str = ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STAGE 2 , Tools, Materials, Protective Gear
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -336,6 +412,10 @@ class Stage2Output(BaseModel):
     optional_materials: list[str] = []  # OPTIONAL materials, improve the result but not required
     protective_gear: list[str]      # safety equipment, e.g. "Rubber gloves"
     estimated_time_minutes: int     # realistic estimate for a competent DIYer
+    # Root-cause enrichment — populated by Stage 2 before Stage 3 generates steps.
+    # Defaults keep old stored analyses loading cleanly.
+    likely_causes: list[str] = []               # top 3 probable causes ranked by confidence %
+    repair_confidence_reasoning: str = ""       # why the primary cause is most likely
 
 
 # ─────────────────────────────────────────────────────────────────────────────

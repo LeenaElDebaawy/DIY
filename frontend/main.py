@@ -5,10 +5,7 @@ import httpx
 from nicegui import app, ui
 from nicegui.events import UploadEventArguments
 
-# TEMP: pointing at 8001 because an orphaned socket holds port 8000 with stale
-# backend code. After a reboot (which clears the zombie), change this back to 8000
-# and run the backend normally on 8000.
-BACKEND = "http://127.0.0.1:8001"
+BACKEND = "http://127.0.0.1:8000"
 API     = f"{BACKEND}/api/v1"
 
 STATUS = {
@@ -18,7 +15,7 @@ STATUS = {
     "closed":             {"stripe": "#94a3b8", "bg": "#f1f5f9", "fg": "#475569", "label": "Closed"},
     "complete":           {"stripe": "#22c55e", "bg": "#dcfce7", "fg": "#14532d", "label": "Complete"},
     "failed":             {"stripe": "#ef4444", "bg": "#fee2e2", "fg": "#991b1b", "label": "Failed"},
-    "needs_clarification":{"stripe": "#f59e0b", "bg": "#fef3c7", "fg": "#78350f", "label": "Needs better photo"},
+    "needs_clarification":{"stripe": "#f59e0b", "bg": "#fef3c7", "fg": "#78350f", "label": "Needs more info"},
     "needs_info":         {"stripe": "#f59e0b", "bg": "#fff7ed", "fg": "#92400e", "label": "Needs answers"},
     "running":            {"stripe": "#6366f1", "bg": "#ede9fe", "fg": "#4c1d95", "label": "Analysing"},
 }
@@ -188,6 +185,36 @@ def inject_styles():
         border-color: #6366f1 !important;
         transform: scale(1.05);
         box-shadow: 0 4px 18px rgba(99,102,241,0.3);
+      }
+
+      /* ── Video card in the case detail media grid ── */
+      .video-thumb {
+        position: relative;
+        flex-shrink: 0;
+        border-radius: 10px;
+        border: 2px solid #6366f1;
+        overflow: hidden;
+        background: #0f172a;
+      }
+      .video-thumb video {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+      }
+      .video-thumb .video-badge {
+        position: absolute;
+        top: 4px;
+        left: 4px;
+        background: rgba(99,102,241,0.92);
+        color: #fff;
+        font-size: 0.58rem;
+        font-weight: 700;
+        letter-spacing: 0.07em;
+        padding: 2px 6px;
+        border-radius: 4px;
+        pointer-events: none;
+        text-transform: uppercase;
       }
 
       /* ── Hero (homepage), must fill the full viewport width ── */
@@ -978,7 +1005,7 @@ async def cases_page():
                     "running":             "Analysing",
                     "complete":            "Complete",
                     "failed":              "Failed",
-                    "needs_clarification": "Needs better photo",
+                    "needs_clarification": "Needs more info",
                     "needs_info":          "Needs answers",
                 }
                 _conf_opts    = {
@@ -1563,7 +1590,7 @@ async def case_detail_page(case_id: int):
                 )
 
                 def _render_grid(ups: list):
-                    """Clear and repopulate the photo grid."""
+                    """Clear and repopulate the media grid (images + videos)."""
                     photo_grid.clear()
                     with photo_grid:
                         if not ups:
@@ -1578,13 +1605,32 @@ async def case_detail_page(case_id: int):
                             )
                         else:
                             for up in ups:
+                                source_type = up.get("source_type", "image")
                                 url = f"{BACKEND}/static/uploads/{up['storage_path']}"
-                                # Outer wrapper: fixed 120×120 with hover interactions
-                                thumb = ui.element("div").classes("photo-thumb").style(
-                                    f"width:120px;height:120px;"
-                                    f"background-image:url('{url}');"
-                                )
-                                thumb.on("click", lambda u=url: open_lightbox(u))
+
+                                if source_type == "video":
+                                    # Use the first generated thumbnail as the poster
+                                    # frame so the video card shows a preview image
+                                    # even before the user presses play.
+                                    thumbs = up.get("thumbnail_paths") or []
+                                    poster_attr = ""
+                                    if thumbs:
+                                        poster_url = f"{BACKEND}/static/uploads/{thumbs[0]}"
+                                        poster_attr = f' poster="{poster_url}"'
+                                    ui.html(
+                                        f'<div class="video-thumb" style="width:200px;height:120px;">'
+                                        f'<video src="{url}"{poster_attr} controls preload="metadata">'
+                                        f'</video>'
+                                        f'<div class="video-badge">&#9654; Video</div>'
+                                        f'</div>'
+                                    )
+                                else:
+                                    # Image: existing behaviour, unchanged.
+                                    thumb = ui.element("div").classes("photo-thumb").style(
+                                        f"width:120px;height:120px;"
+                                        f"background-image:url('{url}');"
+                                    )
+                                    thumb.on("click", lambda u=url: open_lightbox(u))
 
                 _render_grid(uploads)   # initial paint from server-fetched data
 
@@ -3130,12 +3176,17 @@ async def case_detail_page(case_id: int):
                 observations = s1.get("observations") or []
                 clarif_req   = (s1.get("clarification_request") or "").strip()
 
+                _is_video = s1.get("input_modality") == "video"
+                _media    = "video" if _is_video else "photo"
+
                 # Fallback message if Stage 1 output is not available
                 msg = (
                     clarif_req
                     or data.get("validation_issues")
-                    or "Please upload a clearer, closer photo of the damaged area "
-                       "or describe the problem in more detail, then click Re-analyse."
+                    or (
+                        f"Please upload a clearer, closer {_media} of the damaged area "
+                        "or describe the problem in more detail, then click Re-analyse."
+                    )
                 )
 
                 # Confidence badge colours
@@ -3146,20 +3197,30 @@ async def case_detail_page(case_id: int):
 
                 # ── Detect what type of input the model needs ─────────────────
                 _combined_hints = (clarif_req + " " + conf_reason).lower()
-                _photo_tips: list[tuple[str, str]] = []
+                _media_tips: list[tuple[str, str]] = []
                 if any(w in _combined_hints for w in ["close", "closer", "close-up", "detail", "clearer"]):
-                    _photo_tips.append(("🔍", "Upload a closer, more detailed photo of the damaged area"))
+                    _media_tips.append(("🔍", f"Upload a closer, more detailed {_media} of the damaged area"))
                 if any(w in _combined_hints for w in ["wider", "wide", "context", "surround", "full"]):
-                    _photo_tips.append(("📐", "Include more surroundings, a wider shot shows the full extent"))
+                    _media_tips.append(("📐", "Include more surroundings to show the full extent"))
                 if any(w in _combined_hints for w in ["light", "bright", "dark", "lit", "illumin", "blurr"]):
-                    _photo_tips.append(("💡", "Take the photo in better light or move to a brighter area"))
+                    if _is_video:
+                        _media_tips.append(("💡", "Re-record the video in better lighting or move to a brighter area"))
+                    else:
+                        _media_tips.append(("💡", "Take the photo in better light or move to a brighter area"))
                 if any(w in _combined_hints for w in ["describe", "written", "description", "explain", "unclear", "not sure", "cannot determine"]):
-                    _photo_tips.append(("✏️", "Add a written description of what you see and what the problem is"))
-                if not _photo_tips:
-                    _photo_tips = [
-                        ("📷", "Upload a new photo, closer, well-lit, and in focus"),
-                        ("✏️", "Add a written description to give the AI a second evidence stream"),
-                    ]
+                    _media_tips.append(("✏️", "Add a written description of what you see and what the problem is"))
+                if not _media_tips:
+                    if _is_video:
+                        _media_tips = [
+                            ("🎥", "Re-record the video, closer and in good lighting"),
+                            ("✏️", "Add a written description to give the AI a second evidence stream"),
+                        ]
+                    else:
+                        _media_tips = [
+                            ("📷", "Upload a new photo, closer, well-lit, and in focus"),
+                            ("✏️", "Add a written description to give the AI a second evidence stream"),
+                        ]
+                _photo_tips = _media_tips
 
                 with ui.element("div").style("padding:22px 24px;"
                                              "display:flex;flex-direction:column;gap:16px;"):
@@ -4842,10 +4903,12 @@ async def new_case_page():
     # ui.add_head_html deduplicates identical head tags across page visits.
     ui.add_head_html("""<script>
     // ── Global state ──────────────────────────────────────────────────────────
-    window._fixlyFiles    = [];   // compressed image objects {name,type,data}
-    window._fixlyToken    = '';   // bearer token, set by deferred timer
-    window._fixlyRecorder = null; // MediaRecorder instance while recording
-    window._fixlyAudio    = [];   // audio chunks collected during recording
+    window._fixlyFiles      = [];   // compressed image objects {name,type,data}
+    window._fixlyVideoFile  = null; // raw File object for a video upload (or null)
+    window._fixlyVideoObjUrl = null; // object URL for video preview (revoked on remove)
+    window._fixlyToken      = '';   // bearer token, set by deferred timer
+    window._fixlyRecorder   = null; // MediaRecorder instance while recording
+    window._fixlyAudio      = [];   // audio chunks collected during recording
 
     // ── Image compression (Canvas, max 1024px, JPEG 82%) ─────────────────────
     function _fixlyCompress(file) {
@@ -4876,6 +4939,12 @@ async def new_case_page():
     }
 
     async function fixlyHandleFiles(fileList) {
+      // Image-only path. Selecting images clears any existing video selection.
+      if (window._fixlyVideoFile) {
+        if (window._fixlyVideoObjUrl) { URL.revokeObjectURL(window._fixlyVideoObjUrl); }
+        window._fixlyVideoFile = null;
+        window._fixlyVideoObjUrl = null;
+      }
       const toAdd = Array.from(fileList)
         .filter(function(f) { return f.type.startsWith('image/'); })
         .slice(0, 10 - window._fixlyFiles.length);
@@ -4885,12 +4954,84 @@ async def new_case_page():
       _fixlyRender();
     }
 
-    // ── Photo area renderer, single container, completely replaced each call ─
+    // Called by the video file input (fixly-video-input). Selecting a video
+    // clears any existing image selection and shows the blue preview card.
+    function fixlyHandleVideoFile(fileList) {
+      const vf = Array.from(fileList).find(function(f) { return f.type.startsWith('video/'); });
+      if (!vf) return;
+      if (vf.size > 100 * 1024 * 1024) {
+        alert('Video is too large. Maximum size is 100 MB.');
+        return;
+      }
+      if (window._fixlyVideoObjUrl) { URL.revokeObjectURL(window._fixlyVideoObjUrl); }
+      window._fixlyFiles = [];   // clear any images
+      window._fixlyVideoFile = vf;
+      window._fixlyVideoObjUrl = URL.createObjectURL(vf);
+      _fixlyRender();
+    }
+
+    // Upload a video file directly from the browser to the backend.
+    // Called from Python via ui.run_javascript() after the case is created.
+    // Returns the upload response JSON on success, or null on failure.
+    async function fixlyUploadVideo(token, caseId) {
+      if (!window._fixlyVideoFile) return null;
+      const fd = new FormData();
+      fd.append('file', window._fixlyVideoFile);
+      try {
+        const resp = await fetch(
+          'http://127.0.0.1:8000/api/v1/cases/' + caseId + '/uploads',
+          { method: 'POST', headers: { 'Authorization': 'Bearer ' + token }, body: fd }
+        );
+        if (resp.ok) return await resp.json();
+        return { error: resp.status };
+      } catch(e) {
+        return null;
+      }
+    }
+
+    // ── Photo/video area renderer, single container, completely replaced each call ─
     // This avoids any show/hide race between separate DOM elements.
     function _fixlyRender() {
       const area  = document.getElementById('fixly-media-area');
       const badge = document.getElementById('fixly-attach-badge');
       if (!area) return;
+
+      // ── Video attached: show preview instead of image grid ────────────────
+      if (window._fixlyVideoFile && window._fixlyVideoObjUrl) {
+        const vf = window._fixlyVideoFile;
+        const sizeMB = (vf.size / 1024 / 1024).toFixed(1);
+        if (badge) { badge.style.display = 'flex'; badge.textContent = '1'; }
+        area.innerHTML = `
+          <div style="background:#eff6ff;border-bottom:1px solid #bfdbfe;padding:14px 20px;">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap;">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
+                   viewBox="0 0 24 24" fill="none" stroke="#1d4ed8"
+                   stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="23 7 16 12 23 17 23 7"/>
+                <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+              </svg>
+              <span style="font-weight:700;color:#1e40af;font-size:0.88rem;">1 video attached</span>
+              <span style="flex:1;"></span>
+              <button onclick="if(window._fixlyVideoObjUrl){URL.revokeObjectURL(window._fixlyVideoObjUrl);}window._fixlyVideoFile=null;window._fixlyVideoObjUrl=null;_fixlyRender();"
+                      style="font-size:0.78rem;color:#dc2626;font-weight:600;
+                             cursor:pointer;padding:3px 10px;border-radius:6px;
+                             border:1px solid #fecaca;background:#fef2f2;
+                             -webkit-appearance:none;">
+                Remove
+              </button>
+            </div>
+            <video src="${window._fixlyVideoObjUrl}" controls
+                   style="width:100%;max-width:360px;border-radius:10px;
+                          display:block;background:#000;max-height:220px;">
+            </video>
+            <p style="font-size:0.78rem;color:#64748b;margin:6px 0 0;">
+              ${vf.name} &middot; ${sizeMB} MB &middot;
+              <em>Video analysis — allow extra time</em>
+            </p>
+          </div>`;
+        return;
+      }
+
       const n = window._fixlyFiles.length;
 
       // Update badge on the attachment icon
@@ -5242,11 +5383,16 @@ async def new_case_page():
                 "border-radius:16px;overflow:hidden;"
                 "box-shadow:0 2px 12px rgba(0,0,0,0.04);"
             ):
-                # Hidden file input, label elements trigger it natively (no JS .click() needed)
+                # Hidden file inputs — triggered by their corresponding label/button elements.
+                # fixly-file-input: multi-image from gallery (drop zone + paperclip icon).
+                # fixly-video-input: single video from the 🎥 icon button.
                 ui.html(
                     '<input type="file" id="fixly-file-input" multiple accept="image/*"'
                     ' style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;"'
-                    ' onchange="fixlyHandleFiles(this.files);this.value=\'\'">'
+                    ' onchange="fixlyHandleFiles(this.files);this.value=\'\'"> '
+                    '<input type="file" id="fixly-video-input" accept="video/*"'
+                    ' style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;"'
+                    ' onchange="fixlyHandleVideoFile(this.files);this.value=\'\'">'
                 )
 
                 # Stage 1A: native camera input (separate from the gallery input above,
@@ -5368,15 +5514,15 @@ async def new_case_page():
                     </svg>
                   </button>
 
-                  <!-- Video, coming soon -->
-                  <div class="fixly-icon-btn-soon" title="Video support coming soon">
+                  <!-- Video upload button — triggers the hidden fixly-video-input -->
+                  <label for="fixly-video-input" class="fixly-icon-btn" title="Add a video">
                     <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
                          viewBox="0 0 24 24" fill="none" stroke="currentColor"
                          stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                       <path d="m22 8-6 4 6 4V8Z"/>
                       <rect width="14" height="12" x="2" y="6" rx="2" ry="2"/>
                     </svg>
-                  </div>
+                  </label>
 
                   <div style="flex:1;"></div>
                 </div>
@@ -5414,16 +5560,18 @@ async def new_case_page():
 
         err_label.set_text("")
 
-        # Pull compressed files from JS global
+        # Pull compressed image files and check for a video from JS globals
         raw_json = await ui.run_javascript("return fixlyGetFiles()")
         try:
             files = json.loads(raw_json or "[]")
         except Exception:
             files = []
 
-        if not files:
+        has_video = await ui.run_javascript("return !!window._fixlyVideoFile")
+
+        if not files and not has_video:
             err_label.set_text(
-                "Please add at least one photo before analysing."
+                "Please add at least one photo or video before analysing."
             )
             return
 
@@ -5432,9 +5580,13 @@ async def new_case_page():
         # Build inline progress
         prog_area.clear()
         n = len(files)
+        if has_video:
+            upload_label = "Uploading video"
+        else:
+            upload_label = f"Uploading {n} photo{'s' if n > 1 else ''}"
         _texts = {
             "case":    "Creating your case",
-            "upload":  f"Uploading {n} photo{'s' if n > 1 else ''}",
+            "upload":  upload_label,
             "analyse": "Starting AI analysis",
         }
         _lbls = {}
@@ -5485,29 +5637,48 @@ async def new_case_page():
             submit_btn.props(remove="loading disable")
             return
 
-        # Step 2, upload files (already compressed by JS)
+        # Step 2, upload files
         _active("upload")
         uploaded = 0
-        for i, f in enumerate(files):
-            _lbls["upload"].set_text(f"↻  Uploading photo {i + 1} of {n}…")
+
+        if has_video:
+            # ── Video path: JS uploads directly via fetch (avoids base64/WS transfer) ──
+            _lbls["upload"].set_text("↻  Uploading video…")
             try:
-                raw_b64 = f["data"].split(",", 1)[1]
-                img_bytes = _b64.b64decode(raw_b64)
-                async with httpx.AsyncClient() as client:
-                    r_up = await client.post(
-                        f"{API}/cases/{cid}/uploads",
-                        files={"file": (f["name"], img_bytes, f["type"])},
-                        headers={"Authorization": f"Bearer {token}"},
-                        timeout=30.0,
-                    )
-                if r_up.status_code in (200, 201):
-                    uploaded += 1
+                video_result = await ui.run_javascript(
+                    f"return await fixlyUploadVideo('{token}', {cid})"
+                )
+                if video_result and not video_result.get("error"):
+                    uploaded = 1
             except Exception:
                 pass
-        if uploaded == 0:
-            err_label.set_text("Could not upload any photos, check your connection and try again.")
-            submit_btn.props(remove="loading disable")
-            return
+            if uploaded == 0:
+                err_label.set_text("Could not upload the video. Check your connection and try again.")
+                submit_btn.props(remove="loading disable")
+                return
+        else:
+            # ── Image path (original, unchanged) ──────────────────────────────
+            for i, f in enumerate(files):
+                _lbls["upload"].set_text(f"↻  Uploading photo {i + 1} of {n}…")
+                try:
+                    raw_b64 = f["data"].split(",", 1)[1]
+                    img_bytes = _b64.b64decode(raw_b64)
+                    async with httpx.AsyncClient() as client:
+                        r_up = await client.post(
+                            f"{API}/cases/{cid}/uploads",
+                            files={"file": (f["name"], img_bytes, f["type"])},
+                            headers={"Authorization": f"Bearer {token}"},
+                            timeout=30.0,
+                        )
+                    if r_up.status_code in (200, 201):
+                        uploaded += 1
+                except Exception:
+                    pass
+            if uploaded == 0:
+                err_label.set_text("Could not upload any photos, check your connection and try again.")
+                submit_btn.props(remove="loading disable")
+                return
+
         _done("upload")
 
         # Step 3, trigger analysis
@@ -5634,13 +5805,13 @@ async def admin_feedback_page():
                     f'padding:14px 18px;display:flex;align-items:center;gap:10px;">'
                     f'<span style="font-size:1.2rem;">&#128721;</span>'
                     f'<span style="font-weight:700;color:#991b1b;font-size:0.9rem;">'
-                    f'{s_open} safety incident{"s" if s_open != 1 else ""} awaiting review</span></div>'
+                    f'{s_open} safety review{"s" if s_open != 1 else ""} pending</span></div>'
                 )
             else:
                 ui.html(
                     '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:12px;'
                     'padding:12px 18px;color:#15803d;font-weight:600;font-size:0.86rem;">'
-                    '&#10003; No safety incidents awaiting review</div>'
+                    '&#10003; No safety reviews pending</div>'
                 )
 
             # Headline takeaway sentence (counts-first)
@@ -5650,11 +5821,19 @@ async def admin_feedback_page():
                 f"Based on {tf} response{'s' if tf != 1 else ''}: "
                 f"helpful {helpful}/{tf}"
                 + (f"; top issue: {top_issue} ({priority[0]['count']})" if top_issue else "")
-                + f"; {overview.get('safety_total', 0)} safety report(s)."
+                + f"; {overview.get('safety_total', 0)} safety review(s)."
+            )
+            _context_note = (
+                "The analysis count reflects iterative testing across output modes and routing scenarios "
+                "during development. The feedback system was introduced recently, so only a subset of "
+                "those analyses have recorded feedback."
             )
             ui.html(
                 f'<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;'
-                f'padding:12px 16px;font-size:0.86rem;color:#334155;line-height:1.5;">{_take}</div>'
+                f'padding:12px 16px;font-size:0.86rem;color:#334155;line-height:1.5;">'
+                f'{_take}'
+                f'<div style="margin-top:6px;font-size:0.78rem;color:#94a3b8;font-style:italic;">'
+                f'{_context_note}</div></div>'
             )
 
             # Health cards — count-first, N-tagged
@@ -5672,7 +5851,7 @@ async def admin_feedback_page():
                 + _card("Analyses", overview.get("total_analyses", 0))
                 + _card("Feedback", tf, f"{rr}% response rate")
                 + _card("Helpful", f"{helpful}/{tf}", "of responses")
-                + _card("Safety reports", overview.get("safety_total", 0), f"{s_open} open")
+                + _card("Safety reviews", overview.get("safety_total", 0), f"{s_open} pending")
                 + '</div>'
             )
 
@@ -5712,27 +5891,98 @@ async def admin_feedback_page():
                     )
                 ui.html(f'<div style="display:flex;gap:12px;flex-wrap:wrap;">{cards}</div>')
 
-            # Safety Centre — incident queue with review controls
-            ui.html('<div style="font-weight:700;color:#0f172a;font-size:0.95rem;margin-top:4px;">Safety Centre</div>')
+            # Safety Review Queue — shows auto-flagged hazard cases and user-reported safety concerns
+            ui.html('<div style="font-weight:700;color:#0f172a;font-size:0.95rem;margin-top:4px;">Safety Review Queue</div>')
+            ui.html(
+                '<div style="font-size:0.78rem;color:#64748b;margin-bottom:4px;">'
+                'Includes cases automatically flagged because they involved a hazardous scenario, '
+                'and cases where the user explicitly reported a safety concern.</div>'
+            )
             if not safety:
-                ui.html('<div style="color:#94a3b8;font-size:0.84rem;">No safety incidents.</div>')
+                ui.html('<div style="color:#94a3b8;font-size:0.84rem;">No safety reviews.</div>')
             else:
                 for inc in safety:
+                    # Determine whether this was auto-flagged by the system or user-reported.
+                    _has_user_report = bool(inc.get("safety_category"))
+                    _mode = inc.get("output_mode") or ""
+                    if _has_user_report:
+                        _flag_label = "USER-REPORTED SAFETY CONCERN"
+                        _flag_bg    = "#fef2f2"
+                        _flag_fg    = "#991b1b"
+                        _flag_border = "#fca5a5"
+                        _reason = (
+                            f"The user selected a safety category: "
+                            f"<strong>{inc['safety_category'].replace('_', ' ')}</strong>."
+                        )
+                    elif _mode == "assessment_first":
+                        _flag_label  = "AUTO-FLAGGED · Assessment First Case"
+                        _flag_bg     = "#fffbeb"
+                        _flag_fg     = "#92400e"
+                        _flag_border = "#fde68a"
+                        _reason = (
+                            "This case was automatically added to the review queue because it involved "
+                            "a hazardous scenario requiring professional assessment. "
+                            "The user did not report a safety concern."
+                        )
+                    elif _mode == "out_of_scope":
+                        _flag_label  = "AUTO-FLAGGED · Emergency Case"
+                        _flag_bg     = "#fffbeb"
+                        _flag_fg     = "#92400e"
+                        _flag_border = "#fde68a"
+                        _reason = (
+                            "This case was automatically added because it was classified as an active emergency. "
+                            "The user did not report a safety concern."
+                        )
+                    else:
+                        _flag_label  = "AUTO-FLAGGED"
+                        _flag_bg     = "#fffbeb"
+                        _flag_fg     = "#92400e"
+                        _flag_border = "#fde68a"
+                        _reason = "This case was automatically added to the safety review queue."
+
+                    # Feedback detail lines
+                    _rating_label   = {"helpful": "Helpful", "partial": "Partially helpful", "not": "Not helpful"}.get(
+                        inc.get("rating", ""), inc.get("rating", "—")
+                    )
+                    _issue_label  = _ISSUE_LABELS.get(inc.get("issue_category"), None)
+                    _comment_text = inc.get("comment") or None
+
+                    _feedback_rows = (
+                        f'<div style="font-size:0.8rem;color:#334155;line-height:1.7;">'
+                        f'<span style="color:#64748b;">Rating:</span> {_rating_label}&nbsp;&nbsp;'
+                        f'<span style="color:#64748b;">Issue:</span> {_issue_label or "None"}&nbsp;&nbsp;'
+                        f'<span style="color:#64748b;">Safety category:</span> '
+                        f'{inc.get("safety_category", "None") or "None"}'
+                        + (f'<br><span style="color:#64748b;">Comment:</span> {_comment_text}' if _comment_text else
+                           '&nbsp;&nbsp;<span style="color:#64748b;">Comment:</span> None')
+                        + '</div>'
+                    )
+
                     with ui.element("div").style(
-                        "background:white;border:1px solid #fecaca;border-radius:12px;"
-                        "padding:14px 16px;display:flex;flex-direction:column;gap:8px;"
+                        f"background:white;border:1px solid {_flag_border};border-radius:12px;"
+                        "padding:14px 16px;display:flex;flex-direction:column;gap:10px;"
                     ):
+                        # Flag banner
                         ui.html(
                             f'<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;">'
-                            f'<span style="font-weight:700;color:#991b1b;font-size:0.84rem;">'
-                            f'{inc.get("safety_category") or "safety report"} · {inc.get("output_mode")}</span>'
-                            f'<span style="font-size:0.74rem;color:#64748b;">case {inc.get("session_id")} · '
-                            f'analysis {inc.get("analysis_id")} · status: {inc.get("status")}'
+                            f'<span style="background:{_flag_bg};color:{_flag_fg};font-weight:700;'
+                            f'font-size:0.78rem;padding:3px 10px;border-radius:6px;letter-spacing:0.03em;">'
+                            f'{_flag_label}</span>'
+                            f'<span style="font-size:0.74rem;color:#64748b;">'
+                            f'case {inc.get("session_id")} &middot; analysis {inc.get("analysis_id")} '
+                            f'&middot; mode: {_mode or "—"} &middot; status: {inc.get("status")}'
                             + (f' ({inc.get("resolution")})' if inc.get("resolution") else "")
                             + '</span></div>'
                         )
-                        if inc.get("comment"):
-                            ui.html(f'<div style="font-size:0.82rem;color:#334155;">{inc["comment"]}</div>')
+                        # Original feedback
+                        ui.html(_feedback_rows)
+                        # Reason explanation
+                        ui.html(
+                            f'<div style="background:#f8fafc;border-radius:8px;padding:8px 12px;'
+                            f'font-size:0.78rem;color:#64748b;line-height:1.5;">'
+                            f'<strong style="color:#475569;">Reason:</strong> {_reason}</div>'
+                        )
+                        # Review controls
                         with ui.element("div").style("display:flex;gap:8px;flex-wrap:wrap;align-items:center;"):
                             st = ui.select(["new", "reviewing", "resolved"], value=inc.get("status", "new")) \
                                 .props("outlined dense").style("min-width:120px;")

@@ -33,6 +33,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,8 @@ from app.database import AsyncSessionLocal
 
 from app.models import Analysis, Message, Session as RepairSession, Upload
 from app.services.clarification_reasoning import (
+    ClarificationAssessment,
+    QuestionCoverage,
     assess_clarification,
     build_reprompt,
     finalize_context,
@@ -88,6 +91,123 @@ _REPAIR_SCOPE = (
 )
 
 _ollama = ollama.AsyncClient(host=OLLAMA_BASE_URL)
+
+# Inlined from clarification_reasoning._assemble_context so we can rebuild
+# a ClarificationAssessment without importing the private symbol.
+_CQ_CONTEXT_HEADER = "User answers to clarification questions:"
+
+
+def _rebuild_context(
+    resolved_pairs: list[tuple[str, str]],
+    prior_context: str | None,
+) -> str:
+    prior = (prior_context or "").strip()
+    lines: list[str] = []
+    n = 0
+    for question, answer in resolved_pairs:
+        if prior and question in prior and answer in prior:
+            continue
+        n += 1
+        lines.append(f"Q{n}: {question}")
+        lines.append(f"A{n}: {answer}")
+    parts: list[str] = []
+    if prior:
+        parts.append(prior)
+    if lines:
+        parts.append(_CQ_CONTEXT_HEADER + "\n" + "\n".join(lines))
+    return "\n\n".join(parts)
+
+
+async def _assess_with_model_fallback(
+    required_questions: list[str],
+    answer_messages: list[str],
+    prior_context: str | None,
+    optional_questions: list[str],
+) -> ClarificationAssessment:
+    """keyword assess_clarification + LLM fallback for vocabulary-mismatch cases.
+
+    The pure keyword matcher fails when the user gives a valid but different-
+    vocabulary answer (e.g. "cup plunger" vs a question about "clearing method").
+    This wrapper runs the keyword check first, then asks the LLM a single batched
+    YES/NO question for any questions still open. Fails safe: if the model call
+    errors, returns the original keyword-only assessment unchanged.
+    """
+    first = assess_clarification(
+        required_questions=required_questions,
+        answer_messages=answer_messages,
+        prior_context=prior_context,
+        optional_questions=optional_questions,
+    )
+    if not first.open_questions or not answer_messages:
+        return first
+
+    open_qs = first.open_questions
+    answers_block = "\n".join(f"- {a}" for a in answer_messages)
+    prompt_lines = [
+        "For each numbered question below, reply YES if any of the user's messages "
+        "directly answers it, or NO if none do. Use exactly the format '1: YES' or '1: NO'. "
+        "No other text.",
+        "",
+        "Questions:",
+    ]
+    for i, q in enumerate(open_qs, 1):
+        prompt_lines.append(f"{i}. {q}")
+    prompt_lines += ["", "User messages:", answers_block]
+    prompt = "\n".join(prompt_lines)
+
+    model_resolved: set[str] = set()
+    try:
+        resp = await _ollama.chat(
+            model=CHAT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0, "num_predict": max(30, len(open_qs) * 10)},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+        raw = (resp.message.content or "").strip()
+        for line in raw.splitlines():
+            m = re.match(r"^\s*(\d+)\s*[:.)]\s*(yes|no)\b", line, re.IGNORECASE)
+            if m:
+                idx = int(m.group(1)) - 1
+                if 0 <= idx < len(open_qs) and m.group(2).upper() == "YES":
+                    model_resolved.add(open_qs[idx])
+        log.info(
+            "clarification_model_check open=%d resolved_by_model=%d",
+            len(open_qs), len(model_resolved),
+        )
+    except Exception as exc:
+        log.warning("clarification model fallback failed: %s", exc)
+        return first
+
+    if not model_resolved:
+        return first
+
+    # Pick the best answer to attribute: most recent substantive message.
+    best_answer = next(
+        (a for a in reversed(answer_messages) if len(a.strip()) > 3),
+        answer_messages[-1],
+    )
+
+    new_coverage: list[QuestionCoverage] = []
+    new_resolved: list[tuple[str, str]] = list(first.resolved_pairs)
+    new_open: list[str] = []
+
+    for cov in first.coverage:
+        if not cov.answered and cov.question in model_resolved:
+            new_coverage.append(QuestionCoverage(cov.question, True, best_answer))
+            new_resolved.append((cov.question, best_answer))
+        else:
+            new_coverage.append(cov)
+            if not cov.answered:
+                new_open.append(cov.question)
+
+    assembled = _rebuild_context(new_resolved, prior_context)
+    return ClarificationAssessment(
+        coverage=new_coverage,
+        ready=len(new_open) == 0,
+        open_questions=new_open,
+        resolved_pairs=new_resolved,
+        assembled_context=assembled,
+    )
 
 
 # Em / en dashes read as "AI-generated"; replace them with plain punctuation in
@@ -647,7 +767,7 @@ async def _evaluate_clarification(db: AsyncSession, case_id: int) -> _Clarificat
     ]
     answer_texts = [m.content for m in answer_msgs]
 
-    assessment = assess_clarification(
+    assessment = await _assess_with_model_fallback(
         required_questions=questions,
         answer_messages=answer_texts,
         prior_context=(analysis.text_context or "").strip() or None,
@@ -954,6 +1074,60 @@ async def _build_system_prompt(db: AsyncSession, case_id: int) -> str:
         problem = s1.get("problem_type", "")
         trade = s1.get("trade_category", "")
         optional = cl.get("optional_questions") or []
+
+        # Pre-compute which questions are already answered so the model is told
+        # explicitly — not asked to infer from history. This prevents re-asking.
+        _opener_r = await db.execute(
+            select(Message)
+            .where(
+                Message.session_id == case_id,
+                Message.message_type == "clarification_opener",
+            )
+            .order_by(Message.created_at.desc())
+            .limit(1)
+        )
+        _opener = _opener_r.scalar_one_or_none()
+        _resolved_pairs: list[tuple[str, str]] = []
+        _open_questions: list[str] = list(questions)
+        if _opener and questions:
+            _ans_r = await db.execute(
+                select(Message)
+                .where(
+                    Message.session_id == case_id,
+                    Message.role == "user",
+                    Message.created_at > _opener.created_at,
+                )
+                .order_by(Message.created_at.asc())
+            )
+            _answer_texts = [
+                m.content for m in _ans_r.scalars().all()
+                if (m.msg_metadata or {}).get("clarification_answer")
+            ]
+            if _answer_texts:
+                _assessment = await _assess_with_model_fallback(
+                    required_questions=questions,
+                    answer_messages=_answer_texts,
+                    optional_questions=optional,
+                )
+                _resolved_pairs = _assessment.resolved_pairs
+                _open_questions = _assessment.open_questions
+
+        _resolved_block = ""
+        if _resolved_pairs:
+            _resolved_block = (
+                "\n\nQUESTIONS ALREADY ANSWERED (do NOT ask these again):\n"
+                + "\n".join(
+                    f"  Q: {q}\n  A: {a}" for q, a in _resolved_pairs
+                )
+            )
+
+        _open_block = (
+            "\n\nQUESTIONS STILL OPEN (ask only these, in order):\n"
+            + "\n".join(f"  {i}. {q}" for i, q in enumerate(_open_questions, 1))
+            if _open_questions
+            else "\n\nAll required questions have been answered."
+        )
+
         return (
             "You are Knitra, the repair assistant for this case.\n"
             + _REPAIR_SCOPE + "\n\n"
@@ -963,8 +1137,8 @@ async def _build_system_prompt(db: AsyncSession, case_id: int) -> str:
             f"Trade               : {trade}\n"
             + (f"What is unclear     : {'; '.join(what_unclear)}\n" if what_unclear else "")
             + (f"Why it matters      : {why_matters}\n" if why_matters else "")
-            + "\nRequired questions you asked the user:\n"
-            + "\n".join(f"  {i}. {q}" for i, q in enumerate(questions, 1))
+            + _resolved_block
+            + _open_block
             + (
                 "\n\nOptional question (does not block re-analysis):\n"
                 + "\n".join(f"  - {q}" for q in optional)
@@ -976,8 +1150,8 @@ async def _build_system_prompt(db: AsyncSession, case_id: int) -> str:
             "'it was a candle, about 5cm wide' resolves both cause and size — acknowledge "
             "both, do not ask them again.\n"
             "2. When the user answers a question, acknowledge it warmly.\n"
-            "3. NEVER repeat or rephrase a question already answered earlier in the chat, "
-            "even if worded differently. Before asking anything, check the full history.\n"
+            "3. NEVER ask a question listed under QUESTIONS ALREADY ANSWERED, even worded "
+            "differently. Only ask from QUESTIONS STILL OPEN.\n"
             "4. OFFICIAL ANALYSIS OWNERSHIP: The official AI Analysis panel is the "
             "authoritative source of repair instructions, tool lists, and step-by-step "
             "guidance. It is being updated now. When the user's answers appear to resolve "

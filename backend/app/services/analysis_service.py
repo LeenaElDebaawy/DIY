@@ -1132,15 +1132,46 @@ async def _run_pipeline(
                 if _precomputed_s1 is not None
                 else _BASE_CONFIDENCE_FLOOR
             )
-            # High-risk or professional-assessment cases must route to assessment_first,
-            # not needs_clarification. A clarification question ("Is the boiler still
-            # on?") does not change the safety recommendation ("call a professional").
+            # High-risk cases must route to assessment_first, not needs_clarification.
+            # A clarification question ("Is the boiler still on?") does not change
+            # the safety recommendation ("call a professional").
+            #
+            # Video path: risk_level alone drives escalation — the local Qwen2.5-VL
+            # model over-sets professional_assessment_recommended for medium-risk tasks
+            # (drain blockages, dripping taps, peeling wallpaper) because the system
+            # prompt says "if in doubt, recommend professional assessment."  Trusting
+            # par=True at medium risk on the video path causes routine maintenance to
+            # force assessment_first.  risk_level is a more reliable signal because
+            # the model only rates high/critical when it observes a specific danger.
+            # The post-processing rule in video_analysis_service.py also corrects par
+            # for plumbing/decorating at medium risk with no serious hazard evidence.
+            #
+            # Image path keeps the combined gate (par OR high/critical) because the
+            # image model does not show the same systematic over-escalation pattern.
+            _is_video_path = _precomputed_s1 is not None
             _force_assessment_first = (
-                getattr(s1, "professional_assessment_recommended", False) is True
-                or getattr(s1, "risk_level", "") in ("high", "critical")
+                getattr(s1, "risk_level", "") in ("high", "critical")
+                if _is_video_path
+                else (
+                    getattr(s1, "professional_assessment_recommended", False) is True
+                    or getattr(s1, "risk_level", "") in ("high", "critical")
+                )
+            )
+            # Video path: nc=True does not fire the early gate on its own.
+            # The video model sets needs_clarification=True when it has specific
+            # diagnostic questions (duration, extent, damage type) even when the
+            # video quality is adequate and Stage 1 is complete.  Those questions
+            # belong in Stage C (clarification mode) so the chat opener, Q&A flow,
+            # and auto-reanalysis work exactly as they do for image cases.
+            # The early gate is reserved for genuinely low-confidence video (conf
+            # below floor), where asking the user to re-upload or describe more is
+            # the only meaningful action.
+            # Image path: unchanged — nc=True often signals poor image quality.
+            _nc_triggers_early_gate = (
+                False if _is_video_path else s1.needs_clarification
             )
             if not _s1_fallback and not _force_assessment_first and (
-                s1.needs_clarification or s1.confidence < _confidence_floor
+                _nc_triggers_early_gate or s1.confidence < _confidence_floor
             ):
                 log.info(
                     "Stage 1 confidence=%d (floor=%d, trade=%s) needs_clarification=%s, "

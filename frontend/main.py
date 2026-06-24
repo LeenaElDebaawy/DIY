@@ -3929,12 +3929,15 @@ async def case_detail_page(case_id: int):
                             ]
 
                         async def _reanalyse_from_chat(text_context: str = ""):
-                            """Trigger the official Re-analyse then reload into the running/polling flow.
+                            """Trigger the official Re-analyse then show pipeline progress in-place.
 
                             text_context is passed to the analysis endpoint so Stage 1 can
                             incorporate clarification answers.  The manual button calls this
                             with no args (empty string); auto-reanalysis passes the joined answers.
+                            Instead of reloading the page, we activate the poll timer so the
+                            analysis panel updates with live pipeline stages while chat stays visible.
                             """
+                            nonlocal _was_running, _title_updated
                             try:
                                 body = {"text_context": text_context} if text_context else {}
                                 async with httpx.AsyncClient() as c:
@@ -3945,7 +3948,11 @@ async def case_detail_page(case_id: int):
                                         timeout=30.0,
                                     )
                                 if r.status_code in (200, 202):
-                                    ui.run_javascript("window.location.reload()")
+                                    _was_running = True
+                                    _title_updated = False
+                                    fresh = await _get_analysis()
+                                    _redraw(fresh)
+                                    poll_timer.active = True
                                 else:
                                     ui.notify(f"Could not start re-analysis ({r.status_code}).",
                                               type="negative", position="top-right")

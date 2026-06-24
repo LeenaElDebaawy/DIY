@@ -102,6 +102,17 @@ what is intermittent. This is why video evidence is being collected.
 'I cannot confirm this without a closer look'.
 5. Safety is always the primary concern. If in doubt, recommend professional \
 assessment.
+6. Set professional_assessment_recommended to true only when the evidence \
+supports it: risk_level is high or critical, OR a specific hazard is visible \
+that a competent DIYer cannot safely manage — live electrical exposure or water \
+within 1 metre of a live fitting, a gas supply or boiler fault, an active water \
+leak under pressure (burst pipe, leaking water heater), sewage contamination, \
+active flooding, or structural instability (sagging ceiling, visible load-bearing \
+damage). Do NOT set it to true purely out of general caution for medium-risk \
+maintenance where no such hazard is observable. A blocked drain, dripping tap, \
+peeling paint or wallpaper without damp evidence, or grout and tile repair are \
+tasks a competent homeowner can assess safely — route them through the risk and \
+hazard evidence, not through precautionary instinct.
 """
 
 # Double braces {{ }} are literal braces in the JSON schema (format() escaping).
@@ -114,7 +125,7 @@ Return ONLY a JSON object with EXACTLY these fields. No extra text, no markdown.
 {{
   "scope": "<repair | emergency | not_repair | unclear>",
   "problem_type": "<short human-readable description, e.g. 'Leaking pipe joint under kitchen sink'>",
-  "trade_category": "<EXACTLY one of: plumbing | electrical | appliance | carpentry/joinery | glazing | sealing/weatherproofing | plastering/decorating | structural | hvac | general/other>",
+  "trade_category": "<EXACTLY one of: plumbing | electrical | appliance | carpentry/joinery | glazing | sealing/weatherproofing | plastering/decorating | stone/masonry | structural | hvac | general/other — use stone/masonry for tile, grout, and stone surface work; use plumbing only for water supply, drainage, and pipe fittings>",
   "severity": "<low | medium | high>",
   "risk_level": "<low | medium | high | critical>",
   "confidence": <integer 0 to 100>,
@@ -570,6 +581,9 @@ def _get_client() -> VideoInferenceClient:
 # by Rule 0 before any escalation logic runs.
 _BOILERPLATE_HAZARD_PHRASES: frozenset[str] = frozenset({
     "sharp edge", "sharp edges",
+    "sharp object", "sharp objects",   # generic kitchen/bathroom debris caution
+    "if left unattended",              # consequence-of-inaction, not an observed hazard
+    "if improper tool", "if improper tools",  # technique advice, not observed in video
     "moving part", "moving parts",
     "pinch risk", "pinch hazard",
     "hand tool", "tool injury",
@@ -843,6 +857,47 @@ def _apply_video_safety_adjustments(s1: VideoStage1Output) -> list[str]:
             notes.append(
                 f"added {len(s1.safety_concerns)} safety_concern(s) from brief_hazards"
             )
+
+    # 1R. Medium-risk plumbing / plastering-decorating with no serious hazard evidence
+    #
+    # The video model over-sets professional_assessment_recommended in these two
+    # trades because the system prompt says "if in doubt, recommend professional
+    # assessment."  This triggers for medium-risk maintenance where no unmanageable
+    # hazard is actually present: drain blockages, dripping taps, peeling wallpaper.
+    #
+    # This rule is evidence-based, NOT problem-name-based.  It fires only when ALL
+    # of the following hold simultaneously:
+    #
+    #   1. trade_category is plumbing or plastering/decorating
+    #      (the two trades where systematic over-escalation is observed)
+    #   2. risk_level == "medium"
+    #      (high/critical always warrant professional escalation — untouched)
+    #   3. _has_serious_hazard is False
+    #      (computed above from the model's own text; covers electrical, gas,
+    #      flooding, sewage, structural collapse, fire, mould, asbestos, etc.)
+    #   4. No real brief_hazards remain after Rule 0 boilerplate stripping
+    #      (a non-boilerplate specific hazard in the model's output keeps par=True)
+    #
+    # The routing gate in analysis_service.py (_force_assessment_first) is the
+    # PRIMARY fix for stored analyses; this rule corrects the stored par signal
+    # so future routing and display are consistent with the evidence.
+    _ROUTINE_ESCALATION_TRADES: frozenset[str] = frozenset({
+        "plumbing",
+        "plastering/decorating",
+    })
+    if (
+        (s1.trade_category or "").lower() in _ROUTINE_ESCALATION_TRADES
+        and (s1.risk_level or "medium") == "medium"
+        and not _has_serious_hazard
+        and not s1.brief_hazards         # real entries remaining after Rule 0
+        and s1.professional_assessment_recommended
+    ):
+        s1.professional_assessment_recommended = False
+        notes.append(
+            f"par_downgrade: professional_assessment_recommended -> False "
+            f"(trade={s1.trade_category!r}, risk=medium, no_serious_hazard, "
+            f"no_real_brief_hazards after boilerplate filter)"
+        )
 
     # 2. Active hazard in motion — only escalate when motion signals a live fault.
     #

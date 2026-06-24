@@ -190,7 +190,7 @@ class Stage1Output(BaseModel):
             return v.strip().lower() in ("true", "1", "yes", "y", "recommended")
         return bool(v)
 
-    @field_validator("safety_concerns", "clarifying_questions", mode="before")
+    @field_validator("safety_concerns", "clarifying_questions", "optional_questions", mode="before")
     @classmethod
     def _coerce_str_list(cls, v: object) -> list[str]:
         """Accept a list of strings, a list of dicts (extract a string value), or a

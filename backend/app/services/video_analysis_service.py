@@ -312,6 +312,11 @@ def _run_inference_sync(
     import torch  # noqa: PLC0415 — re-import is a no-op; confirms DLL order
     from qwen_vl_utils import process_vision_info  # noqa: PLC0415
 
+    # Diagnostic: confirm this code version is running
+    _diag = Path(__file__).parent.parent.parent / "video_diag.log"
+    with open(_diag, "a") as _f:
+        _f.write(f"_run_inference_sync called: {video_path.name}\n")
+
     # Pre-extract frames with PyAV and pass as a list of PIL Images.
     # qwen-vl-utils fetch_video() accepts list|tuple directly (calls fetch_image
     # per frame), bypassing all video-reader backends entirely.
@@ -319,13 +324,23 @@ def _run_inference_sync(
     # removal in torchvision >= 0.20.
     try:
         frames = _extract_frames_pyav(video_path, nframes)
+        with open(_diag, "a") as _f:
+            _f.write(f"  PyAV extracted {len(frames)} frames OK\n")
     except VideoAnalysisError:
         raise
     except Exception as exc:
+        with open(_diag, "a") as _f:
+            _f.write(f"  PyAV FAILED: {type(exc).__name__}: {exc}\n")
         raise VideoAnalysisError(
             f"Frame extraction failed for '{video_path.name}': {type(exc).__name__}: {exc}"
         ) from exc
 
+    # Pass frames as "type": "video" with a PIL list.
+    # fetch_video() takes the else branch for list input (no video reader called),
+    # so FORCE_QWENVL_VIDEO_READER=decord guards the string-path case only.
+    # This is important: video mode applies a lower per-frame pixel budget
+    # (VIDEO_FRAME_MAX_PIXELS) than image mode (IMAGE_MAX_PIXELS), which
+    # prevents the CUDA OOM that occurs when 8 large images are passed separately.
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {
@@ -333,8 +348,8 @@ def _run_inference_sync(
             "content": [
                 {
                     "type": "video",
-                    "video": frames,       # list[PIL.Image] — skips video reader
-                    "sample_fps": 2.0,     # approximate; used for temporal metadata
+                    "video": frames,
+                    "sample_fps": 1.0,
                 },
                 {"type": "text", "text": prompt_text},
             ],
@@ -347,16 +362,16 @@ def _run_inference_sync(
 
     try:
         image_inputs, video_inputs = process_vision_info(messages)
+        with open(_diag, "a") as _f:
+            _f.write(f"  process_vision_info OK: {len(image_inputs or [])} images, {len(video_inputs or [])} videos\n")
     except Exception as exc:
+        with open(_diag, "a") as _f:
+            _f.write(f"  process_vision_info FAILED: {type(exc).__name__}: {exc}\n")
         raise VideoAnalysisError(
             f"Frame extraction failed for '{video_path.name}': {type(exc).__name__}: {exc}"
         ) from exc
 
-    actual_nframes = (
-        video_inputs[0].shape[0]
-        if video_inputs and hasattr(video_inputs[0], "shape")
-        else len(frames)
-    )
+    actual_nframes = len(frames)
 
     inputs = processor(
         text=[text],
@@ -388,9 +403,12 @@ def _run_inference_sync(
                 max_new_tokens=max_new_tokens,
                 do_sample=False,   # greedy decoding — deterministic output
             )
-    except RuntimeError as exc:
+    except Exception as exc:
+        # Free GPU memory before re-raising so a retry has a better chance.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         msg = str(exc).lower()
-        if "out of memory" in msg or "cuda" in msg:
+        if "out of memory" in msg or "cuda" in msg or "accelerator" in type(exc).__name__.lower():
             raise VideoAnalysisError(
                 f"GPU out of memory during video inference. "
                 f"Try reducing VIDEO_NFRAMES (currently {nframes}) or "
@@ -398,10 +416,6 @@ def _run_inference_sync(
             ) from exc
         raise VideoAnalysisError(
             f"Inference runtime error: {type(exc).__name__}: {exc}"
-        ) from exc
-    except Exception as exc:
-        raise VideoAnalysisError(
-            f"Inference failed unexpectedly: {type(exc).__name__}: {exc}"
         ) from exc
 
     infer_ms = int((time.monotonic() - t0) * 1000)
@@ -416,6 +430,7 @@ def _run_inference_sync(
 
     if torch.cuda.is_available():
         vram_peak = torch.cuda.max_memory_allocated(0) / 1024 ** 3
+        torch.cuda.empty_cache()   # free allocator fragments for the next request
         log.info(
             "video_inference_complete infer_ms=%d output_chars=%d peak_vram=%.2fGB",
             infer_ms, len(raw_output), vram_peak,
@@ -1077,10 +1092,31 @@ async def analyse_video(
         nframes_used, len(raw),
     )
 
-    # Extract JSON
+    # Extract JSON — if the model produces no JSON at all (common for unrelated
+    # or unintelligible video content), treat as not_repair rather than failing.
     try:
         data = _extract_json_from_raw(raw)
-    except VideoAnalysisError:
+    except VideoAnalysisError as exc:
+        if "contains no JSON object" in str(exc) or "JSON parse error" in str(exc):
+            log.warning(
+                "video_stage1: no JSON from model for %s — treating as not_repair. "
+                "raw[:80]=%r",
+                video_path.name, raw[:80],
+            )
+            return VideoStage1Output(
+                scope="not_repair",
+                problem_type="Unrelated or unrecognisable video content",
+                trade_category="general/other",
+                risk_level="low",
+                diy_suitability="not_recommended",
+                professional_assessment_recommended=False,
+                needs_clarification=False,
+                confidence=90,
+                input_modality="video",
+                motion_detected=False,
+                brief_hazard_observed=False,
+                temporal_confidence=75.0,
+            )
         raise
     except Exception as exc:
         raise VideoAnalysisError(

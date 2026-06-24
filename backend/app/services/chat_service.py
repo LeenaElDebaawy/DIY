@@ -160,7 +160,7 @@ async def _assess_with_model_fallback(
         resp = await _ollama.chat(
             model=CHAT_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0, "num_predict": max(30, len(open_qs) * 10)},
+            options={"temperature": 0, "num_predict": max(30, len(open_qs) * 10), "num_gpu": 0},
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
         raw = (resp.message.content or "").strip()
@@ -556,6 +556,7 @@ async def send_message(
                 "temperature":  0.6,
                 "num_predict":  CHAT_NUM_PREDICT,
                 "num_ctx":      CHAT_NUM_CTX,
+                "num_gpu":      0,
             },
             keep_alive=OLLAMA_KEEP_ALIVE,
         )
@@ -609,6 +610,7 @@ async def stream_message(
                     "temperature":  0.6,
                     "num_predict":  CHAT_NUM_PREDICT,
                     "num_ctx":      CHAT_NUM_CTX,
+                    "num_gpu":      0,
                 },
                 keep_alive=OLLAMA_KEEP_ALIVE,
                 stream=True,

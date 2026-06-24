@@ -158,6 +158,66 @@ UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
 # pipeline calls.  AsyncClient is safe to share across coroutines.
 _ollama = ollama.AsyncClient(host=OLLAMA_BASE_URL)
 
+
+def _log_gpu_vram(label: str) -> None:
+    """Log total GPU VRAM state using pynvml (sees ALL processes, not just PyTorch)."""
+    try:
+        import pynvml  # noqa: PLC0415
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        info   = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        name   = pynvml.nvmlDeviceGetName(handle)
+        total  = info.total / 1024 ** 3
+        used   = info.used  / 1024 ** 3
+        free   = info.free  / 1024 ** 3
+        log.info(
+            "VRAM [%s] gpu=%s total=%.1fGB used=%.1fGB free=%.1fGB",
+            label, name, total, used, free,
+        )
+        pynvml.nvmlShutdown()
+    except Exception as exc:
+        log.info("VRAM [%s] pynvml unavailable: %s", label, exc)
+
+
+async def _unload_ollama_models() -> None:
+    """Unload all Ollama models from GPU VRAM before video inference.
+
+    On a single GPU, Ollama's chat/image models (llama3.1, qwen2.5vl) compete
+    directly with the video transformer model for VRAM. Sending a generate
+    request with keep_alive=0 tells Ollama to evict any loaded model immediately,
+    freeing VRAM for the video pipeline. Fails silently — a failed unload is not
+    fatal, it just means video inference has less headroom.
+    """
+    _log_gpu_vram("before_ollama_unload")
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            ps = await client.get(f"{OLLAMA_BASE_URL}/api/ps")
+            if ps.status_code != 200:
+                log.warning("video_pipeline: /api/ps returned %d", ps.status_code)
+                return
+            loaded = [m.get("name", "") for m in (ps.json().get("models") or [])]
+            if not loaded:
+                log.info("video_pipeline: no ollama models loaded in VRAM")
+                return
+            log.info("video_pipeline: unloading ollama models from VRAM: %s", loaded)
+            for model_name in loaded:
+                try:
+                    await client.post(
+                        f"{OLLAMA_BASE_URL}/api/generate",
+                        json={"model": model_name, "keep_alive": 0},
+                        timeout=10.0,
+                    )
+                    log.info("video_pipeline: unloaded %s", model_name)
+                except Exception as exc:
+                    log.warning("video_pipeline: failed to unload %s: %s", model_name, exc)
+        import asyncio as _asyncio
+        await _asyncio.sleep(2.0)   # give Ollama time to release GPU memory
+    except Exception as exc:
+        log.warning("video_pipeline: ollama unload failed (non-fatal): %s", exc)
+    _log_gpu_vram("after_ollama_unload")
+
+
 # ── Pipeline stage label constants ────────────────────────────────────────────
 # Written to Analysis.pipeline_stage after each step.
 # The frontend maps these to human-readable progress labels:
@@ -854,6 +914,12 @@ async def _run_video_pipeline(
         analysis.pipeline_stage = _S1_RUNNING
         await db.commit()
     # Session closed — DB connection released for the duration of inference.
+
+    # ── 1b. Unload Ollama models from GPU before video inference ─────────────
+    # Ollama keeps chat/image models in VRAM for up to 5 min. On a single GPU
+    # they compete directly with the video transformer model. Unloading them
+    # first ensures the full VRAM budget is available for video inference.
+    await _unload_ollama_models()
 
     # ── 2. Video Stage 1 inference ────────────────────────────────────────────
     _t_s1 = time.monotonic()

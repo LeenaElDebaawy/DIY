@@ -540,10 +540,11 @@ def sidebar(active_path: str = "/cases"):
             nav("📋", "My Cases", "/cases")
             nav("➕", "New Case", "/new")
 
-            # Admin-only: feedback dashboard. Shown only when the logged-in user is
-            # an admin (UX gate; access is enforced server-side via require_admin).
+            # Admin-only: feedback / judge / quality dashboards (UX gate; server enforces via require_admin).
             if app.storage.user.get("is_admin", False):
-                nav("📊", "Feedback", "/admin/feedback")
+                nav("💬", "Feedback", "/admin/feedback")
+                nav("🏛", "Judge", "/admin/judge")
+                nav("📊", "Quality", "/admin/quality")
 
             ui.html(
                 '<div style="height:1px;background:rgba(255,255,255,0.05);'
@@ -3457,9 +3458,52 @@ async def case_detail_page(case_id: int):
                         {"helpful": "Helpful", "partial": "Partially", "not": "No"},
                     ).props("inline").style("font-size:0.85rem;")
 
-                    issue_select = ui.select(
-                        list(_label_map.keys()), label="What was the main issue?",
-                    ).props("outlined dense").style("width:100%;margin-top:8px;display:none;")
+                    # ── Reason chips (shown for Partially / No only) ──────────
+                    _CHIP_OPTIONS = [
+                        ("wrong_diagnosis",                   "Wrong diagnosis"),
+                        ("too_cautious",                      "Too cautious"),
+                        ("not_cautious_enough",               "Not cautious enough"),
+                        ("not_detailed_enough",               "Not detailed enough"),
+                        ("wrong_tools_materials",             "Wrong tools/materials"),
+                        ("steps_unclear",                     "Steps unclear"),
+                        ("wrong_professional_recommendation", "Wrong professional recommendation"),
+                        ("advice_didnt_match_upload",         "Advice didn't match upload"),
+                        ("repeated_question",                 "Repeated a question I answered"),
+                        ("advice_felt_unsafe",                "Advice felt unsafe"),
+                        ("other",                            "Other"),
+                    ]
+                    _CHIP_OFF = (
+                        "padding:3px 11px;border-radius:100px;font-size:0.78rem;"
+                        "border:1.5px solid #e2e8f0;background:white;color:#64748b;"
+                        "font-weight:500;min-height:0;"
+                    )
+                    _CHIP_ON = (
+                        "padding:3px 11px;border-radius:100px;font-size:0.78rem;"
+                        "border:1.5px solid #6366f1;background:#e0e7ff;color:#3730a3;"
+                        "font-weight:600;min-height:0;"
+                    )
+                    _chip_sel  = {v: False for v, _ in _CHIP_OPTIONS}
+                    _chip_btns: dict = {}
+
+                    with ui.element("div").style("display:none;margin-top:10px;") as _chips_container:
+                        ui.html(
+                            '<div style="font-size:0.78rem;color:#64748b;margin-bottom:6px;">'
+                            'What was the issue? <span style="font-weight:400;">'
+                            '(optional — choose all that apply)</span></div>'
+                        )
+                        with ui.element("div").style("display:flex;flex-wrap:wrap;gap:6px;"):
+                            for _cv, _cl in _CHIP_OPTIONS:
+                                _btn = ui.button(_cl).props("flat no-caps").style(_CHIP_OFF)
+                                _chip_btns[_cv] = _btn
+
+                                def _make_toggle(v, b):
+                                    def _toggle():
+                                        _chip_sel[v] = not _chip_sel[v]
+                                        b.style(_CHIP_ON if _chip_sel[v] else _CHIP_OFF)
+                                    return _toggle
+
+                                _btn.on_click(_make_toggle(_cv, _btn))
+
                     comment = ui.textarea(
                         placeholder="Optional: what actually happened? (helps us improve)",
                     ).props("outlined dense autogrow rows=2").style(
@@ -3467,12 +3511,16 @@ async def case_detail_page(case_id: int):
                     )
 
                     def _on_rating(_=None):
-                        # Reveal the issue dropdown only for partial/no.
-                        issue_select.style(
-                            "width:100%;margin-top:8px;display:block;"
-                            if rating.value in ("partial", "not")
-                            else "width:100%;margin-top:8px;display:none;"
+                        show = rating.value in ("partial", "not")
+                        _chips_container.style(
+                            "display:block;margin-top:10px;"
+                            if show else "display:none;margin-top:10px;"
                         )
+                        if not show:
+                            for v in _chip_sel:
+                                _chip_sel[v] = False
+                            for b in _chip_btns.values():
+                                b.style(_CHIP_OFF)
                     rating.on_value_change(_on_rating)
 
                     _msg = ui.label("").style("font-size:0.8rem;color:#dc2626;min-height:16px;margin-top:6px;")
@@ -3482,12 +3530,10 @@ async def case_detail_page(case_id: int):
                             _msg.set_text("Please choose Helpful, Partially, or No.")
                             return
                         body = {"analysis_id": analysis_id, "rating": rating.value}
-                        if rating.value in ("partial", "not") and issue_select.value:
-                            kind, val = _label_map.get(issue_select.value, ("issue", "other"))
-                            if kind == "safety":
-                                body["safety_category"] = val
-                            else:
-                                body["issue_category"] = val
+                        if rating.value in ("partial", "not"):
+                            selected_chips = [v for v, sel in _chip_sel.items() if sel]
+                            if selected_chips:
+                                body["reason_chips"] = selected_chips
                         if (comment.value or "").strip():
                             body["comment"] = comment.value.strip()
                         try:
@@ -3509,6 +3555,357 @@ async def case_detail_page(case_id: int):
                     ui.button("Submit feedback", on_click=_submit) \
                         .props("unelevated color=primary size=sm") \
                         .style("font-weight:600;margin-top:8px;")
+
+            # ── Admin judge panel ─────────────────────────────────────────────
+            # Visible only to admins (UX gate; server enforces require_admin).
+            # Lets an admin click "Run Judge" to evaluate output quality on-demand.
+            def _draw_judge_panel():
+                _VERDICT_STYLE = {
+                    "pass":         ("Pass",         "#15803d", "#dcfce7"),
+                    "needs_review": ("Needs Review", "#92400e", "#fef3c7"),
+                    "unsafe":       ("Unsafe",       "#991b1b", "#fee2e2"),
+                }
+                _TAG_LABELS = {
+                    "over_cautious_routing":                          "Over-cautious routing",
+                    "under_cautious_routing":                         "Under-cautious routing",
+                    "missing_safety_warning":                         "Missing safety warning",
+                    "hallucinated_hazard":                            "Hallucinated hazard",
+                    "vague_repair_steps":                             "Vague repair steps",
+                    "vague_tools_or_materials":                       "Vague tools/materials",
+                    "poor_grounding":                                 "Poor grounding",
+                    "unnecessary_clarification":                      "Unnecessary clarification",
+                    "missing_clarification":                          "Missing clarification",
+                    "unclear_user_language":                          "Unclear language",
+                    "wrong_trade_category":                           "Wrong trade category",
+                    "weak_step_ordering":                             "Weak step ordering",
+                    "emergency_wording_could_be_stronger":            "Emergency wording too weak",
+                    "emergency_repair_steps_inappropriately_expected":"Repair steps wrongly expected",
+                    "unsupported_professional_escalation":            "Unsupported escalation",
+                    "unsupported_hazard_claim":                       "Unsupported hazard claim",
+                    "wrong_professional_type":                        "Wrong professional type",
+                    "over_specific_urgency":                          "Urgency over-specified",
+                    "useful_but_overcautious":                        "Useful but overcautious",
+                    "evidence_uncertainty_not_explained":             "Uncertainty not explained",
+                    "correct_but_unclear_reasoning":                  "Correct but unclear",
+                }
+
+                def _score_color(s: int) -> str:
+                    if s >= 80: return "#15803d"
+                    if s >= 65: return "#92400e"
+                    return "#991b1b"
+
+                def _render_result(j: dict, container):
+                    container.clear()
+                    with container:
+                        verdict   = j.get("final_verdict", "needs_review")
+                        vstyle    = _VERDICT_STYLE.get(verdict, _VERDICT_STYLE["needs_review"])
+                        overall   = j.get("overall_score", 0)
+                        dims      = j.get("dimension_scores") or {}
+                        tags      = j.get("issue_tags") or []
+                        judged_at = j.get("judged_at", "")[:10]
+                        rubric    = j.get("rubric_mode", j.get("output_mode", ""))
+
+                        # New structured fields (Phase 2), with fallback to legacy
+                        what_went_well  = j.get("what_went_well") or j.get("strengths") or []
+                        what_needs_work = j.get("what_needs_work") or j.get("missing_details") or []
+                        claims          = j.get("claims") or []
+                        findings        = j.get("findings") or []
+                        mode_review     = j.get("mode_review") or ""
+                        prof_review     = j.get("professional_type_review") or ""
+                        # qa_summary with fallback to old judge_reasoning_summary
+                        summary = (
+                            j.get("qa_summary")
+                            or j.get("judge_reasoning_summary")
+                            or ""
+                        )
+                        # Legacy fallback: if no findings, use suggested_improvements
+                        legacy_imps = j.get("suggested_improvements") or []
+
+                        _CLAIM_STYLE = {
+                            "confirmed":           ("#dcfce7", "#15803d", "✓ Confirmed"),
+                            "reasonable_inference":("#dbeafe", "#1e40af", "~ Reasonable"),
+                            "unsupported":         ("#ffedd5", "#9a3412", "✗ Unsupported"),
+                            "overclaimed":         ("#fee2e2", "#991b1b", "⚠ Overclaimed"),
+                        }
+
+                        def _section_header(title: str):
+                            ui.html(
+                                f'<div style="font-size:0.72rem;font-weight:700;color:#475569;'
+                                f'text-transform:uppercase;letter-spacing:0.07em;'
+                                f'margin:14px 0 6px;">{title}</div>'
+                            )
+
+                        # ── Score + verdict header ──────────────────────────
+                        _rubric_badge = (
+                            f'&nbsp;<span style="background:#e0e7ff;color:#3730a3;'
+                            f'font-size:0.7rem;font-weight:600;padding:2px 8px;'
+                            f'border-radius:100px;">{rubric}</span>'
+                            if rubric else ""
+                        )
+                        ui.html(
+                            f'<div style="display:flex;align-items:center;gap:14px;'
+                            f'flex-wrap:wrap;margin-bottom:10px;">'
+                            f'<div style="font-size:2.4rem;font-weight:800;'
+                            f'color:{_score_color(overall)};">{overall}</div>'
+                            f'<div>'
+                            f'<span style="background:{vstyle[2]};color:{vstyle[1]};'
+                            f'font-size:0.75rem;font-weight:700;padding:3px 10px;'
+                            f'border-radius:100px;">{vstyle[0]}</span>'
+                            f'{_rubric_badge}'
+                            f'<div style="color:#64748b;font-size:0.75rem;margin-top:4px;">'
+                            f'Judged {judged_at} · {j.get("judge_model","")}</div>'
+                            f'</div></div>'
+                        )
+
+                        # ── QA summary ──────────────────────────────────────
+                        if summary:
+                            bg = "#fee2e2" if verdict == "unsafe" else "#f1f5f9"
+                            tc = "#7f1d1d" if verdict == "unsafe" else "#334155"
+                            ui.html(
+                                f'<div style="background:{bg};border-radius:8px;padding:10px 14px;'
+                                f'font-size:0.85rem;color:{tc};line-height:1.55;margin-bottom:10px;">'
+                                f'{summary}</div>'
+                            )
+
+                        # ── Issue tag chips ─────────────────────────────────
+                        if tags:
+                            chips_html = "".join(
+                                f'<span style="background:#fef3c7;color:#92400e;font-size:0.72rem;'
+                                f'font-weight:600;padding:3px 9px;border-radius:100px;margin:2px;">'
+                                f'{_TAG_LABELS.get(t, t)}</span>'
+                                for t in tags
+                            )
+                            ui.html(f'<div style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:8px;">{chips_html}</div>')
+
+                        # ── What went well ──────────────────────────────────
+                        if what_went_well:
+                            _section_header("What went well")
+                            bullets = "".join(
+                                f'<div style="display:flex;gap:8px;margin-bottom:4px;">'
+                                f'<span style="color:#15803d;font-weight:700;flex-shrink:0;">✓</span>'
+                                f'<span style="font-size:0.83rem;color:#1e293b;line-height:1.5;">{item}</span>'
+                                f'</div>'
+                                for item in what_went_well
+                            )
+                            ui.html(f'<div style="background:#f0fdf4;border-radius:8px;padding:10px 12px;margin-bottom:8px;">{bullets}</div>')
+
+                        # ── What needs work ─────────────────────────────────
+                        if what_needs_work:
+                            _section_header("What needs work")
+                            bullets = "".join(
+                                f'<div style="display:flex;gap:8px;margin-bottom:4px;">'
+                                f'<span style="color:#b45309;font-weight:700;flex-shrink:0;">⚠</span>'
+                                f'<span style="font-size:0.83rem;color:#1e293b;line-height:1.5;">{item}</span>'
+                                f'</div>'
+                                for item in what_needs_work
+                            )
+                            ui.html(f'<div style="background:#fffbeb;border-radius:8px;padding:10px 12px;margin-bottom:8px;">{bullets}</div>')
+
+                        # ── Evidence audit ──────────────────────────────────
+                        if claims:
+                            _section_header("Evidence Audit")
+                            rows = []
+                            for c in claims:
+                                v = c.get("verdict", "unsupported")
+                                cs = _CLAIM_STYLE.get(v, _CLAIM_STYLE["unsupported"])
+                                rows.append(
+                                    f'<div style="border:1px solid #e2e8f0;border-radius:7px;'
+                                    f'padding:8px 10px;margin-bottom:5px;background:#fafafa;">'
+                                    f'<div style="display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap;">'
+                                    f'<span style="background:{cs[0]};color:{cs[1]};font-size:0.68rem;'
+                                    f'font-weight:700;padding:2px 7px;border-radius:100px;white-space:nowrap;'
+                                    f'flex-shrink:0;margin-top:1px;">{cs[2]}</span>'
+                                    f'<span style="font-size:0.82rem;font-weight:600;color:#1e293b;'
+                                    f'flex:1;">{c.get("claim","")}</span>'
+                                    f'</div>'
+                                    f'<div style="font-size:0.79rem;color:#64748b;margin-top:4px;'
+                                    f'line-height:1.4;">{c.get("note","")}</div>'
+                                    f'</div>'
+                                )
+                            ui.html(f'<div style="margin-bottom:8px;">{"".join(rows)}</div>')
+
+                        # ── Specific findings (new) or legacy improvements ──
+                        if findings:
+                            _section_header("Specific Findings")
+                            for f in findings:
+                                tag_label = _TAG_LABELS.get(f.get("tag",""), f.get("tag",""))
+                                excerpt   = f.get("excerpt","")
+                                problem   = f.get("problem","")
+                                better    = f.get("better","")
+                                pfix      = f.get("pipeline_fix","")
+                                ui.html(
+                                    f'<div style="border:1px solid #e0e7ff;border-radius:8px;'
+                                    f'padding:10px 12px;margin-bottom:8px;background:#fafbff;">'
+                                    f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">'
+                                    f'<span style="background:#fef3c7;color:#92400e;font-size:0.68rem;'
+                                    f'font-weight:700;padding:2px 8px;border-radius:100px;">{tag_label}</span>'
+                                    f'</div>'
+                                    + (
+                                        f'<div style="background:#f1f5f9;border-left:3px solid #94a3b8;'
+                                        f'border-radius:0 5px 5px 0;padding:5px 10px;margin-bottom:7px;'
+                                        f'font-size:0.8rem;color:#475569;font-style:italic;">"{excerpt}"</div>'
+                                        if excerpt else ""
+                                    )
+                                    + (
+                                        f'<div style="font-size:0.8rem;color:#7c2d12;'
+                                        f'margin-bottom:6px;line-height:1.45;">'
+                                        f'<strong>Problem:</strong> {problem}</div>'
+                                        if problem else ""
+                                    )
+                                    + (
+                                        f'<div style="background:#f0fdf4;border-radius:5px;'
+                                        f'padding:6px 10px;margin-bottom:6px;font-size:0.8rem;'
+                                        f'color:#14532d;line-height:1.45;">'
+                                        f'<strong>Better:</strong> {better}</div>'
+                                        if better else ""
+                                    )
+                                    + (
+                                        f'<div style="font-size:0.75rem;color:#64748b;'
+                                        f'line-height:1.4;">Pipeline fix: {pfix}</div>'
+                                        if pfix else ""
+                                    )
+                                    + f'</div>'
+                                )
+                        elif legacy_imps:
+                            # Fallback: show legacy suggested_improvements for old results
+                            _section_header("Suggested Improvements")
+                            for imp in legacy_imps:
+                                ui.html(
+                                    f'<div style="border-left:3px solid #6366f1;padding:8px 12px;'
+                                    f'margin-bottom:6px;background:#fafafa;border-radius:0 6px 6px 0;">'
+                                    f'<div style="font-size:0.78rem;font-weight:600;color:#1e293b;">'
+                                    f'{_TAG_LABELS.get(imp.get("issue",""), imp.get("issue",""))}</div>'
+                                    f'<div style="font-size:0.78rem;color:#475569;margin-top:2px;">'
+                                    f'{imp.get("proposed_fix","")}</div>'
+                                    f'</div>'
+                                )
+
+                        # ── Mode review ─────────────────────────────────────
+                        if mode_review:
+                            _section_header("Mode Evaluation")
+                            ui.html(
+                                f'<div style="background:#f8fafc;border-radius:8px;padding:10px 12px;'
+                                f'font-size:0.83rem;color:#334155;line-height:1.55;margin-bottom:8px;">'
+                                f'{mode_review}</div>'
+                            )
+
+                        # ── Professional / verify-first review ───────────────
+                        # assessment_first → "Professional Assessment Review"
+                        # verify_first     → "Verify-first Conditions Review"
+                        # all other modes  → hidden (field is null for those modes)
+                        if prof_review and rubric == "assessment_first":
+                            _section_header("Professional Assessment Review")
+                            ui.html(
+                                f'<div style="background:#eff6ff;border-left:3px solid #3b82f6;'
+                                f'border-radius:0 8px 8px 0;padding:10px 12px;'
+                                f'font-size:0.83rem;color:#1e3a5f;line-height:1.55;margin-bottom:8px;">'
+                                f'{prof_review}</div>'
+                            )
+                        elif prof_review and rubric == "verify_first":
+                            _section_header("Verify-first Conditions Review")
+                            ui.html(
+                                f'<div style="background:#eff6ff;border-left:3px solid #3b82f6;'
+                                f'border-radius:0 8px 8px 0;padding:10px 12px;'
+                                f'font-size:0.83rem;color:#1e3a5f;line-height:1.55;margin-bottom:8px;">'
+                                f'{prof_review}</div>'
+                            )
+
+                        # ── Dimension scores (lower priority, always present) ─
+                        _section_header("Dimension Scores")
+                        _DIM_LABELS = {
+                            "safety_correctness":            "Safety",
+                            "routing_appropriateness":       "Routing",
+                            "repair_step_detail":            "Step detail",
+                            "tools_materials_specificity":   "Tools",
+                            "grounding":                     "Grounding",
+                            "hallucination_absence":         "No hallucinations",
+                            "safety_warning_completeness":   "Warnings",
+                            "clarification_appropriateness": "Clarification",
+                            "user_clarity":                  "User clarity",
+                        }
+                        with ui.element("div").style(
+                            "display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:5px;margin-bottom:10px;"
+                        ):
+                            for key, label in _DIM_LABELS.items():
+                                val = dims.get(key)
+                                if val is None:
+                                    col, display = "#94a3b8", "N/A"
+                                else:
+                                    col, display = _score_color(int(val)), str(val)
+                                ui.html(
+                                    f'<div style="background:#f8fafc;border:1px solid #e2e8f0;'
+                                    f'border-radius:7px;padding:6px 9px;">'
+                                    f'<div style="font-size:0.7rem;color:#64748b;">{label}</div>'
+                                    f'<div style="font-size:1rem;font-weight:700;color:{col};">{display}</div>'
+                                    f'</div>'
+                                )
+
+                with ui.element("div").style("margin-top:18px;"):
+                    with ui.expansion(
+                        "Quality Evaluation (Admin)",
+                        icon="verified",
+                    ).style(
+                        "border:1px solid #e0e7ff;border-radius:12px;"
+                        "background:#fafbff;font-weight:600;color:#3730a3;"
+                    ):
+                        result_area = ui.element("div").style("padding:4px 0 8px;")
+
+                        async def _load_existing():
+                            try:
+                                async with httpx.AsyncClient() as c:
+                                    r = await c.get(
+                                        f"{API}/cases/{case_id}/judge",
+                                        headers={"Authorization": f"Bearer {token}"},
+                                        timeout=15.0,
+                                    )
+                                if r.status_code == 200:
+                                    _render_result(r.json(), result_area)
+                                else:
+                                    result_area.clear()
+                                    with result_area:
+                                        ui.html(
+                                            '<div style="color:#94a3b8;font-size:0.84rem;'
+                                            'padding:8px 0;">No evaluation yet. Click Run Judge below.</div>'
+                                        )
+                            except Exception:
+                                pass
+
+                        async def _run_judge():
+                            result_area.clear()
+                            with result_area:
+                                ui.html(
+                                    '<div style="color:#6366f1;font-size:0.84rem;padding:8px 0;">'
+                                    'Running judge (CPU inference — may take 1-3 min)…</div>'
+                                )
+                            try:
+                                async with httpx.AsyncClient() as c:
+                                    r = await c.post(
+                                        f"{API}/cases/{case_id}/judge",
+                                        headers={"Authorization": f"Bearer {token}"},
+                                        timeout=240.0,
+                                    )
+                                if r.status_code == 200:
+                                    _render_result(r.json(), result_area)
+                                elif r.status_code == 503:
+                                    result_area.clear()
+                                    with result_area:
+                                        ui.html(
+                                            '<div style="color:#92400e;font-size:0.84rem;padding:8px 0;">'
+                                            'Judge is disabled. Set JUDGE_ENABLED=true in backend/.env '
+                                            'and restart, then pull qwen2.5:7b via Ollama.</div>'
+                                        )
+                                else:
+                                    detail = r.json().get("detail", r.text) if r.headers.get("content-type","").startswith("application/json") else r.text
+                                    ui.notify(f"Judge failed: {detail}", type="negative", position="top-right")
+                            except Exception as exc:
+                                ui.notify(f"Judge error: {exc}", type="negative", position="top-right")
+
+                        ui.timer(0.1, _load_existing, once=True)
+
+                        with ui.element("div").style("margin-top:10px;"):
+                            ui.button("Run Judge", icon="play_arrow", on_click=_run_judge) \
+                                .props("unelevated color=indigo size=sm") \
+                                .style("font-weight:600;")
 
             # ── Master redraw, called on every state transition ──────────────
             def _redraw(data):
@@ -3583,6 +3980,8 @@ async def case_detail_page(case_id: int):
                     elif status == "complete":
                         _draw_complete(data)
                         _draw_feedback_widget(data)
+                        if app.storage.user.get("is_admin", False):
+                            _draw_judge_panel()
                     elif status == "needs_clarification":
                         _draw_needs_clarification(data)
                     elif status == "failed":
@@ -5783,6 +6182,35 @@ async def admin_feedback_page():
         "scope_incorrect": "Scope decision incorrect", "steps_unclear": "Steps unclear",
         "care_not_useful": "Care advice not useful", "other": "Other",
     }
+    _CHIP_LABELS = {
+        "wrong_diagnosis":                    "Wrong diagnosis",
+        "too_cautious":                       "Too cautious",
+        "not_cautious_enough":                "Not cautious enough",
+        "not_detailed_enough":                "Not detailed enough",
+        "wrong_tools_materials":              "Wrong tools/materials",
+        "steps_unclear":                      "Steps unclear",
+        "wrong_professional_recommendation":  "Wrong professional recommendation",
+        "advice_didnt_match_upload":          "Advice didn't match upload",
+        "repeated_question":                  "Repeated a question I answered",
+        "advice_felt_unsafe":                 "Advice felt unsafe",
+        "other":                              "Other",
+    }
+
+    def _chip_badges_html(chips: list) -> str:
+        if not chips:
+            return ""
+        badges = "".join(
+            f'<span style="display:inline-block;background:#e0e7ff;color:#3730a3;'
+            f'border-radius:100px;font-size:0.7rem;padding:2px 9px;font-weight:600;'
+            f'margin:2px 3px 2px 0;">'
+            f'{_CHIP_LABELS.get(c, c.replace("_", " "))}</span>'
+            for c in chips
+        )
+        return (
+            f'<div style="margin-top:5px;">'
+            f'<span style="font-size:0.72rem;color:#64748b;">Reason chips: </span>'
+            f'{badges}</div>'
+        )
 
     mobile_bar()
     sidebar("/admin/feedback")
@@ -5953,6 +6381,7 @@ async def admin_feedback_page():
                     )
                     _issue_label  = _ISSUE_LABELS.get(inc.get("issue_category"), None)
                     _comment_text = inc.get("comment") or None
+                    _inc_chips    = inc.get("reason_chips") or []
 
                     _feedback_rows = (
                         f'<div style="font-size:0.8rem;color:#334155;line-height:1.7;">'
@@ -5962,6 +6391,7 @@ async def admin_feedback_page():
                         f'{inc.get("safety_category", "None") or "None"}'
                         + (f'<br><span style="color:#64748b;">Comment:</span> {_comment_text}' if _comment_text else
                            '&nbsp;&nbsp;<span style="color:#64748b;">Comment:</span> None')
+                        + _chip_badges_html(_inc_chips)
                         + '</div>'
                     )
 
@@ -6025,13 +6455,1400 @@ async def admin_feedback_page():
                 rows = ""
                 for c in comments:
                     tag = _ISSUE_LABELS.get(c.get("issue_category"), c.get("issue_category") or c.get("rating"))
+                    _c_chips = c.get("reason_chips") or []
                     rows += (
                         f'<div style="border-bottom:1px solid #f1f5f9;padding:10px 0;">'
                         f'<div style="font-size:0.83rem;color:#334155;">{c.get("comment")}</div>'
                         f'<div style="font-size:0.72rem;color:#94a3b8;margin-top:2px;">'
-                        f'{c.get("rating")} · {c.get("output_mode")} · {tag}</div></div>'
+                        f'{c.get("rating")} · {c.get("output_mode")} · {tag}</div>'
+                        + _chip_badges_html(_c_chips)
+                        + '</div>'
                     )
                 ui.html(f'<div style="background:white;border:1px solid #e2e8f0;border-radius:12px;padding:6px 16px;">{rows}</div>')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN — Judge summary dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+@ui.page("/admin/judge")
+async def admin_judge_page():
+    token = app.storage.user.get("token")
+    if not token:
+        ui.navigate.to("/login")
+        return
+    if not app.storage.user.get("is_admin", False):
+        ui.navigate.to("/cases")
+        return
+
+    H = {"Authorization": f"Bearer {token}"}
+
+    summary = None
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{API}/admin/judge/summary", headers=H, timeout=15.0)
+        if r.status_code == 403:
+            ui.navigate.to("/cases")
+            return
+        if r.status_code == 200:
+            summary = r.json()
+    except Exception:
+        pass
+
+    summary = summary or {}
+
+    _VERDICT_STYLE = {
+        "pass":         ("#dcfce7", "#15803d"),
+        "needs_review": ("#fef3c7", "#92400e"),
+        "unsafe":       ("#fee2e2", "#991b1b"),
+        "unknown":      ("#f1f5f9", "#475569"),
+    }
+    _TAG_LABELS = {
+        "over_cautious_routing":                          "Over-cautious routing",
+        "under_cautious_routing":                         "Under-cautious routing",
+        "missing_safety_warning":                         "Missing safety warning",
+        "hallucinated_hazard":                            "Hallucinated hazard",
+        "vague_repair_steps":                             "Vague repair steps",
+        "vague_tools_or_materials":                       "Vague tools/materials",
+        "poor_grounding":                                 "Poor grounding",
+        "unnecessary_clarification":                      "Unnecessary clarification",
+        "missing_clarification":                          "Missing clarification",
+        "unclear_user_language":                          "Unclear language",
+        "wrong_trade_category":                           "Wrong trade category",
+        "weak_step_ordering":                             "Weak step ordering",
+        "emergency_wording_could_be_stronger":            "Emergency wording too weak",
+        "emergency_repair_steps_inappropriately_expected":"Repair steps wrongly expected",
+        "unsupported_professional_escalation":            "Unsupported escalation",
+        "unsupported_hazard_claim":                       "Unsupported hazard claim",
+        "wrong_professional_type":                        "Wrong professional type",
+        "over_specific_urgency":                          "Urgency over-specified",
+        "useful_but_overcautious":                        "Useful but overcautious",
+        "evidence_uncertainty_not_explained":             "Uncertainty not explained",
+        "correct_but_unclear_reasoning":                  "Correct but unclear",
+    }
+
+    inject_styles()
+    mobile_bar()
+    sidebar("/admin/judge")
+
+    with ui.element("div").classes("main"):
+        with ui.element("div").style(
+            "padding:32px;max-width:860px;display:flex;flex-direction:column;gap:18px;"
+        ):
+            total_judged    = summary.get("total_judged", 0)
+            verdict_counts  = summary.get("verdict_counts") or {}
+            top_tags        = summary.get("top_issue_tags") or []
+            score_dist      = summary.get("score_distribution") or {}
+            suggested_fixes = summary.get("suggested_fixes") or []
+            judge_model     = summary.get("judge_model", "—")
+
+            ui.html(
+                f'<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">'
+                f'<h1 style="font-size:1.5rem;font-weight:800;color:#0f172a;margin:0;">Judge Summary</h1>'
+                f'<span style="background:#f1f5f9;color:#475569;font-size:0.72rem;'
+                f'font-weight:700;padding:3px 10px;border-radius:100px;">'
+                f'{total_judged} evaluation{"s" if total_judged != 1 else ""} · {judge_model}</span></div>'
+            )
+
+            if total_judged == 0:
+                ui.html(
+                    '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;'
+                    'padding:24px;color:#94a3b8;font-size:0.9rem;text-align:center;">'
+                    'No judge evaluations yet. Open a completed case and click Run Judge '
+                    '(requires JUDGE_ENABLED=true in backend/.env).</div>'
+                )
+            else:
+                # Verdict counts
+                with ui.element("div").style(
+                    "display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;"
+                ):
+                    for verdict, (bg, fg) in _VERDICT_STYLE.items():
+                        count = verdict_counts.get(verdict, 0)
+                        if count == 0:
+                            continue
+                        ui.html(
+                            f'<div style="background:{bg};border-radius:12px;padding:16px 18px;">'
+                            f'<div style="font-size:1.8rem;font-weight:800;color:{fg};">{count}</div>'
+                            f'<div style="font-size:0.78rem;font-weight:600;color:{fg};">'
+                            f'{verdict.replace("_", " ").title()}</div></div>'
+                        )
+
+                # Score distribution
+                if score_dist:
+                    ui.html(
+                        '<div style="font-weight:700;color:#0f172a;font-size:0.95rem;">Score distribution</div>'
+                    )
+                    dist_html = "".join(
+                        f'<div style="display:flex;justify-content:space-between;padding:6px 0;'
+                        f'border-bottom:1px solid #f1f5f9;font-size:0.84rem;">'
+                        f'<span style="color:#334155;">{bucket}</span>'
+                        f'<span style="font-weight:700;color:#0f172a;">{cnt}</span></div>'
+                        for bucket, cnt in score_dist.items()
+                    )
+                    ui.html(
+                        f'<div style="background:white;border:1px solid #e2e8f0;border-radius:12px;'
+                        f'padding:4px 16px;">{dist_html}</div>'
+                    )
+
+                # Top issue tags
+                if top_tags:
+                    ui.html(
+                        '<div style="font-weight:700;color:#0f172a;font-size:0.95rem;margin-top:4px;">Top issue tags</div>'
+                    )
+                    tags_html = "".join(
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;'
+                        f'padding:7px 0;border-bottom:1px solid #f1f5f9;">'
+                        f'<span style="background:#fef3c7;color:#92400e;font-size:0.72rem;font-weight:600;'
+                        f'padding:2px 8px;border-radius:100px;">'
+                        f'{_TAG_LABELS.get(entry["tag"], entry["tag"])}</span>'
+                        f'<span style="font-weight:700;color:#0f172a;font-size:0.84rem;">{entry["count"]}</span>'
+                        f'</div>'
+                        for entry in top_tags
+                    )
+                    ui.html(
+                        f'<div style="background:white;border:1px solid #e2e8f0;border-radius:12px;'
+                        f'padding:4px 16px;">{tags_html}</div>'
+                    )
+
+                # Suggested fixes
+                if suggested_fixes:
+                    ui.html(
+                        '<div style="font-weight:700;color:#0f172a;font-size:0.95rem;margin-top:4px;">Suggested prompt fixes</div>'
+                    )
+                    for fix in suggested_fixes:
+                        tag_label = _TAG_LABELS.get(fix["tag"], fix["tag"])
+                        ui.html(
+                            f'<div style="border-left:3px solid #6366f1;padding:10px 14px;'
+                            f'background:#fafbff;border-radius:0 8px 8px 0;margin-bottom:6px;">'
+                            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">'
+                            f'<span style="background:#e0e7ff;color:#3730a3;font-size:0.7rem;font-weight:700;'
+                            f'padding:2px 7px;border-radius:100px;">{fix["count"]}×</span>'
+                            f'<span style="font-size:0.84rem;font-weight:600;color:#1e293b;">{tag_label}</span></div>'
+                            f'<div style="font-size:0.8rem;color:#475569;">{fix["proposed_fix"]}</div>'
+                            f'</div>'
+                        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Quality Dashboard  /admin/quality
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Module-level label maps (used only by the quality page) ──────────────────
+_QA_TAG_LABELS: dict[str, str] = {
+    "over_cautious_routing":                           "Over-cautious routing",
+    "under_cautious_routing":                          "Under-cautious routing",
+    "missing_safety_warning":                          "Missing safety warning",
+    "hallucinated_hazard":                             "Hallucinated hazard",
+    "vague_repair_steps":                              "Vague repair steps",
+    "vague_tools_or_materials":                        "Vague tools/materials",
+    "poor_grounding":                                  "Poor grounding",
+    "unnecessary_clarification":                       "Unnecessary clarification",
+    "missing_clarification":                           "Missing clarification",
+    "unclear_user_language":                           "Unclear language",
+    "wrong_trade_category":                            "Wrong trade category",
+    "weak_step_ordering":                              "Weak step ordering",
+    "emergency_wording_could_be_stronger":             "Emergency wording too weak",
+    "emergency_repair_steps_inappropriately_expected": "Repair steps wrongly expected",
+    "unsupported_professional_escalation":             "Unsupported escalation",
+    "unsupported_hazard_claim":                        "Unsupported hazard claim",
+    "wrong_professional_type":                         "Wrong professional type",
+    "over_specific_urgency":                           "Urgency over-specified",
+    "useful_but_overcautious":                         "Useful but overcautious",
+    "evidence_uncertainty_not_explained":              "Uncertainty not explained",
+    "correct_but_unclear_reasoning":                   "Correct but unclear",
+    "hallucinate_hazard":                              "Hallucinated hazard",
+}
+_QA_CHIP_LABELS: dict[str, str] = {
+    "wrong_diagnosis":                   "Wrong diagnosis",
+    "too_cautious":                      "Too cautious",
+    "not_cautious_enough":               "Not cautious enough",
+    "not_detailed_enough":               "Not detailed enough",
+    "wrong_tools_materials":             "Wrong tools/materials",
+    "steps_unclear":                     "Steps unclear",
+    "wrong_professional_recommendation": "Wrong professional recommendation",
+    "advice_didnt_match_upload":         "Advice didn't match upload",
+    "repeated_question":                 "Repeated a question",
+    "advice_felt_unsafe":                "Advice felt unsafe",
+    "other":                             "Other",
+}
+_QA_ALIGN_LABEL = {
+    "likely_good":             "Likely Good",
+    "confirmed_issue":         "Confirmed Issue",
+    "judge_calibration_issue": "Calibration Gap",
+    "safety_override":         "Safety Override",
+    "needs_judge":             "Needs Judge",
+    "monitor":                 "Monitor",
+    "no_signal":               "No Signal",
+}
+_QA_ALIGN_BG = {
+    "likely_good":             "#dcfce7",
+    "confirmed_issue":         "#fee2e2",
+    "judge_calibration_issue": "#fef3c7",
+    "safety_override":         "#fef2f2",
+    "needs_judge":             "#e0e7ff",
+    "monitor":                 "#f1f5f9",
+    "no_signal":               "#f8fafc",
+}
+_QA_ALIGN_FG = {
+    "likely_good":             "#15803d",
+    "confirmed_issue":         "#991b1b",
+    "judge_calibration_issue": "#92400e",
+    "safety_override":         "#991b1b",
+    "needs_judge":             "#3730a3",
+    "monitor":                 "#475569",
+    "no_signal":               "#94a3b8",
+}
+_QA_VERDICT_BG = {"pass": "#dcfce7", "needs_review": "#fef3c7", "unsafe": "#fee2e2"}
+_QA_VERDICT_FG = {"pass": "#15803d", "needs_review": "#92400e", "unsafe": "#991b1b"}
+_QA_RATING_BG  = {"helpful": "#dcfce7", "partial": "#fef3c7", "not": "#fee2e2"}
+_QA_RATING_FG  = {"helpful": "#15803d", "partial": "#92400e", "not": "#991b1b"}
+_QA_RATING_LBL = {"helpful": "Helpful",  "partial": "Partially", "not": "No"}
+_QA_PRIO_COL   = {"high": "#dc2626",    "medium": "#f59e0b",    "low": "#94a3b8"}
+_QA_SIG_COL    = {"both": "#3730a3",    "judge": "#92400e",     "user": "#1e40af"}
+
+
+@ui.page("/admin/quality")
+async def admin_quality_page():
+    token = app.storage.user.get("token")
+    if not token:
+        ui.navigate.to("/login")
+        return
+    if not app.storage.user.get("is_admin", False):
+        ui.navigate.to("/cases")
+        return
+
+    H = {"Authorization": f"Bearer {token}"}
+    summary: dict = {}
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{API}/admin/quality/summary", headers=H, timeout=30.0)
+        if r.status_code == 403:
+            ui.navigate.to("/cases")
+            return
+        if r.status_code == 200:
+            summary = r.json()
+    except Exception:
+        pass
+
+    # Unpack ─────────────────────────────────────────────────────────────────
+    totals           = summary.get("totals") or {}
+    cases            = summary.get("cases") or []
+    needs_attention  = summary.get("needs_attention") or []
+    verdict_counts   = summary.get("verdict_counts") or {}
+    rating_counts    = summary.get("rating_counts") or {}
+    align_counts     = summary.get("alignment_counts") or {}
+    top_judge_tags   = summary.get("top_judge_tags") or []
+    top_user_chips   = summary.get("top_user_chips") or []
+    recurring_issues = summary.get("recurring_issues") or []
+    suggestions      = summary.get("improvement_suggestions") or []
+
+    # ── Render helpers ────────────────────────────────────────────────────────
+    def _mcard(value, label, sub="", bg="#f8fafc", fg="#0f172a", val_fg: str | None = None) -> str:
+        vfg = val_fg or fg
+        sub_html = f'<div style="font-size:0.7rem;color:{fg};opacity:0.7;margin-top:1px;">{sub}</div>' if sub else ""
+        return (
+            f'<div style="background:{bg};border-radius:10px;padding:14px 16px;'
+            f'flex:1;min-width:115px;">'
+            f'<div style="font-size:0.68rem;color:{fg};opacity:0.65;font-weight:700;'
+            f'text-transform:uppercase;letter-spacing:0.05em;">{label}</div>'
+            f'<div style="font-size:1.55rem;font-weight:800;color:{vfg};margin-top:3px;">{value}</div>'
+            f'{sub_html}</div>'
+        )
+
+    def _sh(title: str) -> None:
+        ui.html(
+            f'<div style="font-weight:700;color:#0f172a;font-size:0.92rem;'
+            f'margin:16px 0 7px 0;">{title}</div>'
+        )
+
+    def _bar_row(label: str, count: int, max_count: int, color: str = "#6366f1") -> str:
+        pct = int(100 * count / max_count) if max_count else 0
+        return (
+            f'<div style="display:flex;align-items:center;gap:10px;padding:5px 0;'
+            f'border-bottom:1px solid #f8fafc;">'
+            f'<div style="flex:1;font-size:0.82rem;color:#334155;min-width:0;'
+            f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{label}</div>'
+            f'<div style="width:130px;flex-shrink:0;">'
+            f'<div style="background:#e2e8f0;border-radius:4px;height:8px;">'
+            f'<div style="background:{color};height:8px;border-radius:4px;width:{pct}%;"></div>'
+            f'</div></div>'
+            f'<div style="font-weight:700;color:#0f172a;font-size:0.82rem;'
+            f'width:22px;text-align:right;">{count}</div>'
+            f'</div>'
+        )
+
+    def _tag_badge(tag: str) -> str:
+        lbl = _QA_TAG_LABELS.get(tag, tag.replace("_", " "))
+        return (
+            f'<span style="background:#fef3c7;color:#92400e;font-size:0.68rem;'
+            f'font-weight:600;padding:1px 7px;border-radius:100px;">{lbl}</span> '
+        )
+
+    def _chip_badge(chip: str) -> str:
+        lbl = _QA_CHIP_LABELS.get(chip, chip.replace("_", " "))
+        return (
+            f'<span style="background:#e0e7ff;color:#3730a3;font-size:0.68rem;'
+            f'font-weight:600;padding:1px 7px;border-radius:100px;">{lbl}</span> '
+        )
+
+    def _verdict_chip(verdict: str | None) -> str:
+        if not verdict:
+            return '<span style="color:#cbd5e1;font-size:0.75rem;">—</span>'
+        bg  = _QA_VERDICT_BG.get(verdict, "#f8fafc")
+        fg  = _QA_VERDICT_FG.get(verdict, "#475569")
+        lbl = verdict.replace("_", " ").title()
+        return (
+            f'<span style="background:{bg};color:{fg};font-size:0.7rem;'
+            f'font-weight:600;padding:2px 8px;border-radius:100px;">{lbl}</span>'
+        )
+
+    def _rating_chip(rating: str | None) -> str:
+        if not rating:
+            return '<span style="color:#cbd5e1;font-size:0.75rem;">—</span>'
+        bg  = _QA_RATING_BG.get(rating, "#f8fafc")
+        fg  = _QA_RATING_FG.get(rating, "#475569")
+        lbl = _QA_RATING_LBL.get(rating, rating)
+        return (
+            f'<span style="background:{bg};color:{fg};font-size:0.7rem;'
+            f'font-weight:600;padding:2px 8px;border-radius:100px;">{lbl}</span>'
+        )
+
+    def _align_chip(alignment: str) -> str:
+        bg  = _QA_ALIGN_BG.get(alignment, "#f8fafc")
+        fg  = _QA_ALIGN_FG.get(alignment, "#475569")
+        lbl = _QA_ALIGN_LABEL.get(alignment, alignment)
+        return (
+            f'<span style="background:{bg};color:{fg};font-size:0.7rem;'
+            f'font-weight:600;padding:2px 8px;border-radius:100px;">{lbl}</span>'
+        )
+
+    def _prio_badge(prio: str) -> str:
+        _bg  = {"high": "#fee2e2", "medium": "#fef3c7", "low": "#f1f5f9"}
+        _col = {"high": "#991b1b", "medium": "#92400e", "low": "#475569"}
+        bg  = _bg.get(prio, "#f1f5f9")
+        col = _col.get(prio, "#475569")
+        return (
+            f'<span style="background:{bg};color:{col};font-weight:700;font-size:0.68rem;'
+            f'text-transform:uppercase;padding:2px 8px;border-radius:100px;">{prio}</span>'
+        )
+
+    _TH = (
+        'style="padding:7px 8px;text-align:left;font-size:0.7rem;'
+        'color:#94a3b8;font-weight:600;white-space:nowrap;"'
+    )
+    _TD = 'style="padding:7px 8px;font-size:0.78rem;color:#334155;vertical-align:middle;"'
+
+    def _table_wrap(thead_html: str, tbody_html: str) -> str:
+        return (
+            f'<div style="overflow-x:auto;">'
+            f'<table style="width:100%;border-collapse:collapse;background:white;'
+            f'border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">'
+            f'<thead><tr style="background:#f8fafc;">{thead_html}</tr></thead>'
+            f'<tbody>{tbody_html}</tbody></table></div>'
+        )
+
+    def _bar_card(rows_html: str) -> str:
+        return (
+            f'<div style="background:white;border:1px solid #e2e8f0;'
+            f'border-radius:12px;padding:10px 16px;">{rows_html}</div>'
+        )
+
+    def _case_link(case_id: int, url: str | None = None) -> str:
+        href = url or f"/cases/{case_id}"
+        return (
+            f'<a href="{href}" target="_blank" '
+            f'style="color:#6366f1;font-weight:700;text-decoration:none;">'
+            f'#{case_id}</a>'
+        )
+
+    def _fmt_date(iso: str | None) -> str:
+        """ISO 8601 string → '28 Jun 15:45'. Returns '—' for missing/invalid."""
+        if not iso:
+            return "—"
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            return f"{dt.day} {dt.strftime('%b %H:%M')}"
+        except Exception:
+            return "—"
+
+    def _prop_bar(title: str, total: int, segments: list) -> str:
+        """Stacked horizontal proportion bar.
+        segments: [(label, count, bar_color, text_color), ...]
+        """
+        bar_segs = ""
+        legend   = ""
+        for label, count, bar_col, text_col in segments:
+            pct = round(100 * count / total) if total else 0
+            min_w = "2px" if count > 0 else "0"
+            bar_segs += (
+                f'<div style="background:{bar_col};width:{pct}%;min-width:{min_w};'
+                f'transition:width 0.3s;"></div>'
+            )
+            legend += (
+                f'<div style="display:flex;align-items:center;gap:5px;">'
+                f'<span style="display:inline-block;width:9px;height:9px;border-radius:2px;'
+                f'background:{bar_col};flex-shrink:0;"></span>'
+                f'<span style="font-size:0.76rem;color:#64748b;">{label}</span>'
+                f'<span style="font-size:0.84rem;font-weight:700;color:{text_col};">{count}</span>'
+                f'<span style="font-size:0.7rem;color:#94a3b8;">{pct}%</span>'
+                f'</div>'
+            )
+        total_label = f"{total} total" if total else "no data yet"
+        return (
+            f'<div style="background:white;border:1px solid #e2e8f0;border-radius:12px;'
+            f'padding:14px 16px;margin-bottom:10px;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:baseline;'
+            f'margin-bottom:9px;">'
+            f'<span style="font-size:0.85rem;font-weight:700;color:#0f172a;">{title}</span>'
+            f'<span style="font-size:0.72rem;color:#94a3b8;">{total_label}</span>'
+            f'</div>'
+            f'<div style="display:flex;height:13px;border-radius:7px;overflow:hidden;'
+            f'background:#f1f5f9;margin-bottom:10px;">{bar_segs}</div>'
+            f'<div style="display:flex;gap:16px;flex-wrap:wrap;">{legend}</div>'
+            f'</div>'
+        )
+
+    # ── Page ─────────────────────────────────────────────────────────────────
+    inject_styles()
+    mobile_bar()
+    sidebar("/admin/quality")
+
+    with ui.element("div").classes("main"):
+        with ui.element("div").style(
+            "padding:28px 32px;max-width:980px;display:flex;flex-direction:column;gap:0;"
+        ):
+            tc = totals.get("total_cases", 0)
+            ui.html(
+                f'<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px;">'
+                f'<h1 style="font-size:1.5rem;font-weight:800;color:#0f172a;margin:0;">Quality Dashboard</h1>'
+                f'<span style="background:#f1f5f9;color:#475569;font-size:0.72rem;font-weight:700;'
+                f'padding:3px 10px;border-radius:100px;">'
+                f'{tc} case{"s" if tc != 1 else ""} · last 200</span></div>'
+            )
+
+            if not summary:
+                ui.html(
+                    '<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:12px;'
+                    'padding:16px;color:#991b1b;font-size:0.86rem;">'
+                    'Could not load quality summary. Make sure the backend is running.</div>'
+                )
+                return
+
+            # ── Headline metrics (computed once, used in banner + tabs) ───────
+            _total_fb  = sum(rating_counts.values())
+            _hlth_h    = rating_counts.get("helpful", 0) / max(_total_fb, 1)
+            _avg_s_raw = totals.get("avg_judge_score")
+            _hlth_j    = (_avg_s_raw or 70) / 100
+            _hlth_ci   = align_counts.get("confirmed_issue", 0) / max(tc, 1)
+            _health    = round(_hlth_h * 40 + _hlth_j * 40 + (1 - _hlth_ci) * 20)
+            _hlth_col  = "#15803d" if _health >= 75 else "#92400e" if _health >= 55 else "#991b1b"
+            _hlth_bg   = "#dcfce7" if _health >= 75 else "#fef3c7" if _health >= 55 else "#fee2e2"
+            _hlth_lbl  = "Healthy" if _health >= 75 else "Monitor" if _health >= 55 else "Critical"
+
+            _both_cases = [c for c in cases if c.get("judge_verdict") and c.get("fb_rating")]
+            _agree_n    = sum(1 for c in _both_cases
+                              if c["alignment"] in ("likely_good", "confirmed_issue"))
+            _agree_pct  = round(100 * _agree_n / max(len(_both_cases), 1)) if _both_cases else None
+            _agree_col  = ("#15803d" if (_agree_pct or 0) >= 70
+                           else "#92400e" if (_agree_pct or 0) >= 50 else "#991b1b")
+
+            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+            from collections import Counter as _Ctr
+            _cutoff  = _dt.now(_tz.utc) - _td(days=7)
+            _recent  = [c for c in cases if c.get("created_at") and
+                        _dt.fromisoformat(c["created_at"].replace("Z", "+00:00")) >= _cutoff]
+            _wk_tags = _Ctr()
+            for _wc in _recent:
+                for _wt in (_wc.get("judge_tags") or []):
+                    _wk_tags[_wt] += 1
+                for _wch in (_wc.get("fb_chips") or []):
+                    _wk_tags[_wch] += 1
+            _top3_wk = _wk_tags.most_common(3)
+
+            # ── QA Health banner ──────────────────────────────────────────────
+            ui.html(
+                f'<div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;'
+                f'background:white;border:1px solid #e2e8f0;border-radius:12px;'
+                f'padding:12px 18px;margin-bottom:16px;">'
+                f'<div style="display:flex;align-items:baseline;gap:6px;" '
+                f'title="Composite: helpful rate ×40 + avg judge score ×40 + (1 − confirmed-issue rate) ×20">'
+                f'<span style="font-size:0.78rem;font-weight:700;color:#64748b;">QA Health</span>'
+                f'<span style="font-size:1.7rem;font-weight:800;color:{_hlth_col};">{_health}</span>'
+                f'<span style="font-size:0.72rem;color:#94a3b8;">/100</span>'
+                f'<span style="background:{_hlth_bg};color:{_hlth_col};font-size:0.68rem;font-weight:700;'
+                f'padding:2px 8px;border-radius:100px;margin-left:4px;">{_hlth_lbl}</span>'
+                f'</div>'
+                f'<div style="width:1px;height:30px;background:#e2e8f0;flex-shrink:0;"></div>'
+                + (
+                    f'<div style="display:flex;align-items:baseline;gap:6px;" '
+                    f'title="Cases where judge and user both agreed (Likely Good or Confirmed Issue), '
+                    f'divided by all cases that have both a judge verdict and user feedback">'
+                    f'<span style="font-size:0.78rem;font-weight:700;color:#64748b;">Judge–User Agreement</span>'
+                    f'<span style="font-size:1.7rem;font-weight:800;color:{_agree_col};">{_agree_pct}%</span>'
+                    f'<span style="font-size:0.72rem;color:#94a3b8;">({len(_both_cases)} paired)</span>'
+                    f'</div>'
+                    if _agree_pct is not None else
+                    f'<span style="font-size:0.8rem;color:#94a3b8;font-style:italic;">'
+                    f'Judge–User Agreement: no paired cases yet</span>'
+                )
+                + f'<div style="margin-left:auto;font-size:0.68rem;color:#cbd5e1;white-space:nowrap;">'
+                f'helpful×40 · judge×40 · conflict×20</div>'
+                f'</div>'
+            )
+
+            # ── Tabs ─────────────────────────────────────────────────────────
+            with ui.tabs().props("align=left dense").style(
+                "font-weight:600;font-size:0.8rem;"
+                "border-bottom:2px solid #e2e8f0;margin-bottom:20px;"
+            ) as tab_bar:
+                t_ov  = ui.tab("Overview")
+                t_fb  = ui.tab("User Feedback")
+                t_jdg = ui.tab("Judge")
+                t_aln = ui.tab("Alignment")
+                t_rec = ui.tab("Recurring Issues")
+                t_sug = ui.tab("Suggestions")
+
+            with ui.tab_panels(tab_bar, value=t_ov).style("width:100%;"):
+
+                # ════════════════════════════════════════════════════════════
+                # TAB 1: Overview
+                # ════════════════════════════════════════════════════════════
+                with ui.tab_panel(t_ov):
+                    tf = totals.get("total_feedback", 0)
+                    tj = totals.get("total_judged", 0)
+                    ta = totals.get("avg_judge_score")
+                    tn = totals.get("needs_attention", 0)
+
+                    ui.html(
+                        '<div style="display:flex;gap:10px;flex-wrap:wrap;">'
+                        + _mcard(tc, "Total Cases")
+                        + _mcard(tf, "With Feedback",
+                                 f"{round(100*tf/tc)}% rate" if tc else "",
+                                 "#f0fdf4" if tf else "#f8fafc", "#15803d" if tf else "#94a3b8")
+                        + _mcard(tj, "Judged",
+                                 f"{round(100*tj/tc)}% coverage" if tc else "",
+                                 "#f0f9ff" if tj else "#f8fafc", "#0369a1" if tj else "#94a3b8")
+                        + (
+                            _mcard(
+                                str(ta), "Avg Judge Score", "",
+                                "#dcfce7" if ta >= 85 else "#fef3c7" if ta >= 70 else "#fee2e2",
+                                "#0f172a",
+                                "#15803d" if ta >= 85 else "#92400e" if ta >= 70 else "#991b1b",
+                            ) if ta is not None else
+                            _mcard("—", "Avg Judge Score")
+                        )
+                        + _mcard(tn, "Needs Attention",
+                                 "high + medium priority" if tn else "",
+                                 "#fef2f2" if tn else "#f0fdf4",
+                                 "#991b1b" if tn else "#15803d",
+                                 "#991b1b" if tn else "#15803d")
+                        + '</div>'
+                    )
+
+                    # Feedback rating stacked bar
+                    ui.html(_prop_bar(
+                        "Feedback Ratings",
+                        sum(rating_counts.values()),
+                        [
+                            ("Helpful",   rating_counts.get("helpful", 0), "#4ade80", "#15803d"),
+                            ("Partially", rating_counts.get("partial", 0), "#fbbf24", "#92400e"),
+                            ("No",        rating_counts.get("not", 0),     "#f87171", "#991b1b"),
+                        ],
+                    ))
+
+                    # Judge verdict stacked bar
+                    ui.html(_prop_bar(
+                        "Judge Verdicts",
+                        sum(verdict_counts.values()),
+                        [
+                            ("Pass",         verdict_counts.get("pass", 0),         "#4ade80", "#15803d"),
+                            ("Needs Review", verdict_counts.get("needs_review", 0), "#fbbf24", "#92400e"),
+                            ("Unsafe",       verdict_counts.get("unsafe", 0),       "#f87171", "#991b1b"),
+                        ],
+                    ))
+
+                    # Top recurring issue callout
+                    if recurring_issues:
+                        top_ri = recurring_issues[0]
+                        sig_col = _QA_SIG_COL.get(top_ri["signal"], "#475569")
+                        _sh("Top Recurring Issue")
+                        ui.html(
+                            f'<div style="background:#fffbeb;border:1px solid #fde68a;'
+                            f'border-radius:10px;padding:12px 16px;font-size:0.84rem;color:#92400e;">'
+                            f'<strong>{top_ri["label"]}</strong> — '
+                            f'{top_ri["total"]} occurrence(s) '
+                            f'(judge: {top_ri["judge_count"]}, user: {top_ri["user_count"]}) · '
+                            f'<span style="color:{sig_col};font-weight:700;">'
+                            f'{top_ri["signal"]} signal</span></div>'
+                        )
+
+                    # Top 3 this week
+                    _sh(f"This Week · {len(_recent)} case{'s' if len(_recent) != 1 else ''}")
+                    if _top3_wk:
+                        _wk_rows = ""
+                        for _rank, (_lbl, _cnt) in enumerate(_top3_wk, 1):
+                            _readable = (
+                                _QA_TAG_LABELS.get(_lbl)
+                                or _QA_CHIP_LABELS.get(_lbl)
+                                or _lbl.replace("_", " ").title()
+                            )
+                            _rank_col = ["#6366f1", "#f59e0b", "#94a3b8"][_rank - 1]
+                            _wk_rows += (
+                                f'<div style="display:flex;align-items:center;gap:10px;'
+                                f'padding:8px 0;border-bottom:1px solid #f1f5f9;">'
+                                f'<span style="font-size:0.8rem;font-weight:800;color:{_rank_col};'
+                                f'width:18px;text-align:center;">#{_rank}</span>'
+                                f'<span style="font-size:0.84rem;color:#0f172a;flex:1;">{_readable}</span>'
+                                f'<span style="background:#f1f5f9;color:#475569;font-size:0.72rem;'
+                                f'font-weight:700;padding:2px 10px;border-radius:100px;">{_cnt}×</span>'
+                                f'</div>'
+                            )
+                        ui.html(
+                            f'<div style="background:white;border:1px solid #e2e8f0;border-radius:10px;'
+                            f'padding:4px 14px;">{_wk_rows}</div>'
+                        )
+                    elif _recent:
+                        ui.html('<div style="font-size:0.84rem;color:#94a3b8;">No tagged issues in the last 7 days.</div>')
+                    else:
+                        ui.html('<div style="font-size:0.84rem;color:#94a3b8;">No cases in the last 7 days.</div>')
+
+                # ════════════════════════════════════════════════════════════
+                # TAB 2: User Feedback
+                # ════════════════════════════════════════════════════════════
+                with ui.tab_panel(t_fb):
+                    _sh("Ratings")
+                    ui.html(
+                        '<div style="display:flex;gap:10px;flex-wrap:wrap;">'
+                        + "".join(
+                            _mcard(
+                                rating_counts.get(r, 0), _QA_RATING_LBL[r],
+                                "", _QA_RATING_BG[r], _QA_RATING_FG[r], _QA_RATING_FG[r],
+                            )
+                            for r in ("helpful", "partial", "not")
+                        )
+                        + '</div>'
+                    )
+
+                    if top_user_chips:
+                        _sh("Top Reason Chips")
+                        max_c = top_user_chips[0]["count"] or 1
+                        ui.html(_bar_card(
+                            "".join(_bar_row(e["label"], e["count"], max_c, "#6366f1")
+                                    for e in top_user_chips)
+                        ))
+                    else:
+                        ui.html('<div style="color:#94a3b8;font-size:0.84rem;margin-top:8px;">No reason chips recorded yet.</div>')
+
+                    _fb_f    = {'rating': 'All', 'chips': 'All', 'mode': 'All'}
+                    _fb_base = sorted(
+                        [c for c in cases if c["fb_rating"]],
+                        key=lambda c: {"not": 0, "partial": 1, "helpful": 2}.get(c["fb_rating"], 3),
+                    )
+                    _OM_OPTS = ['All', 'diy', 'verify_first', 'assessment_first',
+                                'active_emergency', 'clarification', 'care', 'out_of_scope']
+
+                    @ui.refreshable
+                    def _fb_table():
+                        f = _fb_base
+                        if _fb_f['rating'] != 'All':
+                            _rmap = {'Helpful': 'helpful', 'Partially': 'partial', 'No': 'not'}
+                            f = [c for c in f if c['fb_rating'] == _rmap.get(_fb_f['rating'])]
+                        if _fb_f['chips'] == 'Yes':
+                            f = [c for c in f if c.get('fb_chips')]
+                        elif _fb_f['chips'] == 'No':
+                            f = [c for c in f if not c.get('fb_chips')]
+                        if _fb_f['mode'] != 'All':
+                            f = [c for c in f if (c.get('output_mode') or '') == _fb_f['mode']]
+                        _af = sum(1 for v in _fb_f.values() if v != 'All')
+                        _af_note = f' · {_af} filter{"s" if _af != 1 else ""} active' if _af else ''
+                        ui.html(
+                            f'<div style="font-size:0.76rem;color:#94a3b8;margin-bottom:8px;">'
+                            f'Showing {len(f)} of {len(_fb_base)} cases{_af_note}</div>'
+                        )
+                        if not f:
+                            ui.html(
+                                '<div style="background:#f8fafc;border:1px solid #e2e8f0;'
+                                'border-radius:8px;padding:12px 14px;font-size:0.84rem;'
+                                'color:#94a3b8;">No cases match these filters.</div>'
+                            )
+                            return
+                        rows_html = ""
+                        for c in f[:30]:
+                            chips_html = "".join(_chip_badge(ch) for ch in (c["fb_chips"] or [])[:4])
+                            rows_html += (
+                                f'<tr style="border-bottom:1px solid #f1f5f9;">'
+                                f'<td {_TD}>{_case_link(c["case_id"], c.get("case_url"))}</td>'
+                                f'<td {_TD}>{c["output_mode"] or "—"}</td>'
+                                f'<td {_TD} style="max-width:130px;color:#475569;font-size:0.75rem;">'
+                                f'{(c["problem_type"] or "")[:35] or "—"}</td>'
+                                f'<td {_TD} style="color:#94a3b8;font-size:0.75rem;white-space:nowrap;">'
+                                f'{_fmt_date(c.get("fb_created_at"))}</td>'
+                                f'<td {_TD}>{_rating_chip(c["fb_rating"])}</td>'
+                                f'<td {_TD}>{chips_html or "—"}</td>'
+                                f'<td {_TD} style="max-width:180px;color:#64748b;">'
+                                f'{c["fb_comment"] or "—"}</td>'
+                                f'</tr>'
+                            )
+                        th_html = "".join(
+                            f'<th {_TH}>{h}</th>'
+                            for h in ("Case", "Mode", "Problem", "Feedback date", "Rating", "Chips", "Comment")
+                        )
+                        ui.html(_table_wrap(th_html, rows_html))
+
+                    if _fb_base:
+                        _sh("Feedback Cases")
+                        with ui.row().style(
+                            'gap:8px;flex-wrap:wrap;align-items:flex-end;'
+                            'background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;'
+                            'padding:10px 12px;margin-bottom:12px;'
+                        ):
+                            _fb_r_sel = ui.select(['All', 'Helpful', 'Partially', 'No'], value='All', label='Rating').style('width:120px;')
+                            _fb_r_sel.on_value_change(lambda e: (_fb_f.update({'rating': e.value}), _fb_table.refresh()))
+                            _fb_c_sel = ui.select(['All', 'Yes', 'No'], value='All', label='Has chips').style('width:110px;')
+                            _fb_c_sel.on_value_change(lambda e: (_fb_f.update({'chips': e.value}), _fb_table.refresh()))
+                            _fb_m_sel = ui.select(_OM_OPTS, value='All', label='Mode').style('width:160px;')
+                            _fb_m_sel.on_value_change(lambda e: (_fb_f.update({'mode': e.value}), _fb_table.refresh()))
+                            def _reset_fb():
+                                _fb_f.update({'rating': 'All', 'chips': 'All', 'mode': 'All'})
+                                _fb_r_sel.value = 'All'
+                                _fb_c_sel.value = 'All'
+                                _fb_m_sel.value = 'All'
+                                _fb_table.refresh()
+                            ui.button('↺ Reset', on_click=_reset_fb).props('flat dense').style(
+                                'color:#6366f1;font-size:0.76rem;align-self:flex-end;margin-left:4px;'
+                            )
+                        _fb_table()
+                    else:
+                        ui.html('<div style="color:#94a3b8;font-size:0.84rem;margin-top:8px;">No feedback yet.</div>')
+
+                # ════════════════════════════════════════════════════════════
+                # TAB 3: Judge Evaluation
+                # ════════════════════════════════════════════════════════════
+                with ui.tab_panel(t_jdg):
+                    avg_s = totals.get("avg_judge_score")
+                    _sh("Verdicts")
+                    ui.html(
+                        '<div style="display:flex;gap:10px;flex-wrap:wrap;">'
+                        + "".join(
+                            _mcard(
+                                verdict_counts.get(v, 0),
+                                v.replace("_", " ").title(),
+                                "", _QA_VERDICT_BG.get(v, "#f8fafc"),
+                                "#0f172a", _QA_VERDICT_FG.get(v, "#475569"),
+                            )
+                            for v in ("pass", "needs_review", "unsafe")
+                        )
+                        + _mcard(str(avg_s) if avg_s is not None else "—", "Avg Score")
+                        + '</div>'
+                    )
+
+                    if top_judge_tags:
+                        _sh("Top Issue Tags")
+                        max_t = top_judge_tags[0]["count"] or 1
+                        ui.html(_bar_card(
+                            "".join(_bar_row(e["label"], e["count"], max_t, "#f59e0b")
+                                    for e in top_judge_tags[:12])
+                        ))
+                    else:
+                        ui.html('<div style="color:#94a3b8;font-size:0.84rem;margin-top:8px;">No judge evaluations yet.</div>')
+
+                    judged = [c for c in cases if c["judge_verdict"]]
+                    judged.sort(key=lambda c: (
+                        {"unsafe": 0, "needs_review": 1, "pass": 2}.get(c["judge_verdict"], 3),
+                        (c["judge_score"] or 100),
+                    ))
+
+                    if judged:
+                        _jdg_f = {'verdict': 'All', 'mode': 'All', 'score': 'All'}
+                        _SCORE_BUCKETS = [
+                            ("90–100", 90, 101, "#15803d"),
+                            ("80–89",  80,  90, "#4ade80"),
+                            ("70–79",  70,  80, "#f59e0b"),
+                            ("60–69",  60,  70, "#f97316"),
+                            ("<60",     0,  60, "#dc2626"),
+                        ]
+                        _SCORE_BUCKET_MAP = {b[0]: (b[1], b[2]) for b in _SCORE_BUCKETS}
+                        _JOM = ['All', 'diy', 'verify_first', 'assessment_first',
+                                'active_emergency', 'clarification', 'care', 'out_of_scope']
+
+                        @ui.refreshable
+                        def _jdg_table():
+                            f = judged
+                            if _jdg_f['verdict'] != 'All':
+                                _vmap = {'Pass': 'pass', 'Needs Review': 'needs_review', 'Unsafe': 'unsafe'}
+                                f = [c for c in f if c['judge_verdict'] == _vmap.get(_jdg_f['verdict'])]
+                            if _jdg_f['mode'] != 'All':
+                                f = [c for c in f if (c.get('output_mode') or '') == _jdg_f['mode']]
+                            if _jdg_f['score'] != 'All':
+                                lo, hi = _SCORE_BUCKET_MAP[_jdg_f['score']]
+                                f = [c for c in f if c['judge_score'] is not None and lo <= c['judge_score'] < hi]
+                            # Score distribution — updates with filter
+                            _dist = {
+                                b[0]: sum(1 for c in f if c["judge_score"] is not None and b[1] <= c["judge_score"] < b[2])
+                                for b in _SCORE_BUCKETS
+                            }
+                            _max_d = max(_dist.values()) or 1
+                            ui.html(_bar_card(
+                                "".join(
+                                    _bar_row(bucket, _dist[bucket], _max_d, col)
+                                    for bucket, _, __, col in _SCORE_BUCKETS
+                                    if _dist[bucket] > 0
+                                ) or '<div style="color:#94a3b8;font-size:0.82rem;padding:4px 0;">No scored cases in filter.</div>'
+                            ))
+                            _af = sum(1 for v in _jdg_f.values() if v != 'All')
+                            _af_note = f' · {_af} filter{"s" if _af != 1 else ""} active' if _af else ''
+                            ui.html(
+                                f'<div style="font-size:0.76rem;color:#94a3b8;margin:8px 0;">'
+                                f'Showing {len(f)} of {len(judged)} judged cases{_af_note}</div>'
+                            )
+                            if not f:
+                                ui.html(
+                                    '<div style="background:#f8fafc;border:1px solid #e2e8f0;'
+                                    'border-radius:8px;padding:12px 14px;font-size:0.84rem;'
+                                    'color:#94a3b8;">No cases match these filters.</div>'
+                                )
+                                return
+                            rows_html = ""
+                            for c in f[:30]:
+                                tags_html = "".join(_tag_badge(t) for t in (c["judge_tags"] or [])[:2])
+                                score_col = (
+                                    "#991b1b" if (c["judge_score"] or 100) < 60
+                                    else "#92400e" if (c["judge_score"] or 100) < 80
+                                    else "#15803d"
+                                )
+                                prob = (c["problem_type"] or "")[:35] or "—"
+                                rows_html += (
+                                    f'<tr style="border-bottom:1px solid #f1f5f9;">'
+                                    f'<td {_TD}>{_case_link(c["case_id"], c.get("case_url"))}</td>'
+                                    f'<td {_TD}>{c["output_mode"] or "—"}</td>'
+                                    f'<td {_TD} style="max-width:140px;color:#475569;font-size:0.75rem;">{prob}</td>'
+                                    f'<td {_TD} style="color:#94a3b8;font-size:0.75rem;white-space:nowrap;">'
+                                    f'{_fmt_date(c.get("judged_at"))}</td>'
+                                    f'<td {_TD}>'
+                                    f'<span style="font-size:1rem;font-weight:800;color:{score_col};">'
+                                    f'{c["judge_score"] if c["judge_score"] is not None else "—"}</span></td>'
+                                    f'<td {_TD}>{_verdict_chip(c["judge_verdict"])}</td>'
+                                    f'<td {_TD}>{tags_html or "<span style=\"color:#cbd5e1;\">none</span>"}</td>'
+                                    f'</tr>'
+                                )
+                            th_html = "".join(
+                                f'<th {_TH}>{h}</th>'
+                                for h in ("Case", "Mode", "Problem", "Judged", "Score", "Verdict", "Top Tags")
+                            )
+                            ui.html(_table_wrap(th_html, rows_html))
+
+                        _sh("Score Distribution & Cases")
+                        with ui.row().style(
+                            'gap:8px;flex-wrap:wrap;align-items:flex-end;'
+                            'background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;'
+                            'padding:10px 12px;margin-bottom:12px;'
+                        ):
+                            _jdg_v_sel = ui.select(['All', 'Pass', 'Needs Review', 'Unsafe'], value='All', label='Verdict').style('width:130px;')
+                            _jdg_v_sel.on_value_change(lambda e: (_jdg_f.update({'verdict': e.value}), _jdg_table.refresh()))
+                            _jdg_m_sel = ui.select(_JOM, value='All', label='Mode').style('width:160px;')
+                            _jdg_m_sel.on_value_change(lambda e: (_jdg_f.update({'mode': e.value}), _jdg_table.refresh()))
+                            _jdg_s_sel = ui.select(['All'] + [b[0] for b in _SCORE_BUCKETS], value='All', label='Score range').style('width:130px;')
+                            _jdg_s_sel.on_value_change(lambda e: (_jdg_f.update({'score': e.value}), _jdg_table.refresh()))
+                            def _reset_jdg():
+                                _jdg_f.update({'verdict': 'All', 'mode': 'All', 'score': 'All'})
+                                _jdg_v_sel.value = 'All'
+                                _jdg_m_sel.value = 'All'
+                                _jdg_s_sel.value = 'All'
+                                _jdg_table.refresh()
+                            ui.button('↺ Reset', on_click=_reset_jdg).props('flat dense').style(
+                                'color:#6366f1;font-size:0.76rem;align-self:flex-end;margin-left:4px;'
+                            )
+                        _jdg_table()
+
+                # ════════════════════════════════════════════════════════════
+                # TAB 4: Alignment
+                # ════════════════════════════════════════════════════════════
+                with ui.tab_panel(t_aln):
+                    # Critical cases pinned at top
+                    critical = sorted(
+                        [c for c in cases if c["alignment"] in ("safety_override", "confirmed_issue")],
+                        key=lambda c: {"safety_override": 0, "confirmed_issue": 1}.get(c["alignment"], 2),
+                    )
+                    if critical:
+                        ui.html(
+                            f'<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:10px;'
+                            f'padding:10px 14px;margin-bottom:12px;display:flex;align-items:center;gap:10px;'
+                            f'flex-wrap:wrap;">'
+                            f'<span style="font-size:0.9rem;font-weight:700;color:#991b1b;">⚠ Critical</span>'
+                            f'<span style="font-size:0.78rem;color:#b91c1c;">'
+                            f'{len(critical)} case{"s" if len(critical) != 1 else ""} '
+                            f'with conflicting judge/user signals</span>'
+                            f'<span style="font-size:0.7rem;color:#fca5a5;margin-left:auto;">'
+                            f'Always shown — not affected by filters below</span>'
+                            f'</div>'
+                        )
+                        crit_rows = ""
+                        for c in critical[:8]:
+                            prob      = (c["problem_type"] or "")[:30] or "—"
+                            reason    = c.get("priority_reason") or "—"
+                            case_href = c.get("case_url") or f'/cases/{c["case_id"]}'
+                            crit_rows += (
+                                f'<tr style="border-bottom:1px solid #fef2f2;">'
+                                f'<td {_TD}>{_case_link(c["case_id"], c.get("case_url"))}</td>'
+                                f'<td {_TD} style="max-width:120px;color:#475569;font-size:0.75rem;">{prob}</td>'
+                                f'<td {_TD}>{_align_chip(c["alignment"])}</td>'
+                                f'<td {_TD}>{_verdict_chip(c["judge_verdict"])}</td>'
+                                f'<td {_TD}>{_rating_chip(c["fb_rating"])}</td>'
+                                f'<td {_TD} style="max-width:160px;color:#64748b;font-size:0.75rem;">{reason}</td>'
+                                f'<td {_TD}>'
+                                f'<a href="{case_href}" target="_blank" '
+                                f'style="color:#6366f1;font-weight:600;font-size:0.78rem;text-decoration:none;">'
+                                f'Open →</a></td>'
+                                f'</tr>'
+                            )
+                        crit_th = "".join(
+                            f'<th {_TH}>{h}</th>'
+                            for h in ("Case", "Problem", "Alignment", "Judge", "User", "Reason", "")
+                        )
+                        ui.html(_table_wrap(crit_th, crit_rows))
+
+                    _sh("Judge vs User Signal")
+
+                    align_order = [
+                        "likely_good", "confirmed_issue", "judge_calibration_issue",
+                        "safety_override", "needs_judge", "monitor", "no_signal",
+                    ]
+                    ui.html(
+                        '<div style="display:flex;gap:10px;flex-wrap:wrap;">'
+                        + "".join(
+                            _mcard(
+                                align_counts.get(k, 0),
+                                _QA_ALIGN_LABEL.get(k, k),
+                                "",
+                                _QA_ALIGN_BG.get(k, "#f8fafc"),
+                                _QA_ALIGN_FG.get(k, "#475569"),
+                                _QA_ALIGN_FG.get(k, "#475569"),
+                            )
+                            for k in align_order
+                            if align_counts.get(k, 0) > 0
+                        )
+                        + '</div>'
+                    )
+
+                    # Alignment explainer
+                    ui.html(
+                        '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;'
+                        'padding:10px 14px;font-size:0.75rem;color:#64748b;margin:12px 0;">'
+                        '<strong>Key:</strong> '
+                        '<span style="color:#15803d;">Likely Good</span> = judge pass + user helpful &nbsp;·&nbsp; '
+                        '<span style="color:#991b1b;">Confirmed Issue</span> = judge flag + user complaint &nbsp;·&nbsp; '
+                        '<span style="color:#92400e;">Calibration Gap</span> = judge pass but user said No &nbsp;·&nbsp; '
+                        '<span style="color:#991b1b;">Safety Override</span> = judge unsafe but user said Helpful'
+                        '</div>'
+                    )
+
+                    # ── 4 alignment signal cards ──────────────────────────────
+                    _sh("What the Data Shows")
+                    _paired_all   = [c for c in cases if c.get("judge_verdict") and c.get("fb_rating")]
+                    _n_paired     = len(_paired_all)
+                    _both_good    = [c for c in _paired_all if c["judge_verdict"] == "pass"   and c["fb_rating"] == "helpful"]
+                    _both_flagged = [c for c in _paired_all if c["judge_verdict"] in ("needs_review", "unsafe") and c["fb_rating"] in ("partial", "not")]
+                    _safety_conf  = [c for c in _paired_all if c["judge_verdict"] == "unsafe" and c["fb_rating"] == "helpful"]
+                    _calib_gap    = [c for c in _paired_all if c["judge_verdict"] == "pass"   and c["fb_rating"] in ("not", "partial")]
+
+                    def _ac_pct(lst):
+                        return round(100 * len(lst) / _n_paired) if _n_paired else 0
+
+                    def _ac_ex(lst):
+                        return " ".join(
+                            f'<a href="/cases/{c["case_id"]}" target="_blank" '
+                            f'style="color:inherit;font-weight:700;text-decoration:none;opacity:0.8;">'
+                            f'#{c["case_id"]}</a>'
+                            for c in lst[:3]
+                        )
+
+                    def _ac(icon, title, lst, bg, border, fg, fg_sub, desc):
+                        n   = len(lst)
+                        pct = _ac_pct(lst)
+                        ex  = _ac_ex(lst)
+                        return (
+                            f'<div style="background:{bg};border:1.5px solid {border};border-radius:14px;'
+                            f'padding:16px;flex:1;min-width:185px;">'
+                            f'<div style="font-size:0.95rem;margin-bottom:4px;">{icon}</div>'
+                            f'<div style="font-size:0.8rem;font-weight:700;color:{fg};margin-bottom:8px;">{title}</div>'
+                            f'<div style="font-size:2.4rem;font-weight:800;color:{fg};line-height:1;">{n}</div>'
+                            f'<div style="font-size:0.72rem;color:{fg_sub};margin-top:3px;">'
+                            f'{pct}% of {_n_paired} paired</div>'
+                            f'<div style="font-size:0.75rem;color:{fg};opacity:0.85;margin-top:10px;">{desc}</div>'
+                            + (f'<div style="font-size:0.7rem;color:{fg_sub};margin-top:8px;">e.g. {ex}</div>' if ex else "")
+                            + f'</div>'
+                        )
+
+                    ui.html(
+                        f'<div style="display:flex;gap:12px;flex-wrap:wrap;margin:14px 0;">'
+                        + _ac("✅", "Both Good",
+                              _both_good, "#f0fdf4", "#86efac", "#15803d", "#4ade80",
+                              "Judge passed and user said Helpful.")
+                        + _ac("⚠️", "Both Flagged",
+                              _both_flagged, "#fffbeb", "#fde68a", "#92400e", "#d97706",
+                              "Judge and user both identified an issue.")
+                        + _ac("🔴", "Safety Conflict",
+                              _safety_conf, "#fef2f2", "#fca5a5", "#991b1b", "#f87171",
+                              "User said Helpful — judge flagged Unsafe.")
+                        + _ac("🟡", "Calibration Gap",
+                              _calib_gap, "#fefce8", "#fef08a", "#b45309", "#eab308",
+                              "User was unhappy despite judge passing.")
+                        + f'</div>'
+                        + (f'<div style="font-size:0.72rem;color:#94a3b8;margin-bottom:12px;">'
+                           f'{_n_paired} cases have both signals. Cases appear in only one card.</div>'
+                           if _n_paired else
+                           f'<div style="font-size:0.72rem;color:#94a3b8;margin-bottom:12px;">'
+                           f'No cases have both a judge verdict and user feedback yet.</div>')
+                    )
+
+                    if needs_attention:
+                        _aln_f   = {'alignment': 'All', 'priority': 'All'}
+                        _ALN_OPTS = ['All', 'likely_good', 'confirmed_issue',
+                                     'judge_calibration_issue', 'safety_override',
+                                     'needs_judge', 'monitor', 'no_signal']
+                        _PRIO_OPTS = ['All', 'high', 'medium', 'low']
+
+                        @ui.refreshable
+                        def _aln_table():
+                            f = needs_attention
+                            if _aln_f['alignment'] != 'All':
+                                f = [c for c in f if c['alignment'] == _aln_f['alignment']]
+                            if _aln_f['priority'] != 'All':
+                                f = [c for c in f if c['priority'] == _aln_f['priority']]
+                            _af = sum(1 for v in _aln_f.values() if v != 'All')
+                            _af_note = f' · {_af} filter{"s" if _af != 1 else ""} active' if _af else ''
+                            ui.html(
+                                f'<div style="font-size:0.76rem;color:#94a3b8;margin-bottom:8px;">'
+                                f'Showing {len(f)} of {len(needs_attention)} cases needing attention{_af_note}</div>'
+                            )
+                            if not f:
+                                ui.html(
+                                    '<div style="background:#f8fafc;border:1px solid #e2e8f0;'
+                                    'border-radius:8px;padding:12px 14px;font-size:0.84rem;'
+                                    'color:#94a3b8;">No cases match these filters.</div>'
+                                )
+                                return
+                            rows_html = ""
+                            for c in f[:25]:
+                                action    = c.get("suggested_action") or ""
+                                prob      = (c["problem_type"] or "")[:30] or "—"
+                                reason    = c.get("priority_reason") or "—"
+                                case_href = c.get("case_url") or f'/cases/{c["case_id"]}'
+                                row_hl    = 'border-left:3px solid #f87171;' if c['priority'] == 'high' else 'border-left:3px solid transparent;'
+                                action_sub = (
+                                    f'<div style="color:#94a3b8;font-size:0.68rem;margin-top:2px;">{action}</div>'
+                                    if action else ''
+                                )
+                                rows_html += (
+                                    f'<tr style="border-bottom:1px solid #f1f5f9;{row_hl}">'
+                                    f'<td {_TD}>{_case_link(c["case_id"], c.get("case_url"))}</td>'
+                                    f'<td {_TD}>{c["output_mode"] or "—"}</td>'
+                                    f'<td {_TD} style="max-width:120px;color:#475569;font-size:0.75rem;">{prob}</td>'
+                                    f'<td {_TD}>{_verdict_chip(c["judge_verdict"])}</td>'
+                                    f'<td {_TD}>{_rating_chip(c["fb_rating"])}</td>'
+                                    f'<td {_TD}>{_align_chip(c["alignment"])}</td>'
+                                    f'<td {_TD}>{_prio_badge(c["priority"])}</td>'
+                                    f'<td {_TD} style="max-width:170px;">'
+                                    f'<div style="color:#64748b;font-size:0.75rem;">{reason}</div>'
+                                    f'{action_sub}</td>'
+                                    f'<td {_TD} style="white-space:nowrap;">'
+                                    f'<a href="{case_href}" target="_blank" '
+                                    f'style="color:#6366f1;font-weight:600;font-size:0.78rem;text-decoration:none;">'
+                                    f'Open →</a></td>'
+                                    f'</tr>'
+                                )
+                            th_html = "".join(
+                                f'<th {_TH}>{h}</th>'
+                                for h in ("Case", "Mode", "Problem", "Judge", "User", "Alignment", "Priority", "Reason", "Open")
+                            )
+                            ui.html(_table_wrap(th_html, rows_html))
+
+                        _sh("Cases Needing Attention")
+                        with ui.row().style(
+                            'gap:8px;flex-wrap:wrap;align-items:flex-end;'
+                            'background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;'
+                            'padding:10px 12px;margin-bottom:12px;'
+                        ):
+                            _aln_a_sel = ui.select(_ALN_OPTS, value='All', label='Alignment').style('width:190px;')
+                            _aln_a_sel.on_value_change(lambda e: (_aln_f.update({'alignment': e.value}), _aln_table.refresh()))
+                            _aln_p_sel = ui.select(_PRIO_OPTS, value='All', label='Priority').style('width:110px;')
+                            _aln_p_sel.on_value_change(lambda e: (_aln_f.update({'priority': e.value}), _aln_table.refresh()))
+                            def _reset_aln():
+                                _aln_f.update({'alignment': 'All', 'priority': 'All'})
+                                _aln_a_sel.value = 'All'
+                                _aln_p_sel.value = 'All'
+                                _aln_table.refresh()
+                            ui.button('↺ Reset', on_click=_reset_aln).props('flat dense').style(
+                                'color:#6366f1;font-size:0.76rem;align-self:flex-end;margin-left:4px;'
+                            )
+                        _aln_table()
+                    else:
+                        ui.html(
+                            '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;'
+                            'padding:14px 16px;font-size:0.84rem;color:#15803d;margin-top:12px;">'
+                            '&#10003; No cases currently need attention.</div>'
+                        )
+
+                # ════════════════════════════════════════════════════════════
+                # TAB 5: Recurring Issues
+                # ════════════════════════════════════════════════════════════
+                with ui.tab_panel(t_rec):
+
+                    if top_judge_tags:
+                        _sh("By Judge Issue Tag")
+                        max_t = top_judge_tags[0]["count"] or 1
+                        ui.html(_bar_card(
+                            "".join(_bar_row(e["label"], e["count"], max_t, "#f59e0b")
+                                    for e in top_judge_tags[:12])
+                        ))
+                    else:
+                        ui.html('<div style="color:#94a3b8;font-size:0.84rem;margin-top:8px;">No judge evaluations yet.</div>')
+
+                    if top_user_chips:
+                        _sh("By User Reason Chip")
+                        max_c = top_user_chips[0]["count"] or 1
+                        ui.html(_bar_card(
+                            "".join(_bar_row(e["label"], e["count"], max_c, "#6366f1")
+                                    for e in top_user_chips)
+                        ))
+                    else:
+                        ui.html('<div style="color:#94a3b8;font-size:0.84rem;margin-top:8px;">No reason chips recorded yet.</div>')
+
+                    if recurring_issues:
+                        _sh("Combined Signal")
+                        rows_html = ""
+                        for ri in recurring_issues[:20]:
+                            sig_col = _QA_SIG_COL.get(ri["signal"], "#475569")
+                            ex_str  = " ".join(
+                                f'<a href="/cases/{i}" target="_blank" '
+                                f'style="color:#6366f1;font-weight:600;text-decoration:none;">#{i}</a>'
+                                for i in ri["example_case_ids"][:3]
+                            )
+                            rows_html += (
+                                f'<tr style="border-bottom:1px solid #f1f5f9;">'
+                                f'<td {_TD}>{ri["label"]}</td>'
+                                f'<td {_TD} style="text-align:center;font-weight:700;">{ri["total"]}</td>'
+                                f'<td {_TD} style="text-align:center;color:#92400e;">{ri["judge_count"] or "—"}</td>'
+                                f'<td {_TD} style="text-align:center;color:#3730a3;">{ri["user_count"] or "—"}</td>'
+                                f'<td {_TD}><span style="color:{sig_col};font-weight:700;'
+                                f'font-size:0.7rem;text-transform:uppercase;">{ri["signal"]}</span></td>'
+                                f'<td {_TD}>{ex_str or "—"}</td>'
+                                f'</tr>'
+                            )
+                        th_html = "".join(
+                            f'<th {_TH}>{h}</th>'
+                            for h in ("Issue", "Total", "Judge", "User", "Signal", "Examples")
+                        )
+                        ui.html(_table_wrap(th_html, rows_html))
+
+                # ════════════════════════════════════════════════════════════
+                # TAB 6: Suggestions
+                # ════════════════════════════════════════════════════════════
+                with ui.tab_panel(t_sug):
+                    ui.html(
+                        '<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;'
+                        'padding:10px 14px;font-size:0.8rem;color:#166534;margin-bottom:14px;">'
+                        '&#9432; Suggestions are generated from recurring judge issue tags and user feedback reason chips. '
+                        'They are advisory only and do not automatically change the repair pipeline. '
+                        'Cards labelled <strong style="background:#6366f1;color:white;padding:1px 6px;'
+                        'border-radius:100px;font-size:0.7rem;">JUDGE + USER</strong> mean both signals agree — '
+                        'treat these as higher confidence.</div>'
+                    )
+
+                    if not suggestions:
+                        ui.html(
+                            '<div style="color:#94a3b8;font-size:0.84rem;">'
+                            'No recurring issues found yet — run the judge on more cases '
+                            'and collect more feedback to generate suggestions.</div>'
+                        )
+                    else:
+                        # ── Proposal dialog helpers (defined once, used per card) ──
+
+                        def _pfld(_l: str, _v: str, _b: bool = False) -> str:
+                            _vw = (f'<strong style="color:#0f172a;">{_v}</strong>' if _b
+                                   else f'<span style="color:#0f172a;">{_v}</span>')
+                            return (
+                                f'<div style="font-size:0.82rem;">'
+                                f'<span style="color:#94a3b8;font-size:0.7rem;font-weight:600;'
+                                f'text-transform:uppercase;letter-spacing:0.04em;">{_l}</span><br>'
+                                f'{_vw}</div>'
+                            )
+
+                        def _prop_loading() -> str:
+                            return (
+                                '<div style="background:#6366f1;padding:16px 20px;">'
+                                '<div style="font-size:0.95rem;font-weight:800;color:white;">'
+                                'Advisory Fix Proposal</div>'
+                                '<div style="font-size:0.72rem;color:#c7d2fe;margin-top:2px;">'
+                                'AI-generated · draft only · not applied automatically</div></div>'
+                                '<div style="padding:24px 20px;display:flex;align-items:center;'
+                                'gap:10px;color:#64748b;">'
+                                '<span style="font-size:1.2rem;">&#9203;</span>'
+                                '<span style="font-size:0.84rem;">Generating proposal via Ollama…</span></div>'
+                            )
+
+                        def _prop_ai(_data: dict, _sg: dict) -> str:
+                            _ex = ", ".join(
+                                f"#{i}" for i in (_sg.get("example_case_ids") or [])[:5]
+                            ) or "—"
+                            return (
+                                '<div style="background:#6366f1;padding:16px 20px;">'
+                                '<div style="font-size:0.95rem;font-weight:800;color:white;">'
+                                'Advisory Fix Proposal</div>'
+                                '<div style="font-size:0.72rem;color:#c7d2fe;margin-top:2px;">'
+                                'AI-generated · draft only · not applied automatically</div></div>'
+                                '<div style="padding:18px 20px;display:flex;flex-direction:column;gap:12px;">'
+                                + _pfld("Proposal title",   _data.get("title",            "—"), True)
+                                + _pfld("Problem observed", _data.get("problem_observed",  "—"))
+                                + _pfld("Evidence",         _data.get("evidence",          "—"))
+                                + _pfld("Suggested change", _data.get("suggested_change",  "—"))
+                                + _pfld("Pipeline area",    _data.get("pipeline_area",     _sg.get("pipeline_area", "—")))
+                                + _pfld("Expected impact",  _data.get("expected_impact",   "—"))
+                                + _pfld("Risks / cautions", _data.get("risks_or_cautions", "—"))
+                                + _pfld("Example cases",    _ex)
+                                + '<div style="background:#fef9c3;border-radius:8px;padding:10px 12px;'
+                                  'font-size:0.76rem;color:#92400e;">&#9888; '
+                                + _data.get("safety_note",
+                                            "This is an advisory QA proposal only. "
+                                            "It does not automatically change the repair pipeline.")
+                                + '</div></div>'
+                            )
+
+                        def _prop_static(_sg: dict, _err: dict | None = None) -> str:
+                            _tr = " · ".join(
+                                _QA_TAG_LABELS.get(k) or _QA_CHIP_LABELS.get(k)
+                                or k.replace("_", " ").title()
+                                for k in (_sg.get("trigger_issues") or [])
+                            )
+                            _ex = ", ".join(
+                                f"#{i}" for i in (_sg.get("example_case_ids") or [])[:5]
+                            ) or "—"
+                            _eb = (
+                                f'<div style="background:#fef2f2;border-radius:8px;padding:8px 12px;'
+                                f'font-size:0.74rem;color:#991b1b;">'
+                                f'&#9888; {_err.get("message", "AI generation unavailable")} '
+                                f'— static summary shown.</div>'
+                                if _err else ""
+                            )
+                            return (
+                                '<div style="background:#64748b;padding:16px 20px;">'
+                                '<div style="font-size:0.95rem;font-weight:800;color:white;">'
+                                'Fix Proposal (static)</div>'
+                                '<div style="font-size:0.72rem;color:#e2e8f0;margin-top:2px;">'
+                                'Draft only · not applied automatically</div></div>'
+                                '<div style="padding:18px 20px;display:flex;flex-direction:column;gap:10px;">'
+                                + _eb
+                                + _pfld("Suggestion",    _sg.get("suggestion",   "—"), True)
+                                + _pfld("Pipeline area", _sg.get("pipeline_area", "—"))
+                                + _pfld("Triggered by",  _tr)
+                                + _pfld("Signal",        (_sg.get("signal") or "").upper())
+                                + _pfld("Occurrences",   str(_sg.get("total_occurrences", 0)))
+                                + _pfld("Example cases", _ex)
+                                + '<div style="background:#fef9c3;border-radius:8px;padding:10px 12px;'
+                                  'font-size:0.76rem;color:#92400e;">'
+                                  '&#9888; This is an advisory QA proposal only. '
+                                  'It does not automatically change the repair pipeline.</div>'
+                                  '</div>'
+                            )
+
+                        def _make_proposal(_sg: dict) -> None:
+                            with ui.dialog() as _dlg:
+                                with ui.card().style(
+                                    "max-width:600px;width:100%;border-radius:14px;padding:0;"
+                                    "overflow:hidden;max-height:85vh;"
+                                    "display:flex;flex-direction:column;"
+                                ):
+                                    _ph = ui.html("").style("overflow-y:auto;flex:1;")
+                                    with ui.row().style(
+                                        "justify-content:flex-end;padding:0 16px 12px;flex-shrink:0;"
+                                    ):
+                                        ui.button("Close", on_click=_dlg.close).props(
+                                            "flat dense"
+                                        ).style("color:#6366f1;")
+
+                            async def _open():
+                                _ph.content = _prop_loading()
+                                _dlg.open()
+                                try:
+                                    async with httpx.AsyncClient() as _hc:
+                                        _resp = await _hc.post(
+                                            f"{API}/admin/quality/fix-proposal",
+                                            headers=H,
+                                            json={
+                                                "suggestion":        _sg["suggestion"],
+                                                "signal":            _sg.get("signal", ""),
+                                                "trigger_issues":    _sg.get("trigger_issues") or [],
+                                                "total_occurrences": _sg.get("total_occurrences", 0),
+                                                "pipeline_area":     _sg.get("pipeline_area", ""),
+                                                "example_case_ids":  (_sg.get("example_case_ids") or [])[:5],
+                                            },
+                                            timeout=90.0,
+                                        )
+                                    _d = _resp.json() if _resp.status_code == 200 else None
+                                except Exception as _exc:
+                                    _d = {"error": "connection_failed", "message": str(_exc)[:120]}
+                                if _d and _d.get("ai_generated"):
+                                    _ph.content = _prop_ai(_d, _sg)
+                                else:
+                                    _ph.content = _prop_static(_sg, _d)
+
+                            with ui.row().style("justify-content:flex-end;padding-top:6px;"):
+                                ui.button(
+                                    "Generate fix proposal →", on_click=_open
+                                ).props("flat dense").style(
+                                    "color:#6366f1;font-size:0.76rem;font-weight:600;"
+                                )
+
+                        for sg in suggestions:
+                            _sig = sg["signal"]
+                            sig_border = {"both": "#6366f1", "judge": "#f59e0b", "user": "#3b82f6"}.get(_sig, "#e2e8f0")
+                            sig_bg     = "#f8f7ff" if _sig == "both" else "white"
+                            sig_badge_text = {"both": "JUDGE + USER", "judge": "JUDGE", "user": "USER FEEDBACK"}.get(_sig, _sig.upper())
+                            sig_badge_bg   = {"both": "#6366f1", "judge": "#d97706", "user": "#3b82f6"}.get(_sig, "#94a3b8")
+                            ex_str = "  ".join(
+                                f'<a href="/cases/{i}" target="_blank" '
+                                f'style="color:#6366f1;font-weight:600;text-decoration:none;">#{i}</a>'
+                                for i in sg["example_case_ids"][:5]
+                            )
+                            trigger_str = " · ".join(
+                                _QA_TAG_LABELS.get(k) or _QA_CHIP_LABELS.get(k)
+                                or k.replace("_", " ").title()
+                                for k in sg["trigger_issues"]
+                            )
+                            with ui.element("div").style(
+                                f"background:{sig_bg};border:1px solid #e2e8f0;"
+                                f"border-left:4px solid {sig_border};"
+                                "border-radius:12px;padding:14px 16px;margin-bottom:10px;"
+                            ):
+                                ui.html(
+                                    f'<div style="display:flex;justify-content:space-between;'
+                                    f'align-items:flex-start;gap:12px;">'
+                                    f'<div style="flex:1;min-width:0;">'
+                                    f'<div style="margin-bottom:6px;">'
+                                    f'<span style="background:{sig_badge_bg};color:white;font-size:0.65rem;'
+                                    f'font-weight:800;padding:2px 8px;border-radius:100px;'
+                                    f'letter-spacing:0.04em;white-space:nowrap;">{sig_badge_text}</span>'
+                                    f'</div>'
+                                    f'<div style="font-weight:700;color:#0f172a;font-size:0.88rem;'
+                                    f'margin-bottom:5px;">{sg["suggestion"]}</div>'
+                                    f'<div style="font-size:0.78rem;color:#475569;margin-bottom:4px;">'
+                                    f'<strong>Pipeline area:</strong> {sg["pipeline_area"]}</div>'
+                                    f'<div style="font-size:0.73rem;color:#64748b;">'
+                                    f'Triggered by: {trigger_str}</div>'
+                                    + (
+                                        f'<div style="font-size:0.73rem;color:#64748b;margin-top:2px;">'
+                                        f'Example cases: {ex_str}</div>'
+                                        if ex_str else ""
+                                    )
+                                    + f'</div>'
+                                    f'<div style="text-align:right;flex-shrink:0;min-width:56px;">'
+                                    f'<div style="font-size:1.4rem;font-weight:800;color:#0f172a;">'
+                                    f'{sg["total_occurrences"]}</div>'
+                                    f'<div style="font-size:0.68rem;color:#94a3b8;">occurrences</div>'
+                                    f'</div></div>'
+                                )
+                                _make_proposal(sg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

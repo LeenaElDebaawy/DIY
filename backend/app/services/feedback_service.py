@@ -10,7 +10,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Analysis, Feedback, Session as RepairSession
-from app.schemas.feedback import FeedbackCreate, IncidentUpdate
+from app.schemas.feedback import (
+    FeedbackCreate, IncidentUpdate,
+    _CHIP_TO_ISSUE, _CHIP_TO_SAFETY,
+)
 
 # Severity weights for the priority score. Safety is handled in its own lane and
 # is NOT scored here. Higher weight = a worse failure for the same frequency.
@@ -62,11 +65,30 @@ async def create_feedback(
     output_mode = sr.get("output_mode")
     is_emergency = bool((sr.get("out_of_scope") or {}).get("is_emergency"))
 
-    # Auto safety-flag: hazardous assessment, active emergency, or a safety issue.
+    # Derive issue_category and safety_category from reason_chips when the
+    # caller did not supply them directly (new-style chip submission).
+    issue_category  = body.issue_category
+    safety_category = body.safety_category
+    chips = body.reason_chips or []
+    if chips:
+        if not issue_category:
+            for chip in chips:
+                mapped = _CHIP_TO_ISSUE.get(chip)
+                if mapped:
+                    issue_category = mapped
+                    break
+        if not safety_category:
+            for chip in chips:
+                mapped = _CHIP_TO_SAFETY.get(chip)
+                if mapped:
+                    safety_category = mapped
+                    break
+
+    # Auto safety-flag: hazardous assessment, active emergency, or a safety chip.
     is_safety = (
         output_mode == "assessment_first"
         or (output_mode == "out_of_scope" and is_emergency)
-        or body.safety_category is not None
+        or safety_category is not None
     )
 
     fb = Feedback(
@@ -74,11 +96,12 @@ async def create_feedback(
         analysis_id=body.analysis_id,
         user_id=user_id,
         rating=body.rating,
-        issue_category=body.issue_category,
+        issue_category=issue_category,
         comment=body.comment,
         output_mode=output_mode,
         is_safety=is_safety,
-        safety_category=body.safety_category,
+        safety_category=safety_category,
+        reason_chips=chips or None,
         status="new",
     )
     db.add(fb)

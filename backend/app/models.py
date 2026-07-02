@@ -429,6 +429,10 @@ class Feedback(Base):
     )
     safety_category: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
+    # Optional multi-select reason chips — set when rating is "partial" or "not".
+    # NULL for old records (treated as empty list by callers).
+    reason_chips: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+
     # Review lifecycle (used for safety incidents): 'new' | 'reviewing' | 'resolved'.
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="new", server_default="new"

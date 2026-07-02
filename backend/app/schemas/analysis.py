@@ -22,9 +22,10 @@ Analysis.structured_result as a JSONB dict.
 """
 
 import datetime
+from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -671,3 +672,104 @@ class AnalysisResponse(BaseModel):
     # Analysis.hazard_ack property.  False until the user clicks "I Understand"
     # on the assessment_first acknowledgement card.
     hazard_ack: bool = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JUDGE OUTPUT  (admin-only, on-demand quality evaluation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class JudgeIssueTag(str, Enum):
+    OVER_CAUTIOUS_ROUTING                      = "over_cautious_routing"
+    UNDER_CAUTIOUS_ROUTING                     = "under_cautious_routing"
+    MISSING_SAFETY_WARNING                     = "missing_safety_warning"
+    HALLUCINATED_HAZARD                        = "hallucinated_hazard"
+    VAGUE_REPAIR_STEPS                         = "vague_repair_steps"
+    VAGUE_TOOLS_OR_MATERIALS                   = "vague_tools_or_materials"
+    POOR_GROUNDING                             = "poor_grounding"
+    UNNECESSARY_CLARIFICATION                  = "unnecessary_clarification"
+    MISSING_CLARIFICATION                      = "missing_clarification"
+    UNCLEAR_USER_LANGUAGE                      = "unclear_user_language"
+    WRONG_TRADE_CATEGORY                       = "wrong_trade_category"
+    WEAK_STEP_ORDERING                         = "weak_step_ordering"
+    # Mode-specific tags
+    EMERGENCY_WORDING_COULD_BE_STRONGER        = "emergency_wording_could_be_stronger"
+    EMERGENCY_REPAIR_STEPS_INAPPROPRIATELY_EXPECTED = "emergency_repair_steps_inappropriately_expected"
+    UNSUPPORTED_PROFESSIONAL_ESCALATION        = "unsupported_professional_escalation"
+    UNSUPPORTED_HAZARD_CLAIM                   = "unsupported_hazard_claim"
+    # Professional-assessment / constructive quality tags
+    WRONG_PROFESSIONAL_TYPE                    = "wrong_professional_type"
+    OVER_SPECIFIC_URGENCY                      = "over_specific_urgency"
+    USEFUL_BUT_OVERCAUTIOUS                    = "useful_but_overcautious"
+    EVIDENCE_UNCERTAINTY_NOT_EXPLAINED         = "evidence_uncertainty_not_explained"
+    CORRECT_BUT_UNCLEAR_REASONING              = "correct_but_unclear_reasoning"
+
+
+class JudgeDimensionScores(BaseModel):
+    safety_correctness:            int  = Field(ge=0, le=100)
+    routing_appropriateness:       int  = Field(ge=0, le=100)
+    # null = N/A for this output mode (e.g. emergencies, assessment_first, clarification)
+    repair_step_detail:            Optional[int] = Field(None, ge=0, le=100)
+    tools_materials_specificity:   Optional[int] = Field(None, ge=0, le=100)
+    grounding:                     int  = Field(ge=0, le=100)
+    hallucination_absence:         int  = Field(ge=0, le=100)
+    safety_warning_completeness:   int  = Field(ge=0, le=100)
+    clarification_appropriateness: Optional[int] = Field(None, ge=0, le=100)
+    user_clarity:                  int  = Field(ge=0, le=100)
+
+
+class JudgeSuggestedImprovement(BaseModel):
+    """Legacy schema — kept for backward compat. New code uses JudgeFinding."""
+    issue:        str
+    description:  str
+    proposed_fix: str
+
+
+class EvidenceClaim(BaseModel):
+    """Per-claim audit comparing a final-output claim to Stage 1 / video observations."""
+    claim:   str  # exact phrase or close paraphrase from the output
+    verdict: str  # confirmed | reasonable_inference | unsupported | overclaimed
+    note:    str  # 1 sentence: what Stage 1 says or does not say that determines this
+
+
+class JudgeFinding(BaseModel):
+    """Structured, evidence-grounded finding with quoted text and concrete rewrite."""
+    tag:          str  # issue tag from JudgeIssueTag
+    excerpt:      str  # short direct quote from the output being criticised (< 12 words)
+    problem:      str  # why this is a problem, referencing Stage 1
+    better:       str  # complete replacement sentence the output could use
+    pipeline_fix: str  # what to change in Stage 3 / routing prompt to prevent recurrence
+
+
+class JudgeOutput(BaseModel):
+    judge_model:  str
+    judged_at:    str   # ISO 8601 UTC string
+    analysis_id:  int
+    output_mode:  str
+    rubric_mode:  str = "diy"   # may differ from output_mode (e.g. out_of_scope + emergency → active_emergency)
+
+    overall_score:    int = Field(ge=0, le=100)
+    dimension_scores: JudgeDimensionScores
+
+    # ── Primary structured feedback (Phase 2 redesign) ──────────────────────
+    what_went_well:  list[str]          = []   # 2-4 specific strengths
+    what_needs_work: list[str]          = []   # 2-4 specific issues, no dimension jargon
+    claims:          list[EvidenceClaim] = []   # per-claim evidence audit (max 6)
+    findings:        list[JudgeFinding]  = []   # precise findings with excerpt + better wording (max 4)
+    mode_review:     Optional[str]       = None  # mode-specific focused evaluation
+    qa_summary:      Optional[str]       = None  # 2-3 sentences, must match verdict
+
+    # ── Tags and flags ───────────────────────────────────────────────────────
+    issue_tags:              list[str] = []
+    safety_flags:            list[str] = []
+
+    final_verdict: str   # "pass" | "needs_review" | "unsafe"
+
+    # ── Backward-compat fields (populated from new fields; kept so old results still render) ──
+    suggested_improvements:  list[JudgeSuggestedImprovement] = []
+    missing_details:         list[str]     = []   # from what_needs_work
+    possible_hallucinations: list[str]     = []   # from unsupported/overclaimed claims
+    recurring_issue_hint:    Optional[str] = None
+    strengths:               list[str]     = []   # alias of what_went_well
+    professional_type_review:Optional[str] = None  # assessment_first / verify_first only
+    evidence_match_summary:  Optional[str] = None  # compact text version of claims list
+    judge_reasoning_summary: str           = ""    # alias of qa_summary

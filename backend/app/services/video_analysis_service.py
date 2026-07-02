@@ -312,11 +312,6 @@ def _run_inference_sync(
     import torch  # noqa: PLC0415 — re-import is a no-op; confirms DLL order
     from qwen_vl_utils import process_vision_info  # noqa: PLC0415
 
-    # Diagnostic: confirm this code version is running
-    _diag = Path(__file__).parent.parent.parent / "video_diag.log"
-    with open(_diag, "a") as _f:
-        _f.write(f"_run_inference_sync called: {video_path.name}\n")
-
     # Pre-extract frames with PyAV and pass as a list of PIL Images.
     # qwen-vl-utils fetch_video() accepts list|tuple directly (calls fetch_image
     # per frame), bypassing all video-reader backends entirely.
@@ -324,13 +319,9 @@ def _run_inference_sync(
     # removal in torchvision >= 0.20.
     try:
         frames = _extract_frames_pyav(video_path, nframes)
-        with open(_diag, "a") as _f:
-            _f.write(f"  PyAV extracted {len(frames)} frames OK\n")
     except VideoAnalysisError:
         raise
     except Exception as exc:
-        with open(_diag, "a") as _f:
-            _f.write(f"  PyAV FAILED: {type(exc).__name__}: {exc}\n")
         raise VideoAnalysisError(
             f"Frame extraction failed for '{video_path.name}': {type(exc).__name__}: {exc}"
         ) from exc
@@ -362,13 +353,9 @@ def _run_inference_sync(
 
     try:
         image_inputs, video_inputs = process_vision_info(messages)
-        with open(_diag, "a") as _f:
-            _f.write(f"  process_vision_info OK: {len(image_inputs or [])} images, {len(video_inputs or [])} videos\n")
     except Exception as exc:
-        with open(_diag, "a") as _f:
-            _f.write(f"  process_vision_info FAILED: {type(exc).__name__}: {exc}\n")
         raise VideoAnalysisError(
-            f"Frame extraction failed for '{video_path.name}': {type(exc).__name__}: {exc}"
+            f"process_vision_info failed for '{video_path.name}': {type(exc).__name__}: {exc}"
         ) from exc
 
     actual_nframes = len(frames)
@@ -721,6 +708,26 @@ def _apply_video_safety_adjustments(s1: VideoStage1Output) -> list[str]:
             f"scope_fix: scope {_scope!r} -> 'repair' "
             f"(problem_type={s1.problem_type!r}, trade={s1.trade_category!r})"
         )
+
+    # If the model outputs scope="emergency" but the content doesn't describe an
+    # actual emergency (fire, flooding, collapse, gas, smoke), it's a 3B model
+    # error — the same contradiction fix applied to not_repair/unclear above.
+    # Real emergencies contain at least one of these keywords in problem_type or
+    # observations; a hinge or similar non-hazardous repair will not.
+    _EMERGENCY_KEYWORDS = {
+        "fire", "flame", "smoke", "flood", "flooding", "collapse",
+        "gas leak", "gas", "explosion", "electrocution", "electric shock",
+        "sparks", "arcing", "carbon monoxide",
+    }
+    if _scope == "emergency" and s1.problem_type and s1.trade_category:
+        _content = f"{s1.problem_type} {' '.join(getattr(s1, 'observations', None) or [])}".lower()
+        if not any(kw in _content for kw in _EMERGENCY_KEYWORDS):
+            s1.scope = "repair"
+            notes.append(
+                f"scope_fix: scope 'emergency' -> 'repair' "
+                f"(no emergency keywords found in problem_type/observations; "
+                f"problem_type={s1.problem_type!r})"
+            )
 
     # -0. Decorative / aesthetic task → not_repair
     #
@@ -1107,6 +1114,8 @@ async def analyse_video(
                 scope="not_repair",
                 problem_type="Unrelated or unrecognisable video content",
                 trade_category="general/other",
+                severity="low",
+                observations=[],
                 risk_level="low",
                 diy_suitability="not_recommended",
                 professional_assessment_recommended=False,

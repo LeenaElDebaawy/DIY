@@ -46,6 +46,60 @@ def _cat_label(cat: str) -> str:
     return _CATEGORY_LABELS.get((cat or "").lower(), (cat or "").replace("/", " / ").capitalize())
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FILE NAVIGATION MAP
+# ─────────────────────────────────────────────────────────────────────────────
+# This file is intentionally kept as a single module before handover to ensure
+# a stable, testable baseline.  For architecture context see TECHNICAL_OVERVIEW.md.
+# A gradual post-handover extraction plan is documented there and in the
+# repository handover notes.
+#
+# Section                       Approx. lines   Responsibility
+# ─────────────────────────────────────────────────────────────────────────────
+# Globals & constants           1  –  52        BACKEND/API URL, STATUS colours,
+#                                               trade-category label map
+# STYLES + JS                   53  – 451       inject_styles() — all CSS and
+#                                               inline JavaScript, injected into
+#                                               every page's <head>
+# Layout components             452 – 662       mobile_bar(), sidebar(),
+#                                               top_nav(), do_logout() — shared
+#                                               chrome used on every page
+# Homepage                      663 – 741       @ui.page("/")
+# Register page                 742 – 825       @ui.page("/register")
+# Login page                    826 – 901       @ui.page("/login")
+# Cases list                    902 – 1373      @ui.page("/cases") — case cards,
+#                                               status filter, pagination
+# Case detail                   1374 – 5298     @ui.page("/cases/{case_id}")
+#                                               ── see note below ──
+# New case composer             5299 – 6138     @ui.page("/new") — upload,
+#                                               camera capture, submit flow
+# Admin: feedback               6139 – 6473     @ui.page("/admin/feedback")
+# Admin: judge                  6474 – 6709     @ui.page("/admin/judge")
+# Admin: quality dashboard      6710 – 7853     @ui.page("/admin/quality") —
+#                                               6 tabs: overview, signal cards,
+#                                               alignment, suggestions, feedback,
+#                                               safety incidents
+# Startup                       7854 – end      ui.run()
+#
+# Note on case_detail_page (~3900 lines)
+# ─────────────────────────────────────────────────────────────────────────────
+# This function is large by necessity, not neglect.  It handles six distinct
+# output modes (diy, verify_first, assessment_first, needs_clarification, care,
+# out_of_scope) each with their own rendering tree, plus:
+#   • hazard acknowledgement gate and safety banners
+#   • AI analysis progress display with stage-by-stage polling
+#   • user feedback widget with reason chips
+#   • admin judge panel (score, dimension breakdown, findings)
+#   • contextual chat assistant with voice input and photo attachments
+#   • re-analysis flow for clarification cases
+# All of these share local state through closures (_redraw, _send, _open_judge).
+# Extracting them requires converting those closures to explicit parameter passing
+# — a non-trivial refactor that should be done after handover with a full
+# regression test suite.
+# ═════════════════════════════════════════════════════════════════════════════
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STYLES + JS
 # ─────────────────────────────────────────────────────────────────────────────

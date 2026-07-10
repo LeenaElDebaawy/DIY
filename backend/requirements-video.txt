@@ -1,0 +1,48 @@
+# ── Optional: video analysis and voice input dependencies ────────────────────
+#
+# These packages are NOT required to run image-only analysis, auth, feedback,
+# the judge, or the quality dashboard.
+#
+# Install this file only if you need:
+#   - Video case analysis  (set VIDEO_ANALYSIS_ENABLED=true in .env)
+#   - Voice input (faster-whisper audio transcription in chat)
+#
+# Installation:
+#   pip install -r requirements.txt
+#   pip install -r requirements-video.txt
+#
+# GPU note:
+#   Video analysis uses Qwen2.5-VL-7B-Instruct via HuggingFace Transformers.
+#   A CUDA-capable GPU with at least 12 GB VRAM is recommended.
+#   The model is downloaded from HuggingFace on first use (~15 GB).
+#   CPU fallback is possible but very slow (minutes per video).
+#
+# Audio transcription (faster-whisper) runs on CPU with no GPU required.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Video frame extraction ────────────────────────────────────────────────────
+# PyAV: FFmpeg Python bindings used to extract frames from uploaded video files.
+av>=12.0.0
+
+# ── Audio transcription ───────────────────────────────────────────────────────
+# faster-whisper: local Whisper transcription for voice input.  Runs on CPU.
+# Uses ctranslate2 under the hood — no torch required for audio-only use.
+faster-whisper>=1.0.0
+
+# ── HuggingFace Transformers (video model) ────────────────────────────────────
+# Required for Qwen2.5-VL-7B-Instruct local inference on video frames.
+# Only loaded when VIDEO_ANALYSIS_ENABLED=true.
+torch>=2.3.0
+transformers>=4.47.0
+accelerate>=0.26.0
+
+# bitsandbytes: 4-bit / 8-bit quantisation for the video model.
+# Reduces VRAM requirement from ~14 GB to ~8 GB at minimal quality cost.
+# Windows note: bitsandbytes Windows support requires the bitsandbytes-windows
+# fork on some setups.  See: https://github.com/bitsandbytes-foundation/bitsandbytes
+bitsandbytes>=0.43.0
+
+# ── GPU monitoring (optional) ─────────────────────────────────────────────────
+# pynvml: NVIDIA GPU memory/utilisation logging used in the video service.
+# Safe to omit on CPU-only machines — the service catches ImportError gracefully.
+pynvml>=11.4.1

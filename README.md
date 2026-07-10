@@ -8,6 +8,41 @@ The system is built around a single principle: **a repair assistant is only usef
 
 ---
 
+## Quick Start
+
+**Prerequisites:** Python 3.11+, Git, [Docker Desktop](https://www.docker.com/products/docker-desktop/), [Ollama](https://ollama.com)
+
+```bash
+# 1. Pull the required AI models into Ollama (one-time, ~15 GB total)
+ollama pull qwen2.5vl:7b          # Stage 1 — image classification
+ollama pull mistral:7b-instruct   # Stage 2 — tools, materials, root causes
+ollama pull llama3.1:8b           # Stage 3 — repair steps and chat
+
+# 2. Start PostgreSQL
+docker-compose up -d
+
+# 3. Backend  (new terminal, from repo root)
+cd backend
+cp .env.example .env              # edit DATABASE_URL and SECRET_KEY
+pip install -r requirements.txt
+alembic upgrade head
+python -m uvicorn main:app --host 0.0.0.0 --port 8000
+
+# 4. Frontend  (another terminal, from repo root)
+cd frontend
+pip install -r requirements.txt
+python main.py
+```
+
+Open **http://localhost:3000** in your browser.
+
+> Video analysis and voice input require additional packages — see `backend/requirements-video.txt` and set `VIDEO_ANALYSIS_ENABLED=true` in `.env`.
+> Admin Quality Dashboard and judge features require `JUDGE_ENABLED=true` and `ollama pull qwen2.5:7b`.
+
+Full setup details, environment variable reference, and a step-by-step QA checklist are in [Section 7 — Setup and Installation](#7-setup-and-installation).
+
+---
+
 ## Table of Contents
 
 1. [Project Overview](#1-project-overview)

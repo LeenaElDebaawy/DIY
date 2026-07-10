@@ -1,48 +1,39 @@
-# Web framework for building the backend API
+# ── Core web framework ────────────────────────────────────────────────────────
 fastapi==0.115.5
-
-# ASGI server used to run the FastAPI app locally
 uvicorn[standard]==0.32.1
 
-# SQLAlchemy with asyncio support for the async database layer
+# ── Database ──────────────────────────────────────────────────────────────────
 sqlalchemy[asyncio]==2.0.36
-
-# Async PostgreSQL driver used by SQLAlchemy
 asyncpg==0.30.0
-
-# Database migration tool
 alembic==1.14.0
 
-# Loads environment variables from the backend .env file
+# ── Configuration ─────────────────────────────────────────────────────────────
 python-dotenv==1.0.1
 
-# Password hashing library for secure authentication
+# ── Authentication ────────────────────────────────────────────────────────────
+# Auth uses database-stored opaque tokens (secrets.token_hex) — no JWT library needed.
+# passlib handles password hashing.  bcrypt is pinned to 3.2.x because 4.x removed
+# internal APIs that passlib 1.7.4 depends on.
 passlib[bcrypt]==1.7.4
-# bcrypt 3.2.2 is the last release fully compatible with passlib 1.7.4 on all platforms.
-# Versions 4.x removed __about__ and changed internal API, breaking passlib's verify path.
 bcrypt==3.2.2
 
-# Required by FastAPI to parse multipart/form-data (file uploads)
+# ── File handling ─────────────────────────────────────────────────────────────
 python-multipart==0.0.9
-
-# Image processing — used to extract width/height from uploads at save time.
-# PIL reads only the file header for JPEG/PNG, so this is fast and non-blocking.
 Pillow==10.4.0
 
-# ── Video processing ───────────────────────────────────────────────────────────
-# PyAV: pure-Python FFmpeg bindings used for video metadata extraction and
-# thumbnail frame generation.  Only imported when a video file is uploaded;
-# the image-only code path never loads this package.
-# Phase 1 use: duration extraction + 3 JPEG display frames.
-# Future phases: frame sampling for the video model input.
-av>=12.0.0
-
-# ── AI provider — local Ollama ─────────────────────────────────────────────────
+# ── AI provider — local Ollama ────────────────────────────────────────────────
 # Communicates with the local Ollama server (http://localhost:11434).
-# Models are managed by Ollama itself — no cloud API key needed.
-# Phase 7 Session 2 model assignments:
-#   Stage 1  Qwen2.5-VL   (STAGE_1_MODEL env var)  vision / problem classification
-#   Stage 2  Mistral       (STAGE_2_MODEL env var)  tools / materials / gear
-#   Stage 3  Llama 3.1     (STAGE_3_MODEL env var)  step-by-step repair instructions
+# All models are managed by Ollama — no cloud API key required.
+#
+# Pull the required models before first run:
+#   ollama pull qwen2.5vl:7b          # Stage 1 — image classification (multimodal)
+#   ollama pull mistral:7b-instruct   # Stage 2 — tools, materials, root causes
+#   ollama pull llama3.1:8b           # Stage 3 — repair steps and chat
+#   ollama pull qwen2.5:7b            # Judge / advisory proposals (set JUDGE_ENABLED=true)
 ollama>=0.4.5
 
+# ── Video and audio dependencies ──────────────────────────────────────────────
+# PyAV, faster-whisper, torch, transformers, etc. are in requirements-video.txt.
+# They are not required for image-only analysis, auth, feedback, judge, or the
+# quality dashboard.  Install them only if VIDEO_ANALYSIS_ENABLED=true or voice
+# input is needed.  See requirements-video.txt for instructions.
